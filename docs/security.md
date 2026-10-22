@@ -119,10 +119,11 @@ let the firewall do the rest.
 
 ### A static key compromised later
 
-The long-term static keys are mixed into the session keys, so an attacker who
-later obtains an agent's or an operator's private key can decrypt traffic
-recorded from earlier sessions. There is no forward secrecy against that.
-Rotating a key invalidates it for new sessions only.
+Noise_XX provides forward secrecy against subsequent passive compromise of static keys:
+ephemeral Diffie-Hellman keys (`e`) are generated freshly for each session and mixed into
+the chaining key (`ee`), so recorded session ciphertext cannot be decrypted using static
+keys alone if ephemeral secrets were erased. However, active adversary compromise of a static
+key enables future session impersonation. Rotating a static key revokes trust for new sessions.
 
 ### Key distribution
 

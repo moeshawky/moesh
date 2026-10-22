@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import stat
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import pytest
 
 import moesh_proto_v2 as proto
 import moesh_shell_v2
@@ -20,7 +24,9 @@ def test_client_generate_key_writes_private_0600_and_public_0644(tmp_path: Path)
     assert stat.S_IMODE(pubfile.stat().st_mode) == 0o644
 
 
-def test_generate_key_prints_only_the_public_half(tmp_path: Path, capsys) -> None:
+def test_generate_key_prints_only_the_public_half(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     keyfile = tmp_path / "operator.key"
     rc = moesh_shell_v2.main(["--generate-key", "--keyfile", str(keyfile)])
     assert rc == 0

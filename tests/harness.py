@@ -58,9 +58,25 @@ numbers never repeat inside a run and two test files cannot collide."""
 
 def next_ports() -> tuple[int, int, int]:
     """Return a fresh (tunnel, operator, operator-v2) port triple."""
-    base = _PORT_BASE[0]
-    _PORT_BASE[0] += 10
-    return base, base + 1, base + 2
+    seq_file = os.path.join(EVIDENCE_DIR, ".port_seq")
+    os.makedirs(EVIDENCE_DIR, exist_ok=True)
+    try:
+        with open(seq_file, "a+", encoding="ascii") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            f.seek(0)
+            content = f.read().strip()
+            base = int(content) if content.isdigit() else _PORT_BASE[0]
+            _PORT_BASE[0] = base + 10
+            f.seek(0)
+            f.truncate()
+            f.write(f"{_PORT_BASE[0]}\n")
+            f.flush()
+            fcntl.flock(f, fcntl.LOCK_UN)
+            return base, base + 1, base + 2
+    except OSError:
+        base = _PORT_BASE[0]
+        _PORT_BASE[0] += 10
+        return base, base + 1, base + 2
 
 
 def set_winsize(fd: int, rows: int, cols: int) -> None:
@@ -133,6 +149,7 @@ class OperatorSession:
         self.master, slave = pty.openpty()
         set_winsize(self.master, rows, cols)
         self.buffer = b""
+        self.cursor = 0
 
         def preexec() -> None:
             os.setsid()
@@ -164,7 +181,9 @@ class OperatorSession:
         """Read until ``needle`` appears; raise on timeout."""
         deadline = time.time() + timeout
         while time.time() < deadline:
-            if needle in self.buffer:
+            idx = self.buffer.find(needle, self.cursor)
+            if idx != -1:
+                self.cursor = idx + len(needle)
                 return self.buffer
             ready, _, _ = select.select([self.master], [], [], 0.5)
             if not ready:

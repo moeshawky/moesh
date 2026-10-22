@@ -27,7 +27,10 @@ operator terminal ──TCP 127.0.0.1:44441──▶ moesh-bridge.py ──TCP/8
   there is no inbound terminal endpoint to attack anywhere in the design.
 * The bridge is a **blind byte broker**: after the 101 it copies bytes in both
   directions and never interprets them.  It therefore never holds plaintext
-  terminal data.
+  terminal data.  The documented exception is the operator prelude: an operator
+  sends a short plaintext routing label (`host: <name>\n`) to select the host queue,
+  which the bridge parses before switching to blind forwarding.  This label
+  carries no terminal data and never leaves the receiver host.
 * nginx passes the `Upgrade` token through verbatim
   (`proxy_set_header Upgrade $http_upgrade`), which is why a custom token
   needs no nginx change.  The *route* does need one: an nginx fronting a

@@ -62,14 +62,12 @@ from moesh_proto_v2 import (
 )
 
 DEFAULT_ADDR = "127.0.0.1:44441"
-DEFAULT_HOST = "default"
 # All of the operator's state lives in one config directory: the key material
 # and the pins file.  Override any piece with its environment variable.
 HOSTS_FILE = os.environ.get(
     "MOESH_SHELL_V2_HOSTS_FILE",
     os.path.expanduser("~/.config/moesh/hosts.toml"),
 )
-PRELUDE_PREFIX = b"MOESH-TUNNEL-V2 "
 DEFAULT_KEYFILE = os.path.expanduser("~/.config/moesh/operator.key")
 DEFAULT_PEER_PUBFILE = os.path.expanduser("~/.config/moesh/agent.pub")
 
@@ -337,6 +335,8 @@ def handshake(session: proto.NoiseSession, channel: proto.Channel) -> None:
     channel.send_frame(session.write_handshake())
     if not session.handshake_finished:
         raise ProtocolError("Noise handshake did not complete")
+    if not session.authenticated:
+        raise AuthenticationError("Agent static key could not be authenticated")
     log("authenticated (agent static key matched the pin)")
 
 
@@ -631,6 +631,8 @@ def run_session(
                     log(
                         "detached: the remote shell keeps running; run moesh-shell-v2 again to re-attach"
                     )
+                    with contextlib.suppress(Exception):
+                        secure.send_control(Msg.CLOSE, {"reason": "detach"})
                     return status
                 to_send, detached = escape_filter.feed(data)
                 if to_send:
@@ -642,6 +644,8 @@ def run_session(
                 if detached:
                     sys.stderr.write("\n[moesh: detached]\n")
                     sys.stderr.flush()
+                    with contextlib.suppress(Exception):
+                        secure.send_control(Msg.CLOSE, {"reason": "detach"})
                     return 0
         return status
     finally:
@@ -677,7 +681,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--host",
         "-n",
-        default=os.environ.get("MOESH_TUNNEL_V2_HOST", DEFAULT_HOST),
+        default=os.environ.get("MOESH_TUNNEL_V2_HOST", proto.DEFAULT_HOST),
         help=("host number or name to attach to, e.g. 3 (default: %(default)s)"),
     )
     parser.add_argument(
@@ -716,7 +720,7 @@ def main(argv: list[str] | None = None) -> int:
         # A configured host must be pinned: never fall back to "whatever
         # key file happens to be there".
         peer = pinned_key(host)
-    elif host == DEFAULT_HOST:
+    elif host == proto.DEFAULT_HOST:
         # The single-host setup: one key file, no configuration.
         peer = read_key(args.peer_pubfile, "agent static public key")
     else:
@@ -789,7 +793,7 @@ def run_one_session(
     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     # The routing label: which host the operator is asking for.  It never
     # leaves the receiver host and carries no terminal data.
-    sock.sendall(PRELUDE_PREFIX + host.encode("latin-1") + b"\n")
+    sock.sendall(proto.PRELUDE_PREFIX + host.encode("latin-1") + b"\n")
 
     terminal = RawTerminal(sys.stdin.fileno())
     try:

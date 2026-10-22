@@ -53,27 +53,36 @@ import json
 import struct
 from typing import Any
 
-PROTOCOL_VERSION = 2
-"""Major version carried in the prologue, in HELLO/ACCEPT and in the state machine."""
+from moesh_wire import (
+    DEFAULT_HOST,
+    DEFAULT_PATH,
+    MAX_CONTROL_PAYLOAD,
+    MAX_DATA_PAYLOAD,
+    PRELUDE_PREFIX,
+    PROTOCOL_VERSION,
+    TUNNEL_PATH,
+    UPGRADE_TOKEN,
+)
 
-UPGRADE_TOKEN = "moesh-tunnel-v2"  # noqa: S105 - a protocol identifier, not a secret
-"""Custom HTTP Upgrade token.  The connection is NOT a WebSocket: no RFC 6455
-framing is used, so advertising ``websocket`` would be false."""
+__all__ = [
+    "DEFAULT_HOST",
+    "DEFAULT_PATH",
+    "MAX_CONTROL_PAYLOAD",
+    "MAX_DATA_PAYLOAD",
+    "PRELUDE_PREFIX",
+    "PROTOCOL_VERSION",
+    "TUNNEL_PATH",
+    "UPGRADE_TOKEN",
+]
 
 NOISE_NAME = b"Noise_XX_25519_ChaChaPoly_BLAKE2s"
 """Noise pattern and cipher suite used for the transport."""
 
-PROLOGUE = b"moesh-tunnel-v2/1/noise_xx_25519_chachapoly_blake2s"
-"""Fixed application prologue: protocol identity, major version, cipher suite."""
+PROLOGUE = f"moesh-tunnel-v2/{PROTOCOL_VERSION}/noise_xx_25519_chachapoly_blake2s".encode("ascii")
+"""Fixed application prologue binding cryptographic handshake schema revision to PROTOCOL_VERSION."""
 
 MAX_CIPHERTEXT = 65535
 """Maximum ciphertext in one frame (Noise MAX_MESSAGE_LEN)."""
-
-MAX_DATA_PAYLOAD = 32768
-"""Maximum terminal bytes in one DATA record (bounds the send buffer)."""
-
-MAX_CONTROL_PAYLOAD = 4096
-"""Maximum JSON payload of a control record."""
 
 MAX_HANDSHAKE_FRAME = 4096
 """Maximum Noise handshake message (measured size is 32..112 bytes)."""
@@ -434,6 +443,10 @@ class NoiseSession:
 
         learned = getattr(self._handshake_state, "rs", None)
         if learned is None or isinstance(learned, Empty):
+            if self.handshake_finished:
+                raise AuthenticationError(
+                    "Noise handshake finished without learning remote static key"
+                )
             return
         if bytes(learned.public_bytes) != self._peer_static:
             raise AuthenticationError(
@@ -444,6 +457,8 @@ class NoiseSession:
 
     def encrypt(self, plaintext: bytes) -> bytes:
         """Encrypt one transport message."""
+        if not self._authenticated:
+            raise AuthenticationError("cannot encrypt on unauthenticated session")
         try:
             return bytes(self._conn.encrypt(plaintext))
         except Exception as exc:
@@ -455,6 +470,8 @@ class NoiseSession:
         Raises:
             AuthenticationError: the ciphertext was modified or is out of session.
         """
+        if not self._authenticated:
+            raise AuthenticationError("cannot decrypt on unauthenticated session")
         try:
             return bytes(self._conn.decrypt(ciphertext))
         except Exception as exc:
@@ -510,15 +527,25 @@ class SecureChannel:
         plaintext = self._session.decrypt(frame_bytes)
         if not plaintext:
             raise FramingError("empty transport record")
-        return plaintext[0], plaintext[1:]
+        msg_type = plaintext[0]
+        payload = plaintext[1:]
+        if len(payload) > MAX_DATA_PAYLOAD:
+            raise FramingError(
+                f"inbound payload of {len(payload)} bytes exceeds {MAX_DATA_PAYLOAD}"
+            )
+        return msg_type, payload
 
     def recv_control(self) -> tuple[int, dict[str, Any]]:
         """Return the next ``(message_type, json_object)`` control record.
 
         Raises:
-            FramingError: the payload is not a JSON object.
+            FramingError: the payload is not a JSON object or exceeds bounds.
         """
         msg_type, payload = self.recv()
+        if len(payload) > MAX_CONTROL_PAYLOAD:
+            raise FramingError(
+                f"inbound control payload of {len(payload)} bytes exceeds {MAX_CONTROL_PAYLOAD}"
+            )
         try:
             obj = json.loads(payload.decode())
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -539,7 +566,13 @@ class SecureChannel:
             plaintext = self._session.decrypt(frame_bytes)
             if not plaintext:
                 raise FramingError("empty transport record")
-            out.append((plaintext[0], plaintext[1:]))
+            msg_type = plaintext[0]
+            payload = plaintext[1:]
+            if len(payload) > MAX_DATA_PAYLOAD:
+                raise FramingError(
+                    f"inbound payload of {len(payload)} bytes exceeds {MAX_DATA_PAYLOAD}"
+                )
+            out.append((msg_type, payload))
         return out
 
     def drain(self) -> list[tuple[int, bytes]]:

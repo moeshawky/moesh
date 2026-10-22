@@ -49,6 +49,8 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
+import enum
 import fcntl
 import hashlib
 import os
@@ -65,8 +67,6 @@ from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import contextlib
-
 import moesh_proto_v2 as proto
 from moesh_proto_v2 import (
     AuthenticationError,
@@ -77,12 +77,11 @@ from moesh_proto_v2 import (
     TransportEOF,
 )
 
-DEFAULT_HOST = ""
+DEFAULT_RECEIVER = ""
 """Receiver address to dial.  Empty by default: an address must be provisioned
 (through ``MOESH_TUNNEL_V2_RECEIVER``) or the agent refuses to start, so a
 bare checkout never dials anywhere."""
 DEFAULT_PORT = 80
-DEFAULT_PATH = "/__moesh/tunnel"
 DEFAULT_SESSIONS = 3
 """How many operators this agent serves at once.
 
@@ -337,6 +336,14 @@ def decode_resize(payload: bytes) -> tuple[int, int]:
     return rows, cols
 
 
+class ShellState(enum.Enum):
+    CREATED = "created"
+    RUNNING = "running"
+    EXITED = "exited"
+    REAPED = "reaped"
+    TERMINATED = "terminated"
+
+
 class HostShell:
     """The remote interactive shell.
 
@@ -348,6 +355,8 @@ class HostShell:
     def __init__(self, max_buffer: int = DETACHED_BUFFER) -> None:
         self.pid: int | None = None
         self.fd: int | None = None
+        self.state: ShellState = ShellState.CREATED
+        self.exit_status: int | None = None
         self.buffer = bytearray()
         self.dropped = 0
         self.max_buffer = max_buffer
@@ -358,7 +367,7 @@ class HostShell:
     @property
     def alive(self) -> bool:
         """True when a shell process is running."""
-        return self.pid is not None and self.fd is not None
+        return self.state == ShellState.RUNNING and self.pid is not None and self.fd is not None
 
     def spawn(self, term: str, rows: int, cols: int) -> None:
         """Terminate any previous shell and start a fresh interactive Bash.
@@ -366,12 +375,20 @@ class HostShell:
         Raises:
             ProtocolError: the child could not be started.
         """
-        self.terminate()
+        if self.pid is not None or self.fd is not None:
+            self.terminate()
         pid, fd = pty.fork()
         if pid == 0:
             os.environ["TERM"] = term
             os.environ["LANG"] = "C.UTF-8"
             os.environ["LC_ALL"] = "C.UTF-8"
+            for secret_var in (
+                "MOESH_TUNNEL_V2_AGENT_KEY",
+                "MOESH_TUNNEL_V2_AGENT_MASTER_SECRET",
+                "MOESH_SHELL_V2_OPERATOR_KEY",
+                "MOESH_TUNNEL_V2_CHILD_PIDFILE",
+            ):
+                os.environ.pop(secret_var, None)
             try:
                 # exec, not a shell: the argv is fixed and the path is
                 # absolute, so nothing here is interpolated.
@@ -380,6 +397,8 @@ class HostShell:
                 os._exit(127)
         set_winsize(fd, rows, cols)
         self.pid, self.fd = pid, fd
+        self.state = ShellState.RUNNING
+        self.exit_status = None
         self.term, self.rows, self.cols = term, rows, cols
         self.buffer.clear()
         self.dropped = 0
@@ -444,17 +463,40 @@ class HostShell:
     def reap(self) -> int:
         """Reap the shell if it exited and return its status."""
         if self.pid is None:
-            return 0
+            return self.exit_status or 0
         status = 0
         try:
-            _, wait_status = os.waitpid(self.pid, os.WNOHANG)
+            pid, wait_status = os.waitpid(self.pid, os.WNOHANG)
+        except ChildProcessError:
+            self.state = ShellState.REAPED
+            if self.fd is not None:
+                with contextlib.suppress(OSError):
+                    os.close(self.fd)
+                self.fd = None
+            self.pid = None
+            self._remove_pidfile()
+            return self.exit_status or 0
+        except OSError:
+            return self.exit_status or 0
+
+        if pid == 0:
+            return 0
+
+        if pid == self.pid:
             if os.WIFEXITED(wait_status):
                 status = os.WEXITSTATUS(wait_status)
             elif os.WIFSIGNALED(wait_status):
                 status = 128 + os.WTERMSIG(wait_status)
-        except OSError:
-            pass
-        return status
+            self.exit_status = status
+            self.state = ShellState.REAPED
+            if self.fd is not None:
+                with contextlib.suppress(OSError):
+                    os.close(self.fd)
+                self.fd = None
+            self.pid = None
+            self._remove_pidfile()
+            return status
+        return 0
 
     def wait_exit(self, timeout: float = 5.0) -> int:
         """Wait for the shell to exit and return its real status.
@@ -466,39 +508,63 @@ class HostShell:
         is left untouched so ``terminate()`` and the pidfile keep working.
         """
         if self.pid is None:
-            return 0
+            return self.exit_status or 0
         deadline = time.monotonic() + timeout
         while True:
             try:
                 pid, wait_status = os.waitpid(self.pid, os.WNOHANG)
             except ChildProcessError:
-                return 0
+                self.state = ShellState.REAPED
+                if self.fd is not None:
+                    with contextlib.suppress(OSError):
+                        os.close(self.fd)
+                    self.fd = None
+                self.pid = None
+                self._remove_pidfile()
+                return self.exit_status or 0
+            except OSError:
+                break
             if pid == self.pid:
+                status = 0
                 if os.WIFEXITED(wait_status):
-                    return os.WEXITSTATUS(wait_status)
-                if os.WIFSIGNALED(wait_status):
-                    return 128 + os.WTERMSIG(wait_status)
-                return 0
+                    status = os.WEXITSTATUS(wait_status)
+                elif os.WIFSIGNALED(wait_status):
+                    status = 128 + os.WTERMSIG(wait_status)
+                self.exit_status = status
+                self.state = ShellState.REAPED
+                if self.fd is not None:
+                    with contextlib.suppress(OSError):
+                        os.close(self.fd)
+                    self.fd = None
+                self.pid = None
+                self._remove_pidfile()
+                return status
             if time.monotonic() >= deadline:
                 log("timed out waiting for the shell to become reapable; reporting status 0")
-                return 0
+                return self.exit_status or 0
             time.sleep(0.01)
+        return self.exit_status or 0
 
     def terminate(self) -> None:
         """Terminate the shell and reap it; never leave a zombie or an orphan."""
-        if self.pid is None:
-            return
-        with contextlib.suppress(OSError):
-            os.kill(self.pid, signal.SIGHUP)
-        if self.fd is not None:
-            with contextlib.suppress(OSError):
-                os.close(self.fd)
-        with contextlib.suppress(OSError):
-            os.waitpid(self.pid, 0)
+        pid = self.pid
+        fd = self.fd
+        self.state = ShellState.TERMINATED
         self.pid = None
         self.fd = None
-        self._remove_pidfile()
-        log("shell terminated")
+        if pid is not None:
+            with contextlib.suppress(OSError):
+                with contextlib.suppress(OSError):
+                    os.killpg(os.getpgid(pid), signal.SIGHUP)
+                os.kill(pid, signal.SIGHUP)
+            with contextlib.suppress(OSError):
+                os.waitpid(pid, 0)
+        if fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+        if pid is not None or fd is not None:
+            self._remove_pidfile()
+            log("shell terminated")
 
 
 class ShellPool:
@@ -518,7 +584,47 @@ class ShellPool:
         self._shells: list[HostShell] = []
         self._busy: set[int] = set()
         self._lock = threading.Lock()
+        self._cond = threading.Condition(self._lock)
         self.max_idle = max_idle
+        self._stopped = False
+        self._drain_thread = threading.Thread(
+            target=self._drain_idle_shells, name="moesh-idle-drain", daemon=True
+        )
+        self._drain_thread.start()
+
+    def _drain_idle_shells(self) -> None:
+        """Single-reader pump for idle shells when no operator is attached."""
+        while not self._stopped:
+            with self._cond:
+                idle = [
+                    s
+                    for s in self._shells
+                    if s.alive and id(s) not in self._busy and s.fd is not None
+                ]
+                if not idle and not self._stopped:
+                    self._cond.wait(timeout=0.5)
+                    continue
+            if self._stopped:
+                break
+            fd_map = {s.fd: s for s in idle if s.fd is not None}
+            if not fd_map:
+                time.sleep(0.05)
+                continue
+            try:
+                ready, _, _ = select.select(list(fd_map.keys()), [], [], 0.5)
+            except (OSError, ValueError):
+                continue
+            for fd in ready:
+                with self._lock:
+                    s = fd_map.get(fd)
+                    if s is None or id(s) in self._busy or not s.alive or s.fd != fd:
+                        continue
+                    data = s.read_output()
+                    if data is None:
+                        log("a shell exited while detached")
+                        self._drop(s)
+                    elif data:
+                        s.hold(data)
 
     def _drop(self, shell: HostShell) -> None:
         """Remove a shell from the pool and terminate it."""
@@ -534,7 +640,7 @@ class ShellPool:
         recently used idle shell is re-attached to, the way tmux does on
         attach; if there is none, a new one is created.
         """
-        with self._lock:
+        with self._cond:
             if not fresh:
                 for shell in reversed(self._shells):
                     if id(shell) in self._busy:
@@ -550,10 +656,11 @@ class ShellPool:
 
     def release(self, shell: HostShell) -> None:
         """Give a shell back: it keeps running for the next operator."""
-        with self._lock:
+        with self._cond:
             self._busy.discard(id(shell))
             if not shell.alive:
                 self._drop(shell)
+            self._cond.notify_all()
 
     def idle_shells(self) -> list[HostShell]:
         """Return the shells that no session is using right now."""
@@ -566,12 +673,13 @@ class ShellPool:
 
     def discard(self, shell: HostShell) -> None:
         """Drop a shell from the pool and terminate it."""
-        with self._lock:
+        with self._cond:
             self._drop(shell)
+            self._cond.notify_all()
 
     def reap(self) -> None:
         """Terminate the shells that have exited, keeping the pool bounded."""
-        with self._lock:
+        with self._cond:
             for shell in list(self._shells):
                 if not shell.alive:
                     self._drop(shell)
@@ -580,19 +688,21 @@ class ShellPool:
                 oldest = idle.pop(0)
                 log(f"retiring an idle shell (pid {oldest.pid})")
                 self._drop(oldest)
+            self._cond.notify_all()
 
     def terminate_all(self) -> None:
         """Terminate every shell this pool owns."""
-        with self._lock:
+        with self._cond:
+            self._stopped = True
             for shell in list(self._shells):
                 self._drop(shell)
+            self._cond.notify_all()
+        if self._drain_thread.is_alive():
+            self._drain_thread.join(timeout=1.0)
 
 
 def wait_for_handshake(channel: proto.Channel, pool: ShellPool) -> bytes:
-    """Wait for the operator's first handshake message, draining the shells.
-
-    The shells keep producing output while nobody is attached; it is read into
-    their bounded buffers so the PTY never blocks a shell.
+    """Wait for the operator's first handshake message.
 
     The transport's buffer is asked **first**, before the socket.  A frame
     that arrived in the same TCP segment as the HTTP 101 response is already
@@ -613,27 +723,10 @@ def wait_for_handshake(channel: proto.Channel, pool: ShellPool) -> bytes:
         if waited >= 30.0:
             waited = 0.0
             log("still waiting for an operator on this tunnel")
-        # The buffer first: a frame that is already here must not wait for
-        # the socket to report something it will never report.
         item = channel.next_frame()
         if item is not None:
             return item
-        idle = pool.idle_shells()
-        watched = [channel.socket] + [shell.fd for shell in idle]
-        ready, _, _ = select.select(watched, [], [], 1.0)
-        # Read the idle shells only when select says they are readable: a
-        # blocking read on a quiet PTY would hang this worker and the
-        # operator's handshake with it.
-        for shell in idle:
-            if shell.fd not in ready:
-                continue
-            data = shell.read_output()
-            if data is None:
-                log("a shell exited while detached")
-                pool.discard(shell)
-                continue
-            if data:
-                shell.hold(data)
+        ready, _, _ = select.select([channel.socket], [], [], 1.0)
         if channel.socket in ready:
             return channel.recv_frame()
 
@@ -663,37 +756,43 @@ def negotiate(
     # The shell is chosen only now: the HELLO is what says whether this
     # session wants a fresh shell or the running one.
     shell = pool.acquire(fresh)
-    resumed = bool(shell.alive and not fresh)
-    accepted["resumed"] = resumed
-    secure.send_control(Msg.ACCEPT, accepted)
-    machine.to(State.READY)
-    msg_type, _payload = secure.recv_control()
-    if msg_type != Msg.READY:
-        raise NegotiationError(f"expected READY, got message type {msg_type}")
-    secure.send_control(Msg.READY, {})
-    machine.to(State.ACTIVE)
+    success = False
+    try:
+        resumed = bool(shell.alive and not fresh)
+        accepted["resumed"] = resumed
+        secure.send_control(Msg.ACCEPT, accepted)
+        machine.to(State.READY)
+        msg_type, _payload = secure.recv_control()
+        if msg_type != Msg.READY:
+            raise NegotiationError(f"expected READY, got message type {msg_type}")
+        secure.send_control(Msg.READY, {})
+        machine.to(State.ACTIVE)
 
-    if fresh or not shell.alive:
-        shell.spawn(accepted["term"], accepted["rows"], accepted["cols"])
-    else:
-        shell.apply_size(accepted["rows"], accepted["cols"])
-        # The prompt the previous operator saw was already consumed. A newline
-        # makes the shell draw a fresh prompt, the way tmux does on attach.
-        fd = shell.fd
-        if fd is not None:
-            with contextlib.suppress(OSError):
-                os.write(fd, b"\n")
-        log(f"attached to the running shell (pid {shell.pid})")
-    held = shell.take()
-    if held:
-        if shell.dropped:
-            log(f"replaying {len(held)} buffered bytes ({shell.dropped} dropped)")
+        if fresh or not shell.alive:
+            shell.spawn(accepted["term"], accepted["rows"], accepted["cols"])
         else:
-            log(f"replaying {len(held)} buffered bytes")
-        for piece in chunks(held, proto.MAX_DATA_PAYLOAD):
-            secure.send(Msg.DATA, piece)
-    accepted["_shell"] = shell
-    return accepted
+            shell.apply_size(accepted["rows"], accepted["cols"])
+            # The prompt the previous operator saw was already consumed. A newline
+            # makes the shell draw a fresh prompt, the way tmux does on attach.
+            fd = shell.fd
+            if fd is not None:
+                with contextlib.suppress(OSError):
+                    os.write(fd, b"\n")
+            log(f"attached to the running shell (pid {shell.pid})")
+        held = shell.take()
+        if held:
+            if shell.dropped:
+                log(f"replaying {len(held)} buffered bytes ({shell.dropped} dropped)")
+            else:
+                log(f"replaying {len(held)} buffered bytes")
+            for piece in chunks(held, proto.MAX_DATA_PAYLOAD):
+                secure.send(Msg.DATA, piece)
+        accepted["_shell"] = shell
+        success = True
+        return accepted
+    finally:
+        if not success:
+            pool.release(shell)
 
 
 def run_session(
@@ -722,7 +821,10 @@ def run_session(
     while True:
         fd = shell.fd
         watched: list[socket.socket | int] = [sock] if fd is None else [sock, fd]
-        ready, _, _ = select.select(watched, [], [], 1.0)
+        try:
+            ready, _, _ = select.select(watched, [], [], 1.0)
+        except (ValueError, OSError):
+            break
         now = time.time()
         if ping_every > 0 and now - last_ping >= ping_every:
             last_ping = now
@@ -840,11 +942,12 @@ def serve_once(host: str, port: int, path: str, name: str, pool: ShellPool) -> s
         sock.settimeout(None)
         log("tunnel established; waiting for an operator")
         first = wait_for_handshake(channel, pool)
+        sock.settimeout(proto.HANDSHAKE_TIMEOUT)
         session.read_handshake(first)
         channel.send_frame(session.write_handshake())
         session.read_handshake(channel.recv_frame())
-        if not session.handshake_finished:
-            raise ProtocolError("Noise handshake did not complete")
+        if not session.handshake_finished or not session.authenticated:
+            raise AuthenticationError("Noise handshake did not authenticate")
         machine.to(State.AUTHENTICATED)
         log("authenticated (peer static key matched the pin)")
         secure = proto.SecureChannel(channel, session)
@@ -957,7 +1060,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.generate_key:
         return generate_key(args.keyfile, args.force)
 
-    host = os.environ.get("MOESH_TUNNEL_V2_RECEIVER", DEFAULT_HOST).strip()
+    host = os.environ.get("MOESH_TUNNEL_V2_RECEIVER", DEFAULT_RECEIVER).strip()
     if not host:
         raise SystemExit(
             "no receiver configured: set MOESH_TUNNEL_V2_RECEIVER (address or "
@@ -965,7 +1068,7 @@ def main(argv: list[str] | None = None) -> int:
             "MOESH_TUNNEL_V2_RECEIVER_PORT"
         )
     port = int(os.environ.get("MOESH_TUNNEL_V2_RECEIVER_PORT", str(DEFAULT_PORT)))
-    path = os.environ.get("MOESH_TUNNEL_V2_PATH", DEFAULT_PATH)
+    path = os.environ.get("MOESH_TUNNEL_V2_PATH", proto.DEFAULT_PATH)
     name = host_name()
 
     signal.signal(signal.SIGTERM, _on_stop)
@@ -992,6 +1095,8 @@ def main(argv: list[str] | None = None) -> int:
     except Stop:
         pass
     finally:
+        for worker in workers:
+            worker.join(timeout=1.0)
         pool.terminate_all()
         log("agent stopped")
     return 0

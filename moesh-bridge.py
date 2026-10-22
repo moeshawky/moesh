@@ -47,6 +47,13 @@ import threading
 import time
 from typing import TYPE_CHECKING
 
+from moesh_wire import (
+    DEFAULT_HOST,
+    PRELUDE_PREFIX,
+    TUNNEL_PATH,
+    UPGRADE_TOKEN,
+)
+
 if TYPE_CHECKING:
     from collections.abc import Callable
 
@@ -62,33 +69,34 @@ GPU_RELAY_HOST = "0.0.0.0"  # noqa: S104
 ALLOW_V1 = os.environ.get("MOESH_BRIDGE_ALLOW_V1", "1") != "0"
 
 GPU_PATH = "/__relay/gpu"
-TUNNEL_PATH = "/__moesh/tunnel"
 V1_TUNNEL_PATH = "/__tunnel/v1"
-# A protocol identifier, not a secret: it says which framing the
-# connection speaks, and it is checked on both ends.
-UPGRADE_TOKEN_V2 = "moesh-tunnel-v2"  # noqa: S105
 TUNNEL_PATH_PREFIX = TUNNEL_PATH + "/"
-DEFAULT_HOST = "default"
-PRELUDE_PREFIX = b"MOESH-TUNNEL-V2 "
-"""Operator-side routing label, sent before the encrypted session.
-
-It names the host the operator wants.  It is a routing label, not
-terminal content and not a control message: the session itself stays
-encrypted, and the label never leaves the receiver host.
-"""
 GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 _shell: queue.Queue[socket.socket] = queue.Queue(maxsize=8)
 _shell_v2: dict[str, queue.Queue[socket.socket]] = {}
 _registry_lock = threading.Lock()
+MAX_HOST_QUEUES = 256
 
 
 def host_queue(name: str) -> queue.Queue[socket.socket]:
     """Return the queue of one host, creating it on first use."""
     with _registry_lock:
         item = _shell_v2.get(name)
-        if item is None:
-            item = queue.Queue(maxsize=8)
-            _shell_v2[name] = item
+        if item is not None:
+            return item
+        if len(_shell_v2) >= MAX_HOST_QUEUES:
+            for k in list(_shell_v2.keys()):
+                if _shell_v2[k].empty():
+                    del _shell_v2[k]
+                if len(_shell_v2) < MAX_HOST_QUEUES:
+                    break
+            if len(_shell_v2) >= MAX_HOST_QUEUES:
+                for k in list(_shell_v2.keys()):
+                    if _shell_v2[k].empty():
+                        del _shell_v2[k]
+                        break
+        item = queue.Queue(maxsize=8)
+        _shell_v2[name] = item
         return item
 
 
@@ -179,7 +187,19 @@ def tunnel_conn(conn: socket.socket, addr: tuple[str, int]) -> None:
         hdrs = read_headers(conn)
         path = request_path(hdrs)
         token = upgrade_token(hdrs)
-        if token == UPGRADE_TOKEN_V2:
+        conn_hdr = ""
+        for line in hdrs.split(b"\r\n")[1:]:
+            if line.lower().startswith(b"connection:"):
+                conn_hdr = (
+                    line.split(b":", 1)[1]
+                    .strip()
+                    .decode("latin-1", "replace")
+                    .lower()
+                )
+        if "upgrade" not in conn_hdr:
+            refuse(conn, "400 Bad Request", "Connection header must contain Upgrade")
+            return
+        if token == UPGRADE_TOKEN:
             if path == TUNNEL_PATH:
                 host = DEFAULT_HOST
             elif path.startswith(TUNNEL_PATH_PREFIX):
@@ -192,14 +212,14 @@ def tunnel_conn(conn: socket.socket, addr: tuple[str, int]) -> None:
                 return
             conn.sendall(
                 b"HTTP/1.1 101 Switching Protocols\r\n"
-                b"Upgrade: " + UPGRADE_TOKEN_V2.encode() + b"\r\n"
+                b"Upgrade: " + UPGRADE_TOKEN.encode() + b"\r\n"
                 b"Connection: Upgrade\r\n"
                 b"X-Moesh-Tunnel-Version: 2\r\n"
                 b"X-Moesh-Tunnel-Name: " + host.encode() + b"\r\n\r\n"
             )
             conn.settimeout(None)
             log(f"host tunnel v2 attached from {addr} host {host}")
-            host_queue(host).put(conn, timeout=120)
+            host_queue(host).put(conn, timeout=2.0)
             return
         if token != "websocket":  # noqa: S105 - a protocol identifier, not a secret
             refuse(conn, "400 Bad Request", f"unsupported upgrade token {token!r}")
@@ -358,7 +378,7 @@ def read_host_label(conn: socket.socket) -> str:
             if time.time() > deadline:
                 return ""
             try:
-                chunk = conn.recv(len(PRELUDE_PREFIX) + 64, socket.MSG_PEEK)
+                chunk = conn.recv(256, socket.MSG_PEEK)
             except OSError:
                 return ""
             if not chunk:
@@ -386,7 +406,12 @@ def read_host_label(conn: socket.socket) -> str:
 
 def operator_v2_conn(conn: socket.socket, addr: tuple[str, int]) -> None:
     """Pair one operator connection with the host it asked for."""
-    host = read_host_label(conn) or DEFAULT_HOST
+    host = read_host_label(conn)
+    if not host or not valid_host(host):
+        log(f"operator from {addr[0]}:{addr[1]} sent invalid host label; refusing")
+        with contextlib.suppress(OSError):
+            conn.close()
+        return
     pair(conn, host_queue(host), f"operator-v2[{host}]", 120)
 
 
