@@ -219,7 +219,13 @@ def tunnel_conn(conn: socket.socket, addr: tuple[str, int]) -> None:
             )
             conn.settimeout(None)
             log(f"host tunnel v2 attached from {addr} host {host}")
-            host_queue(host).put(conn, timeout=2.0)
+            try:
+                host_queue(host).put_nowait(conn)
+            except queue.Full:
+                log(f"tunnel queue full — dropping {addr}")
+                with contextlib.suppress(OSError):
+                    conn.close()
+                return
             return
         if token != "websocket":  # noqa: S105 - a protocol identifier, not a secret
             refuse(conn, "400 Bad Request", f"unsupported upgrade token {token!r}")

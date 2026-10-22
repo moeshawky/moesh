@@ -133,6 +133,8 @@ def log(message: str) -> None:
 def _on_stop(_signum: int, _frame: Any) -> None:
     """Ask the agent to stop cleanly."""
     global _stopping
+    if _stopping:
+        return
     _stopping = True
     raise Stop()
 
@@ -557,8 +559,22 @@ class HostShell:
                 with contextlib.suppress(OSError):
                     os.killpg(os.getpgid(pid), signal.SIGHUP)
                 os.kill(pid, signal.SIGHUP)
-            with contextlib.suppress(OSError):
-                os.waitpid(pid, 0)
+            deadline = time.monotonic() + 1.0
+            reaped = False
+            while time.monotonic() < deadline:
+                with contextlib.suppress(OSError):
+                    rpid, _ = os.waitpid(pid, os.WNOHANG)
+                    if rpid == pid:
+                        reaped = True
+                        break
+                time.sleep(0.02)
+            if not reaped:
+                with contextlib.suppress(OSError):
+                    with contextlib.suppress(OSError):
+                        os.killpg(os.getpgid(pid), signal.SIGKILL)
+                    os.kill(pid, signal.SIGKILL)
+                with contextlib.suppress(OSError):
+                    os.waitpid(pid, 0)
         if fd is not None:
             with contextlib.suppress(OSError):
                 os.close(fd)
@@ -819,6 +835,9 @@ def run_session(
     ping_every = float(os.environ.get("MOESH_TUNNEL_V2_PING_INTERVAL", "15") or 0)
     dead_after = float(os.environ.get("MOESH_TUNNEL_V2_DEAD_AFTER", "90") or 0)
     while True:
+        if _stopping:
+            log("the agent is stopping; the session ends abruptly")
+            return "detached"
         fd = shell.fd
         watched: list[socket.socket | int] = [sock] if fd is None else [sock, fd]
         try:
@@ -1095,9 +1114,14 @@ def main(argv: list[str] | None = None) -> int:
     except Stop:
         pass
     finally:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
         for worker in workers:
             worker.join(timeout=1.0)
-        pool.terminate_all()
+        try:
+            pool.terminate_all()
+        except Exception as exc:
+            log(f"error during pool termination: {exc}")
         log("agent stopped")
     return 0
 

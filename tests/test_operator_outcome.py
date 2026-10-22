@@ -230,10 +230,6 @@ def _handshake(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=False,
-    reason="L3/R1/R10 three-operator prompt acquisition can be lost to the measured race",
-)
 def test_three_operators_get_three_distinct_prompts(tmp_path: Path) -> None:
     """FUNC-001 — three concurrent operators reach prompts and one drop is isolated."""
     with live_stack(tmp_path, sessions=3) as stack:
@@ -259,10 +255,6 @@ def test_three_operators_get_three_distinct_prompts(tmp_path: Path) -> None:
                 session.close()
 
 
-@pytest.mark.xfail(
-    strict=False,
-    reason="K1/R2 reattach EOF can be omitted on one draw of the measured race",
-)
 def test_reattach_keeps_shell_identity_and_pre_detach_state(tmp_path: Path) -> None:
     """FUNC-002 — a dropped operator reattaches to the same shell and can type again."""
     with live_stack(tmp_path) as stack:
@@ -457,7 +449,6 @@ def test_departed_tunnel_worker_is_not_paired(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason="K3 the 80-byte peek cannot see a 64-char label's newline")
 def test_host_labels_one_through_sixty_four_route_exactly() -> None:
     """EDGE-001 — every valid label length, especially 64, parses to the exact name."""
     for length in range(1, 65):
@@ -472,7 +463,6 @@ def test_host_labels_one_through_sixty_four_route_exactly() -> None:
             right.close()
 
 
-@pytest.mark.xfail(strict=True, reason="K3/K7 a length-65 label falls back to DEFAULT_HOST")
 def test_length_sixty_five_label_is_refused_not_defaulted() -> None:
     """EDGE-002 — an out-of-range label must not reach the `default` queue."""
     left, right = socket.socketpair()
@@ -491,7 +481,6 @@ def test_length_sixty_five_label_is_refused_not_defaulted() -> None:
         right.close()
 
 
-@pytest.mark.xfail(strict=True, reason="K7 the bridge queues an invalid label under default")
 def test_unpinned_or_invalid_host_fails_closed(tmp_path: Path) -> None:
     """EDGE-003 — the bridge half must not turn a bad label into `default`."""
     left, right = socket.socketpair()
@@ -534,7 +523,6 @@ def test_rows_cols_and_version_bounds() -> None:
         proto.validate_resize({"rows": 0, "cols": 1})
 
 
-@pytest.mark.xfail(strict=True, reason="K10 receive-side DATA has no MAX_DATA_PAYLOAD check")
 def test_data_bounds_are_enforced_on_receive() -> None:
     """EDGE-005 — an inbound 32769-byte DATA record must be refused."""
     session_a, session_b, sock_a, sock_b, errors = _handshake()
@@ -557,7 +545,6 @@ def test_data_bounds_are_enforced_on_receive() -> None:
         sock_b.close()
 
 
-@pytest.mark.xfail(strict=True, reason="K10 receive-side control has no MAX_CONTROL_PAYLOAD check")
 def test_control_bounds_are_enforced_on_receive() -> None:
     """EDGE-006 — an inbound 4097-byte control record must be refused."""
     session_a, session_b, sock_a, sock_b, errors = _handshake()
@@ -611,7 +598,6 @@ def test_peek_window_leaves_the_handshake_frame_intact() -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason="K2 HostShell.reap leaves pid/fd set and alive true")
 def test_reap_clears_shell_identity() -> None:
     """ERR-001 — after the child exits, reap clears pid/fd and alive becomes false."""
     shell = agent_mod.HostShell()
@@ -632,7 +618,6 @@ def test_reap_clears_shell_identity() -> None:
         shell.terminate()
 
 
-@pytest.mark.xfail(strict=True, reason="K2 ShellPool reuses a reaped shell because alive stays true")
 def test_reaped_shell_is_not_reacquired() -> None:
     """ERR-002 — a dead shell is dropped and the next acquire gets a new pid."""
     pool = agent_mod.ShellPool(max_idle=1)
@@ -688,7 +673,6 @@ class _FakeSecure:
             raise OSError("test send failure")
 
 
-@pytest.mark.xfail(strict=True, reason="K4 negotiate leaks the acquired shell on ACCEPT send failure")
 def test_negotiation_send_failure_releases_the_shell() -> None:
     """ERR-003 — an ACCEPT send failure must leave the pool with no busy shell."""
     pool = agent_mod.ShellPool(max_idle=1)
@@ -703,7 +687,6 @@ def test_negotiation_send_failure_releases_the_shell() -> None:
         pool.terminate_all()
 
 
-@pytest.mark.xfail(strict=True, reason="K4 negotiate leaks the acquired shell on transport EOF")
 def test_transport_eof_during_negotiation_releases_the_shell() -> None:
     """ERR-004 — a transport EOF after HELLO must leave no busy shell."""
     pool = agent_mod.ShellPool(max_idle=1)
@@ -718,7 +701,6 @@ def test_transport_eof_during_negotiation_releases_the_shell() -> None:
         pool.terminate_all()
 
 
-@pytest.mark.xfail(strict=True, reason="K9 a clean detach sends no CLOSE and logs abrupt EOF")
 def test_clean_detach_sends_close_and_not_abrupt_eof(tmp_path: Path) -> None:
     """ERR-005 — stdin EOF detach is authenticated CLOSE, not a transport failure."""
     with live_stack(tmp_path) as stack:
@@ -734,10 +716,6 @@ def test_clean_detach_sends_close_and_not_abrupt_eof(tmp_path: Path) -> None:
         assert "abrupt EOF" not in log
 
 
-@pytest.mark.xfail(
-    strict=False,
-    reason="L5 EBADF during shutdown under a writing shell is a measured race",
-)
 def test_shutdown_does_not_close_a_pty_under_a_writer(tmp_path: Path) -> None:
     """ERR-006 — SIGTERM while `yes` writes must not produce EBADF."""
     for trial in range(3):
@@ -791,7 +769,6 @@ def test_three_sessions_own_three_ptys_and_one_drop_is_isolated(tmp_path: Path) 
                 session.close()
 
 
-@pytest.mark.xfail(strict=True, reason="L1 the ninth tunnel blocks up to 120s before queue.Full")
 def test_ninth_queued_tunnel_is_refused_in_bounded_time(tmp_path: Path) -> None:
     """PERF-002 — queue depth 8/9 is refused or backpressured within five seconds."""
     tunnel_port, operator_port, operator_v2_port = next_ports()
@@ -816,7 +793,8 @@ def test_ninth_queued_tunnel_is_refused_in_bounded_time(tmp_path: Path) -> None:
         ninth.settimeout(5)
         with contextlib.suppress(TimeoutError):
             ninth.recv(4096)
-        assert "tunnel queue full" in bridge.log_text()
+        log = _wait_log(bridge.log_path, "tunnel queue full", timeout=5)
+        assert "tunnel queue full" in log
     finally:
         for sock in sockets:
             with contextlib.suppress(OSError):
@@ -824,7 +802,6 @@ def test_ninth_queued_tunnel_is_refused_in_bounded_time(tmp_path: Path) -> None:
         bridge.stop()
 
 
-@pytest.mark.xfail(strict=True, reason="L2 the per-host queue registry grows 1:1 and never evicts")
 def test_per_host_queue_registry_is_bounded() -> None:
     """PERF-003 — 1024 host names must not create 1024 retained queues."""
     start = len(bridge_mod._shell_v2)
@@ -833,7 +810,6 @@ def test_per_host_queue_registry_is_bounded() -> None:
     assert len(bridge_mod._shell_v2) - start <= 256
 
 
-@pytest.mark.xfail(strict=True, reason="K2/L2 dead shells accumulate because alive stays true")
 def test_idle_pool_and_fds_stay_bounded() -> None:
     """PERF-004 — twelve kill/reap cycles must not grow the pool or fd table."""
     pool = agent_mod.ShellPool(max_idle=1)
@@ -940,7 +916,6 @@ def test_gpu_route_survives_v1_cutover(tmp_path: Path) -> None:
         bridge.stop()
 
 
-@pytest.mark.xfail(strict=True, reason="K13 endpoint modules re-declare wire constants")
 def test_wire_constants_have_one_authoritative_definition() -> None:
     """INT-005 — no endpoint may assign a protocol name already owned by proto."""
     owned = {
@@ -965,7 +940,6 @@ def test_wire_constants_have_one_authoritative_definition() -> None:
     assert duplicates == []
 
 
-@pytest.mark.xfail(strict=True, reason="K12 a non-Upgrade Connection header still receives 101")
 def test_connection_header_is_required_for_upgrade(tmp_path: Path) -> None:
     """INT-006 — Connection: keep-alive must be refused, not upgraded."""
     tunnel_port, operator_port, operator_v2_port = next_ports()
@@ -983,7 +957,6 @@ def test_connection_header_is_required_for_upgrade(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason="K14 the doc claims ciphertext-only while the bridge parses the label")
 def test_bridge_is_blind_and_docs_name_the_label_exception() -> None:
     """SEC-001 — no decrypt/terminal parse, and the documented label exception."""
     source = _source("moesh-bridge.py")
@@ -1017,14 +990,12 @@ def test_no_pty_or_terminal_byte_before_active() -> None:
     assert negotiate.index("machine.to(State.ACTIVE)") < negotiate.index("shell.spawn(")
 
 
-@pytest.mark.xfail(strict=True, reason="K6/I3 neither endpoint asserts session.authenticated before READY")
 def test_pin_is_checked_before_the_first_transport_record() -> None:
     """SEC-004 — READY implies authenticated, and the pin is enforced before records."""
     assert "session.authenticated" in _source("moesh_tunnel_v2.py")
     assert "session.authenticated" in _source("moesh_shell_v2.py")
 
 
-@pytest.mark.xfail(strict=True, reason="K8 PROLOGUE carries /1/ while PROTOCOL_VERSION is 2")
 def test_prologue_binds_the_protocol_version() -> None:
     """SEC-005 — the prologue token must equal the current major version."""
     assert f"/{proto.PROTOCOL_VERSION}/".encode() in proto.PROLOGUE
@@ -1093,7 +1064,6 @@ def test_no_operator_port_liveness_probe() -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason="K5 both runs get tunnel port 19470 and the same log path")
 def test_bridge_evidence_is_unique_across_runs() -> None:
     """UX-001 — two processes must not overwrite the same bridge log."""
     code = "from tests.harness import next_ports; print(next_ports()[0])"
