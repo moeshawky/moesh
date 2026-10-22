@@ -1,0 +1,22 @@
+[Unit]
+Description=moesh v2 receiver bridge (encrypted shell tunnel + gpu relay)
+Documentation=https://github.com/moeshawky/moesh#readme
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/bin/moesh-bridge.py
+Restart=always
+RestartSec=3
+# The log lives outside /tmp: a reboot used to take the bridge's log with it
+# and the bridge itself with it, because nothing supervised it.
+StandardOutput=append:/var/log/moesh-bridge.log
+StandardError=append:/var/log/moesh-bridge.log
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

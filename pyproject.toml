@@ -1,0 +1,133 @@
+# moesh — an SSH-like encrypted remote shell.
+#
+# One configuration file for the whole project: the dependency set, the
+# linter, the formatter, the type checker and the test runner all read from
+# here.  The environment is managed by uv (``uv sync``), and the lockfile
+# pins it.
+#
+# There is no console_scripts entry point on purpose: the operator client is
+# a thin wrapper around this file, and an installed entry point goes stale
+# after every source edit.  Run it from the checkout.
+#
+# The project is *virtual* (``package = false``): the three programs are
+# scripts at the top of the tree — ``moesh-bridge.py``, ``moesh_tunnel_v2.py``
+# and ``moesh_shell_v2.py`` — and their names and paths are the contract the
+# deployments and the systemd unit use.  A package layout would rename them
+# and break every receiver and agent host installed from this tree, so the
+# scripts stay where they are and the project manages only its environment.
+[project]
+name = "moesh"
+version = "0.2.0"
+description = "An SSH-like encrypted remote shell: Noise over an HTTP upgrade, with a persistent shell"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "noiseprotocol==0.3.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-cov>=6",
+    "ruff>=0.6",
+    "mypy>=1.11",
+    "pre-commit>=4.0",
+]
+
+[tool.uv]
+package = false
+
+# ── Ruff (linter + formatter) ──────────────────────────────────────────
+# The rule sets are chosen for what each one catches, not for coverage:
+#   E,W   pycodestyle          F    pyflakes (undefined names, unused imports)
+#   I    import order          UP   pyupgrade (modern syntax for our floor)
+#   B    bugbear (bug patterns) SIM  simplifiable code
+#   RUF  ruff-specific         C4   comprehensions
+#   RET  return style          TC   type-checking imports
+#   FA   future annotations    FURB refurb (hygiene-grade idioms)
+#   S    bandit (security)     — per-file ignores below, because the test
+#                                harness runs subprocesses on purpose.
+# PTH (pathlib) is deliberately off: the tree uses os.path consistently, and
+# rewriting every path call is churn, not quality.
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+extend-exclude = [".venv"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W", "F",
+    "I",
+    "UP",
+    "B",
+    "SIM",
+    "RUF",
+    "C4",
+    "RET",
+    "TC",
+    "FA",
+    "FURB",
+    "S",
+]
+ignore = [
+    "E501",   # the formatter owns the line length
+    "S101",   # assert is the point of a test
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = [
+    "S603",   # subprocess with a fixed argument list is what the harness does
+    "S607",   # the harness starts local processes by path
+    "S404",   # the harness starts a subprocess on purpose
+    "B011",   # assert False is a legitimate way to fail a test
+]
+"tests/harness.py" = [
+    "S603",
+    "S607",
+    "S404",
+]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+docstring-code-format = true
+
+# ── mypy (type checker) ────────────────────────────────────────────────
+# Strict: the tree annotates every public signature, so the checker is
+# asked to hold that line.  ``ignore_errors`` is never used: a module that
+# cannot be typed is fixed, not muted.
+[tool.mypy]
+strict = true
+python_version = "3.11"
+warn_return_any = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+show_error_codes = true
+files = ["moesh_proto_v2.py", "moesh_tunnel_v2.py", "moesh_shell_v2.py", "moesh-bridge.py", "tests"]
+
+# The Noise library ships no type information.  Its results are cast to the
+# types this project promises, at the four places they are used; the library
+# itself is not analysed.
+[[tool.mypy.overrides]]
+module = ["noise.*"]
+ignore_missing_imports = true
+
+# ── pytest ─────────────────────────────────────────────────────────────
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers --strict-config"
+markers = [
+    "integration: binds real ports and spawns real processes (the default for this suite)",
+]
+
+# ── coverage ───────────────────────────────────────────────────────────
+[tool.coverage.run]
+source = ["."]
+
+[tool.coverage.report]
+show_missing = true
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "if __name__ == .__main__.:",
+]
