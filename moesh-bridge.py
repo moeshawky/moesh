@@ -69,6 +69,7 @@ GPU_RELAY_HOST = "0.0.0.0"  # noqa: S104
 ALLOW_V1 = os.environ.get("MOESH_BRIDGE_ALLOW_V1", "1") != "0"
 
 GPU_PATH = "/__relay/gpu"
+RELAY_PATH_PREFIX = "/__relay/"
 V1_TUNNEL_PATH = "/__tunnel/v1"
 TUNNEL_PATH_PREFIX = TUNNEL_PATH + "/"
 GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
@@ -107,7 +108,22 @@ def valid_host(name: str) -> bool:
     return all(ch.isalnum() or ch in "._-" for ch in name)
 
 
-_gpu: queue.Queue[socket.socket] = queue.Queue(maxsize=64)
+_relays: dict[str, queue.Queue[socket.socket]] = {}
+_relays_lock = threading.Lock()
+
+
+def relay_queue(name: str) -> queue.Queue[socket.socket]:
+    """Return the queue for one relay service, creating it on first use."""
+    with _relays_lock:
+        item = _relays.get(name)
+        if item is not None:
+            return item
+        item = queue.Queue(maxsize=64)
+        _relays[name] = item
+        return item
+
+
+_gpu: queue.Queue[socket.socket] = relay_queue("gpu")
 
 
 def split_hostport(value: str, default_host: str = "127.0.0.1") -> tuple[str, int]:
@@ -239,8 +255,14 @@ def tunnel_conn(conn: socket.socket, addr: tuple[str, int]) -> None:
                 )
                 return
             q = _shell
-        elif path == GPU_PATH:
-            q = _gpu
+        elif path == GPU_PATH or path.startswith(RELAY_PATH_PREFIX):
+            svc = path[len(RELAY_PATH_PREFIX) :] if path.startswith(RELAY_PATH_PREFIX) else "gpu"
+            if not svc:
+                svc = "gpu"
+            if not valid_host(svc):
+                refuse(conn, "400 Bad Request", f"invalid relay service {svc!r}")
+                return
+            q = relay_queue(svc)
         else:
             refuse(conn, "400 Bad Request", f"unknown v1 path {path}")
             return
@@ -447,19 +469,27 @@ def serve(
         threading.Thread(target=handler, args=(conn, addr), daemon=True).start()
 
 
-def gpu_ports() -> tuple[int, ...]:
-    """Return the public relay ports, expanding a ``first-last`` range."""
-    out: list[int] = []
-    for item in os.environ.get("MOESH_BRIDGE_GPU_PORTS", "26420-26430").split(","):
+def relay_services() -> dict[str, int]:
+    """Return mapping of relay service name -> public listening port."""
+    if os.environ.get("MOESH_BRIDGE_GPU_PORTS") == "":
+        return {}
+    raw = os.environ.get("MOESH_RELAYS", "gpu:26430,lemonade:26426")
+    services: dict[str, int] = {}
+    for item in raw.split(","):
         item = item.strip()
-        if not item:
+        if not item or ":" not in item:
             continue
-        if "-" in item:
-            first, _, last = item.partition("-")
-            out.extend(range(int(first), int(last) + 1))
-        else:
-            out.append(int(item))
-    return tuple(out)
+        name, _, port_str = item.partition(":")
+        try:
+            services[name.strip()] = int(port_str.strip())
+        except ValueError:
+            continue
+    return services
+
+
+def gpu_ports() -> tuple[int, ...]:
+    """Return the ports assigned to relay services."""
+    return tuple(relay_services().values())
 
 
 if __name__ == "__main__":
@@ -474,10 +504,25 @@ if __name__ == "__main__":
         args=(OPERATOR_V2_LISTEN, operator_v2_conn, "operator-v2"),
         daemon=True,
     ).start()
-    for port in gpu_ports():
+    for svc_name, port in relay_services().items():
+        if port <= 0:
+            continue
+        q = relay_queue(svc_name)
+
+        def make_relay_handler(queue_ref: queue.Queue[socket.socket], label: str):
+            def handler(conn: socket.socket, addr: tuple[str, int]) -> None:
+                p = conn.getsockname()[1]
+                pair(conn, queue_ref, f"{label}-public:{p}", 20)
+
+            return handler
+
         threading.Thread(
             target=serve,
-            args=((GPU_RELAY_HOST, port), relay_conn, f"gpu-relay-{port}"),
+            args=(
+                (GPU_RELAY_HOST, port),
+                make_relay_handler(q, svc_name),
+                f"{svc_name}-relay-{port}",
+            ),
             daemon=True,
         ).start()
     # No listener owns the main thread: a bind conflict on one port must not

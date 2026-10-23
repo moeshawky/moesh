@@ -910,7 +910,9 @@ def test_gpu_route_survives_v1_cutover(tmp_path: Path) -> None:
             b"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
         )
         v1 = gpu.replace(b"/__relay/gpu", b"/__tunnel/v1")
+        lemonade = gpu.replace(b"/__relay/gpu", b"/__relay/lemonade")
         assert b" 101 " in _raw_request(tunnel_port, gpu)
+        assert b" 101 " in _raw_request(tunnel_port, lemonade)
         assert b"426" in _raw_request(tunnel_port, v1)
     finally:
         bridge.stop()
