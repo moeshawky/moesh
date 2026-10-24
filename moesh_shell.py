@@ -417,13 +417,25 @@ def negotiate(
     machine: proto.SessionState,
     term: str,
     fresh: bool = False,
+    rows: int | None = None,
+    cols: int | None = None,
 ) -> dict[str, Any]:
     """Send HELLO, exchange ACCEPT/READY and return the accepted configuration.
 
     Raises:
         NegotiationError: the agent's ACCEPT was not acceptable.
     """
-    rows, cols = terminal_size(sys.stdin.fileno())
+    if rows is None or cols is None:
+        try:
+            r, c = terminal_size(sys.stdin.fileno())
+            rows = r if rows is None else rows
+            cols = c if cols is None else cols
+        except ProtocolError:
+            # Non-interactive callers (e.g. moecp, pipelines) do not attach a
+            # terminal to stdin; fall back to the protocol defaults rather than
+            # failing on ioctl (measured 2026-10-24).
+            rows = rows if rows is not None else proto.DEFAULT_ROWS
+            cols = cols if cols is not None else proto.DEFAULT_COLS
     machine.to(State.NEGOTIATING)
     secure.send_control(
         Msg.HELLO,

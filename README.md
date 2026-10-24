@@ -61,6 +61,13 @@ Remote Target Host (Kaggle / AWS / GCP / TPU)              Public Receiver Bridg
 - **Deterministic Derivation:** A single 32-byte master secret (`MOESH_TUNNEL_MASTER`) provisions all numbered nodes (`host-1` through `host-10`) via HKDF-SHA256 (`info=b"moesh-agent-key-host-<n>"`).
 - **Dual-Key Migration:** Operator verifies candidate keys simultaneously, supporting both new master-derived hosts and legacy pinned agent keys without dropping active sessions.
 
+### D. Encrypted Remote File Copy (`moecp`)
+- **Familiar `scp` Semantics:** Copy files and directory hierarchies to and from remote nodes (`moecp local.txt host-3:/tmp/`, `moecp -r -p ./weights host-3:/opt/`).
+- **Non-Disruptive Transfers:** Initiates a dedicated, fresh session (`fresh_session=True`) allocating an isolated worker process without disturbing active interactive shell sessions on the host.
+- **Pure In-Memory Bootstrap:** Remote worker is pushed as an ephemeral base64+zlib bootstrap payload directly into the fresh session; zero installation required on remote nodes.
+- **End-to-End Cryptographic Verification:** Calculates and verifies SHA-256 digests on both endpoints before committing files to disk or preserving attributes (`-p`).
+- **Real-Time Progress Meter:** Dynamic transfer percentage, byte counts, and throughput metrics with `-q` quiet mode for non-interactive scripts.
+
 ---
 
 ## 4. Port & Service Topology
@@ -137,6 +144,29 @@ python3 moesh_relay.py --service embed --target 127.0.0.1:8000 --receiver receiv
 
 ---
 
+### C. Secure Remote File Copy (`moecp`)
+
+Mirroring the syntax and behavior of `scp` over the encrypted `moesh` transport:
+
+```bash
+# Upload a file to remote host-3:
+moecp model.pt host-3:/opt/models/model.pt
+
+# Upload using -n host shortcut:
+moecp -n 3 model.pt remote:/opt/models/model.pt
+
+# Recursively upload a directory preserving permissions and timestamps:
+moecp -r -p ./checkpoints host-3:/opt/checkpoints
+
+# Download a file from remote host-3:
+moecp host-3:/var/log/train.log ./train.log
+
+# Recursively download a remote directory:
+moecp -r host-3:/opt/results ./results
+```
+
+---
+
 ## 6. Complete Documentation
 
 Detailed guides and operational references:
@@ -162,8 +192,8 @@ Verification suite runs self-contained without requiring live networks or mock k
 # 1. Lint checks (Ruff standard rules)
 ruff check .
 
-# 2. Protocol core & deterministic host derivation suite (52 tests)
-python3 -m pytest tests/test_protocol_core.py tests/test_named_hosts.py -q
+# 2. Protocol core, deterministic host derivation & moecp test suite
+python3 -m pytest tests/test_protocol_core.py tests/test_named_hosts.py tests/test_moecp.py -q
 
 # 3. Full integration & operator outcome suite
 python3 -m pytest tests -q

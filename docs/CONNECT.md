@@ -248,3 +248,37 @@ python3 moesh_relay.py --service gpu --target 127.0.0.1:8001 --receiver receiver
 python3 moesh_relay.py --service embed --target 127.0.0.1:8000 --receiver receiver.example.com
 ```
 *On the receiver host, clients connect to `127.0.0.1:26428`.*
+
+---
+
+## 7. Secure Remote File Copy (`moecp`)
+
+The `moecp` command mirrors standard `scp` functionality over the encrypted `moesh` transport, allowing secure bidirectional file transfers with remote hosts.
+
+### Features
+- **Zero remote setup:** Boots an ephemeral streaming worker in-memory on the remote host without requiring extra daemons or manual script installation.
+- **Isolated execution:** Uses a fresh PTY session (`fresh_session=True`), ensuring active operator shells remain completely uninterrupted.
+- **Checksum verification:** Calculates end-to-end SHA-256 digests on both source and destination to detect any in-flight corruption.
+- **Metadata preservation:** Supports `-p` to preserve file permissions (`chmod`) and modification times (`utime`).
+
+### Syntax & Usage
+
+```bash
+# Upload a single local file to remote host-3
+moecp local.txt host-3:/tmp/remote.txt
+
+# Upload using the -n shortcut
+moecp -n 3 local.txt remote:/tmp/remote.txt
+
+# Recursively upload an entire directory tree
+moecp -r ./dataset host-3:/opt/data
+
+# Preserve permissions and timestamps
+moecp -r -p ./scripts host-3:/opt/scripts
+
+# Download a remote file to current local directory
+moecp host-3:/tmp/results.csv ./results.csv
+
+# Recursively download a directory tree
+moecp -r host-3:/opt/models ./models
+```

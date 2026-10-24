@@ -103,7 +103,7 @@ warn_return_any = true
 warn_unused_ignores = true
 warn_redundant_casts = true
 show_error_codes = true
-files = ["moesh_proto.py", "moesh_tunnel.py", "moesh_shell.py", "moesh-bridge.py", "tests"]
+files = ["moesh_proto.py", "moesh_tunnel.py", "moesh_shell.py", "moesh-bridge.py", "moecp.py", "tests"]
 
 # The Noise library ships no type information.  Its results are cast to the
 # types this project promises, at the four places they are used; the library
