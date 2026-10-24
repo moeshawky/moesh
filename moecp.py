@@ -74,6 +74,12 @@ from moesh_wire import PRELUDE_PREFIX
 CHUNK_SIZE: int = 32768
 """Maximum uncompressed chunk size for file transfer streaming (32 KiB)."""
 
+MAX_FRAME_HDR: int = 65536
+"""Maximum allowed JSON metadata header size in bytes (64 KiB)."""
+
+MAX_FRAME_PAYLOAD: int = 10485760
+"""Maximum allowed chunk payload size in bytes (10 MiB)."""
+
 MAGIC_READY: bytes = b"MOECP_READY_V1\n"
 """Handshake token emitted by the remote bootstrap worker once in raw mode."""
 
@@ -120,9 +126,22 @@ def send_frame(meta, payload=b""):
 def recv_frame():
     hdr_len_b = read_exact(8)
     hlen, dlen = struct.unpack(">II", hdr_len_b)
+    if hlen > 65536 or dlen > 10485760:
+        raise ValueError(f"frame length bounds exceeded: hdr={hlen}, data={dlen}")
     meta = json.loads(read_exact(hlen).decode("utf-8"))
     payload = read_exact(dlen) if dlen > 0 else b""
     return meta, payload
+
+def sanitize_relpath(path):
+    if not path or "\\0" in path:
+        raise ValueError(f"invalid path: {path!r}")
+    if path.startswith("/") or path.startswith("\\\\"):
+        raise ValueError(f"absolute path not allowed: {path!r}")
+    normalized = os.path.normpath(path).replace("\\\\", "/").lstrip("/")
+    parts = [p for p in normalized.split("/") if p and p != "."]
+    if not parts or any(p == ".." for p in parts):
+        raise ValueError(f"insecure path traversal: {path!r}")
+    return "/".join(parts)
 
 def run():
     set_raw()
@@ -137,6 +156,8 @@ def run():
         target = os.path.expanduser(meta.get("target", "."))
         is_dir_upload = meta.get("is_dir", False)
         dest_is_dir = os.path.isdir(target)
+        if is_dir_upload:
+            os.makedirs(target, exist_ok=True)
         send_frame({"status": "OK", "target_is_dir": dest_is_dir})
 
         while True:
@@ -149,24 +170,41 @@ def run():
                 send_frame({"status": "ERROR", "message": f"unexpected op: {op}"})
                 return 1
 
-            rel = msg["rel_path"]
-            size = msg["size"]
-            mode = msg["mode"]
-            mtime = msg["mtime"]
-            expected_sha = msg["sha256"]
+            raw_rel = msg.get("rel_path", "")
+            try:
+                rel = sanitize_relpath(raw_rel)
+            except ValueError as e:
+                send_frame({"status": "ERROR", "message": str(e)})
+                return 1
 
+            target_abs = os.path.abspath(target)
             if is_dir_upload:
-                dest_file = os.path.join(target, rel)
+                dest_file = os.path.abspath(os.path.join(target, rel))
             elif dest_is_dir:
-                dest_file = os.path.join(target, os.path.basename(rel))
+                dest_file = os.path.abspath(os.path.join(target, os.path.basename(rel)))
             else:
-                dest_file = target
+                dest_file = target_abs
 
-            os.makedirs(os.path.dirname(dest_file) or ".", exist_ok=True)
+            try:
+                if os.path.commonpath([target_abs, dest_file]) != target_abs and dest_file != target_abs:
+                    send_frame({"status": "ERROR", "message": f"path escapes target directory: {dest_file}"})
+                    return 1
+            except ValueError:
+                send_frame({"status": "ERROR", "message": f"invalid target path: {dest_file}"})
+                return 1
+
+            size = msg.get("size", 0)
+            mode = msg.get("mode", 0o644)
+            mtime = msg.get("mtime", time.time())
+            expected_sha = msg.get("sha256", "")
+
+            dest_dir = os.path.dirname(dest_file) or "."
+            os.makedirs(dest_dir, exist_ok=True)
+            tmp_file = dest_file + ".part." + str(os.getpid())
             hasher = hashlib.sha256()
 
             try:
-                with open(dest_file, "wb") as f:
+                with open(tmp_file, "wb") as f:
                     send_frame({"status": "READY"})
                     while True:
                         cmsg, cdata = recv_frame()
@@ -179,14 +217,18 @@ def run():
                             break
                         else:
                             send_frame({"status": "ERROR", "message": f"unexpected chunk op: {cop}"})
+                            if os.path.exists(tmp_file):
+                                os.remove(tmp_file)
                             return 1
 
                 actual_sha = hasher.hexdigest()
                 if actual_sha != expected_sha:
-                    if os.path.exists(dest_file):
-                        os.remove(dest_file)
+                    if os.path.exists(tmp_file):
+                        os.remove(tmp_file)
                     send_frame({"status": "ERROR", "message": f"checksum mismatch: {actual_sha} vs {expected_sha}"})
                     return 1
+
+                os.replace(tmp_file, dest_file)
 
                 if preserve:
                     try:
@@ -197,6 +239,11 @@ def run():
 
                 send_frame({"status": "OK", "sha256": actual_sha})
             except Exception as e:
+                if os.path.exists(tmp_file):
+                    try:
+                        os.remove(tmp_file)
+                    except Exception:
+                        pass
                 send_frame({"status": "ERROR", "message": str(e)})
                 return 1
 
@@ -219,15 +266,20 @@ def run():
             for root, _, files in os.walk(base_dir):
                 for fname in files:
                     full = os.path.join(root, fname)
-                    rel = os.path.relpath(full, base_dir)
                     try:
+                        rel = sanitize_relpath(os.path.relpath(full, base_dir))
                         st = os.stat(full)
                         file_list.append({"rel": rel, "full": full, "size": st.st_size, "mode": st.st_mode, "mtime": st.st_mtime})
                     except Exception:
                         pass
         else:
-            st = os.stat(source)
-            file_list.append({"rel": os.path.basename(source), "full": source, "size": st.st_size, "mode": st.st_mode, "mtime": st.st_mtime})
+            try:
+                st = os.stat(source)
+                rel = sanitize_relpath(os.path.basename(source))
+                file_list.append({"rel": rel, "full": source, "size": st.st_size, "mode": st.st_mode, "mtime": st.st_mtime})
+            except Exception as e:
+                send_frame({"status": "ERROR", "message": str(e)})
+                return 1
 
         send_frame({"status": "OK", "is_dir": is_dir, "files": [{"rel": f["rel"], "size": f["size"], "mode": f["mode"], "mtime": f["mtime"]} for f in file_list]})
 
@@ -291,6 +343,34 @@ class PathSpec:
     path: str
 
 
+def sanitize_relpath(path: str) -> str:
+    """Sanitize and validate a relative path against directory traversal.
+
+    Rejects paths containing:
+      - Embedded null bytes
+      - Path traversal components ('..')
+      - Empty components resolving outside target
+
+    Args:
+        path: Path string from incoming frame or local manifest.
+
+    Returns:
+        Clean normalized relative path safe for filesystem joining.
+
+    Raises:
+        ValueError: If path attempts directory traversal or contains invalid characters.
+    """
+    if not path or "\0" in path:
+        raise ValueError(f"invalid path: {path!r}")
+    if path.startswith("/") or path.startswith("\\"):
+        raise ValueError(f"absolute path not allowed: {path!r}")
+    normalized = os.path.normpath(path).replace("\\", "/").lstrip("/")
+    parts = [p for p in normalized.split("/") if p and p != "."]
+    if not parts or any(p == ".." for p in parts):
+        raise ValueError(f"insecure path traversal detected: {path!r}")
+    return "/".join(parts)
+
+
 def parse_path_spec(spec: str, default_host: str = "") -> PathSpec:
     """Parse a command-line path specification into a local or remote target.
 
@@ -308,6 +388,12 @@ def parse_path_spec(spec: str, default_host: str = "") -> PathSpec:
         PathSpec dataclass detailing location and resolved host.
     """
     if ":" in spec:
+        slash_idx = spec.find("/")
+        colon_idx = spec.find(":")
+        if slash_idx != -1 and slash_idx < colon_idx:
+            # Slashes precede colon: local path containing a colon (e.g. ./a:b or /path/foo:bar)
+            return PathSpec(is_remote=False, host="", path=spec)
+
         host_part, _, path_part = spec.partition(":")
         if not path_part:
             path_part = "."
@@ -416,6 +502,8 @@ class FramedStreamClient:
         """
         prefix = self._read_exact(8, timeout=timeout)
         hlen, dlen = struct.unpack(">II", prefix)
+        if hlen > MAX_FRAME_HDR or dlen > MAX_FRAME_PAYLOAD:
+            raise ProtocolError(f"received frame exceeding safety bounds: hdr={hlen}, data={dlen}")
         hdr_bytes = self._read_exact(hlen, timeout=timeout)
         meta = json.loads(hdr_bytes.decode("utf-8"))
         payload = self._read_exact(dlen, timeout=timeout) if dlen > 0 else b""
@@ -531,8 +619,11 @@ def upload_files(
         for root, _, files in os.walk(base):
             for fname in files:
                 full = os.path.join(root, fname)
-                rel = os.path.relpath(full, base)
-                file_manifest.append((full, rel))
+                try:
+                    rel = sanitize_relpath(os.path.relpath(full, base))
+                    file_manifest.append((full, rel))
+                except (ValueError, OSError):
+                    continue
     else:
         for src in sources:
             if os.path.isdir(src):
@@ -544,10 +635,18 @@ def upload_files(
                 for root, _, files in os.walk(base):
                     for fname in files:
                         full = os.path.join(root, fname)
-                        rel = os.path.join(prefix, os.path.relpath(full, base))
-                        file_manifest.append((full, rel))
+                        try:
+                            rel = sanitize_relpath(os.path.join(prefix, os.path.relpath(full, base)))
+                            file_manifest.append((full, rel))
+                        except (ValueError, OSError):
+                            continue
             else:
-                file_manifest.append((src, os.path.basename(src)))
+                try:
+                    rel = sanitize_relpath(os.path.basename(src))
+                    file_manifest.append((src, rel))
+                except ValueError as err:
+                    sys.stderr.write(f"moecp: invalid source filename {src!r}: {err}\n")
+                    return 1
 
     client.send_frame({
         "op": "INIT",
@@ -640,56 +739,90 @@ def download_files(
     files = manifest.get("files", [])
     target_is_dir = os.path.isdir(local_target)
 
+    target_abs = os.path.abspath(local_target)
+    if is_dir:
+        os.makedirs(target_abs, exist_ok=True)
+
     for item in files:
-        rel = item["rel"]
+        try:
+            rel = sanitize_relpath(item["rel"])
+        except ValueError as err:
+            sys.stderr.write(f"moecp: remote path rejected: {err}\n")
+            client.send_frame({"status": "ERROR"})
+            return 1
+
         size = item["size"]
         mode = item["mode"]
         mtime = item["mtime"]
 
         if is_dir:
-            dest_file = os.path.join(local_target, rel)
+            dest_file = os.path.abspath(os.path.join(local_target, rel))
         elif target_is_dir:
-            dest_file = os.path.join(local_target, os.path.basename(rel))
+            dest_file = os.path.abspath(os.path.join(local_target, os.path.basename(rel)))
         else:
-            dest_file = local_target
+            dest_file = target_abs
 
-        os.makedirs(os.path.dirname(dest_file) or ".", exist_ok=True)
-        client.send_frame({"op": "PULL_FILE", "rel": rel})
+        try:
+            if os.path.commonpath([target_abs, dest_file]) != target_abs and dest_file != target_abs:
+                sys.stderr.write(f"moecp: remote path escapes local target: {dest_file}\n")
+                client.send_frame({"status": "ERROR"})
+                return 1
+        except ValueError:
+            sys.stderr.write(f"moecp: invalid target path: {dest_file}\n")
+            client.send_frame({"status": "ERROR"})
+            return 1
+
+        dest_dir = os.path.dirname(dest_file) or "."
+        os.makedirs(dest_dir, exist_ok=True)
+        tmp_file = dest_file + f".part.{os.getpid()}"
+        client.send_frame({"op": "PULL_FILE", "rel": item["rel"]})
 
         meter = ProgressMeter(rel, size, quiet=quiet)
         hasher = hashlib.sha256()
 
-        with open(dest_file, "wb") as f:
-            while True:
-                cmsg, cdata = client.recv_frame()
-                cop = cmsg.get("op")
-                if cop == "CHUNK":
-                    raw = zlib.decompress(cdata)
-                    f.write(raw)
-                    hasher.update(raw)
-                    meter.update(len(raw))
-                elif cop == "FILE_END":
-                    expected_sha = cmsg.get("sha256", "")
-                    meter.finish()
-                    break
-                else:
-                    sys.stderr.write(f"moecp: unexpected chunk op: {cop}\n")
-                    return 1
+        try:
+            with open(tmp_file, "wb") as f:
+                while True:
+                    cmsg, cdata = client.recv_frame()
+                    cop = cmsg.get("op")
+                    if cop == "CHUNK":
+                        raw = zlib.decompress(cdata)
+                        f.write(raw)
+                        hasher.update(raw)
+                        meter.update(len(raw))
+                    elif cop == "FILE_END":
+                        expected_sha = cmsg.get("sha256", "")
+                        meter.finish()
+                        break
+                    else:
+                        sys.stderr.write(f"moecp: unexpected chunk op: {cop}\n")
+                        if os.path.exists(tmp_file):
+                            os.remove(tmp_file)
+                        return 1
 
-        actual_sha = hasher.hexdigest()
-        if expected_sha and actual_sha != expected_sha:
-            if os.path.exists(dest_file):
-                os.remove(dest_file)
-            sys.stderr.write(f"moecp: integrity failure on {rel}: {actual_sha} vs {expected_sha}\n")
+            actual_sha = hasher.hexdigest()
+            if expected_sha and actual_sha != expected_sha:
+                if os.path.exists(tmp_file):
+                    os.remove(tmp_file)
+                sys.stderr.write(f"moecp: integrity failure on {rel}: {actual_sha} vs {expected_sha}\n")
+                client.send_frame({"status": "ERROR"})
+                return 1
+
+            os.replace(tmp_file, dest_file)
+
+            if preserve:
+                with contextlib.suppress(Exception):
+                    os.chmod(dest_file, stat.S_IMODE(mode))
+                    os.utime(dest_file, (mtime, mtime))
+
+            client.send_frame({"status": "OK"})
+        except Exception as e:
+            if os.path.exists(tmp_file):
+                with contextlib.suppress(Exception):
+                    os.remove(tmp_file)
+            sys.stderr.write(f"moecp: download failed for {rel}: {e}\n")
             client.send_frame({"status": "ERROR"})
             return 1
-
-        if preserve:
-            with contextlib.suppress(Exception):
-                os.chmod(dest_file, stat.S_IMODE(mode))
-                os.utime(dest_file, (mtime, mtime))
-
-        client.send_frame({"status": "OK"})
 
     client.send_frame({"op": "DONE"})
     done_ack, _ = client.recv_frame()

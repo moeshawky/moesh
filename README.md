@@ -192,8 +192,8 @@ Verification suite runs self-contained without requiring live networks or mock k
 # 1. Lint checks (Ruff standard rules)
 ruff check .
 
-# 2. Protocol core, deterministic host derivation & moecp test suite
-python3 -m pytest tests/test_protocol_core.py tests/test_named_hosts.py tests/test_moecp.py -q
+# 2. Protocol core, deterministic host derivation, moecp & adversarial test suites
+python3 -m pytest tests/test_protocol_core.py tests/test_named_hosts.py tests/test_moecp.py tests/test_moecp_adversarial.py -q
 
 # 3. Full integration & operator outcome suite
 python3 -m pytest tests -q
