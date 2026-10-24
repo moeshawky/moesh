@@ -65,18 +65,29 @@ Remote Target Host (Kaggle / AWS / GCP / TPU)              Public Receiver Bridg
 
 ## 4. Port & Service Topology
 
-The receiver balances encrypted shell sessions and raw reverse relays while preserving reserved ports:
+The receiver operates as a blind socket pump with two classes of endpoints:
 
-| Port | Service / Route | Target Node Subsystem | Local Mapping | Notes |
-|---|---|---|---|---|
-| **`80`** | `/__moesh/tunnel`, `/__relay/*` | Nginx Front-End | `127.0.0.1:9447` | HTTP/1.1 Upgrade entry point |
-| **`44441`** | Operator Socket | Operator Terminal | `127.0.0.1:44441` | Local loopback bridge listener for operator clients |
-| **`26430`** | `gpu` | [`~/gpu-arm`](file:///home/ubuntu/gpu-arm) | `127.0.0.1:8001` | GPU runner / TTS inference sidecar |
-| **`26429`** | `vllm` | [`~/vllm-tpu`](file:///home/ubuntu/vllm-tpu) | `127.0.0.1:8001` | vLLM OpenAI-compatible server |
-| **`26428`** | `embed` | [`~/lemonade_qmd_models`](file:///home/ubuntu/lemonade_qmd_models) | `127.0.0.1:8000` | QMD embedding & rerank model |
-| **`26426`** | `lemonade` | [`~/lemonade_qmd_models`](file:///home/ubuntu/lemonade_qmd_models) | `127.0.0.1:28999` | Lemonade model router |
-| **`26420`** | `qwen` | [`~/lemonade_qmd_models`](file:///home/ubuntu/lemonade_qmd_models) | `127.0.0.1:8000` | Qwen generation API |
-| **`26424`** | *(FRP Vault)* | [`~/frps`](file:///home/ubuntu/frps) | `127.0.0.1:8085` | **Preserved exclusively for FRP** (`frpc-eafsj`) |
+### Core Management & Terminal Endpoints
+
+| Port | Protocol / Route | Purpose | Scope |
+|---|---|---|---|
+| **`80`** | HTTP/1.1 `/__moesh/tunnel`<br>HTTP/1.1 `/__relay/<service>` | Public ingress for outbound agent dials & reverse service relays | Public ingress (via Nginx / reverse proxy) |
+| **`44441`** | Raw TCP (Noise_XX) | Local bridge listener for operator terminal clients (`moesh_shell.py`) | Local loopback only (`127.0.0.1`) |
+
+### Configurable Reverse Service Relays
+
+The receiver bridge exposes dedicated listening ports to pair incoming connections with outbound service agents over HTTP/1.1 Upgrade. Services and public listening ports are configured on the receiver via `MOESH_RELAYS`:
+
+```bash
+# Example receiver configuration (comma-separated <service>:<port>):
+export MOESH_RELAYS="gpu:26430,vllm:26429,api:8080"
+```
+
+| Service Name | Default Bridge Port | Target Node Port | Typical Workload |
+|---|---|---|---|
+| `vllm` | `:26429` | `127.0.0.1:8001` | LLM inference server (e.g. OpenAI-compatible API) |
+| `gpu` | `:26430` | `127.0.0.1:8001` | GPU worker / custom computation sidecar |
+| `<custom>` | `:<port>` | `127.0.0.1:<port>` | Any arbitrary TCP service forwarded via `moesh_relay.py` |
 
 ---
 

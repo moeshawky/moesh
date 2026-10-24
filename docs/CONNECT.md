@@ -216,41 +216,35 @@ Accelerator Host (TPU/GPU/Kaggle)                    Receiver Bridge (Middle)   
 - **No FRPC:** No tokens, no frpc binaries, no root required, no open inbound ports needed.
 - **Firewall friendly:** All connections are outbound HTTP on port 80.
 
-### Dual-Use Port Allocation Roster
+### Service Relay Port Allocation
 
-| Port | Service Name | Source Repository | Target Local Port | Description |
-|---|---|---|---|---|
-| **`26430`** | `gpu` | `~/gpu-arm` | `127.0.0.1:8001` | GPU runner / TTS sidecar / ML inference |
-| **`26429`** | `vllm` | `~/vllm-tpu` | `127.0.0.1:8001` | vLLM OpenAI-compatible API server |
-| **`26428`** | `embed` | `~/lemonade_qmd_models` | `127.0.0.1:8000` | QMD Embedding / Reranking generator |
-| **`26426`** | `lemonade` | `~/lemonade_qmd_models` | `127.0.0.1:28999` | Lemonade model router |
-| **`26420`** | `qwen` | `~/lemonade_qmd_models` | `127.0.0.1:8000` | Qwen generation endpoint |
-| **`26424`** | *(FRP Vault)* | `~/frps` | `127.0.0.1:8085` | **Preserved exclusively for FRP** (`frpc-eafsj`) |
+The receiver bridge maps named services to listening ports (configured via `MOESH_RELAYS`):
+
+| Port | Service Name | Target Local Port | Description |
+|---|---|---|---|
+| **`26430`** | `gpu` | `127.0.0.1:8001` | GPU runner / computation sidecar |
+| **`26429`** | `vllm` | `127.0.0.1:8001` | vLLM OpenAI-compatible API server |
+| **`26428`** | `embed` | `127.0.0.1:8000` | Embedding / Reranking generator |
+| **`26426`** | `custom` | `127.0.0.1:8000` | Custom API service |
 
 ### Running on Accelerator Nodes
 
 Download `moesh_relay.py` (or copy from repo) and run in the background:
 
-#### A. vLLM on TPU VM (`~/vllm-tpu`)
+#### A. vLLM Server
 ```bash
 python3 moesh_relay.py --service vllm --target 127.0.0.1:8001 --receiver receiver.example.com
 ```
-*On this receiver host, clients connect to `http://127.0.0.1:26429/v1`.*
+*On the receiver host, clients connect to `http://127.0.0.1:26429/v1`.*
 
-#### B. GPU Runner / TTS (`~/gpu-arm`)
+#### B. GPU Runner / Worker
 ```bash
 python3 moesh_relay.py --service gpu --target 127.0.0.1:8001 --receiver receiver.example.com
 ```
-*On this receiver host, clients connect to `127.0.0.1:26430`.*
+*On the receiver host, clients connect to `127.0.0.1:26430`.*
 
-#### C. Embeddings Generator (`~/lemonade_qmd_models`)
+#### C. Embeddings Generator
 ```bash
 python3 moesh_relay.py --service embed --target 127.0.0.1:8000 --receiver receiver.example.com
 ```
-*On this receiver host, clients connect to `127.0.0.1:26428`.*
-
-#### D. Qwen Router (`~/lemonade_qmd_models`)
-```bash
-python3 moesh_relay.py --service qwen --target 127.0.0.1:8000 --receiver receiver.example.com
-```
-*On this receiver host, clients connect to `127.0.0.1:26420`.*
+*On the receiver host, clients connect to `127.0.0.1:26428`.*
