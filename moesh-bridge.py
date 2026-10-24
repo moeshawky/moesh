@@ -43,6 +43,7 @@ import hashlib
 import os
 import queue
 import socket
+import sys
 import threading
 import time
 from typing import TYPE_CHECKING
@@ -78,24 +79,23 @@ _shell_v2: dict[str, queue.Queue[socket.socket]] = {}
 _registry_lock = threading.Lock()
 MAX_HOST_QUEUES = 256
 
+_listeners_up = 0
+_listeners_lock = threading.Lock()
 
-def host_queue(name: str) -> queue.Queue[socket.socket]:
-    """Return the queue of one host, creating it on first use."""
+
+def host_queue(name: str) -> queue.Queue[socket.socket] | None:
+    """Return the queue of one host, creating it on first use.
+
+    Refuses new names when the map is at MAX_HOST_QUEUES: no eviction loops
+    that orphan pair() waiters (RC-4/RC-5). Returns None when full so the
+    caller can refuse without sending 101.
+    """
     with _registry_lock:
         item = _shell_v2.get(name)
         if item is not None:
             return item
         if len(_shell_v2) >= MAX_HOST_QUEUES:
-            for k in list(_shell_v2.keys()):
-                if _shell_v2[k].empty():
-                    del _shell_v2[k]
-                if len(_shell_v2) < MAX_HOST_QUEUES:
-                    break
-            if len(_shell_v2) >= MAX_HOST_QUEUES:
-                for k in list(_shell_v2.keys()):
-                    if _shell_v2[k].empty():
-                        del _shell_v2[k]
-                        break
+            return None
         item = queue.Queue(maxsize=8)
         _shell_v2[name] = item
         return item
@@ -126,11 +126,17 @@ def relay_queue(name: str) -> queue.Queue[socket.socket]:
 _gpu: queue.Queue[socket.socket] = relay_queue("gpu")
 
 
-def split_hostport(value: str, default_host: str = "127.0.0.1") -> tuple[str, int]:
-    """Split ``host:port`` into a tuple, defaulting the host when absent."""
+def split_hostport(value: str, default_host: str = "127.0.0.1") -> tuple[str, int] | None:
+    """Split ``host:port`` into a tuple, defaulting the host when absent.
+
+    Returns None when the port is empty or non-numeric instead of raising
+    ValueError, so a bad listen spec can be skipped at startup (G-ERR-1).
+    """
     host, _, port = value.rpartition(":")
     if not host:
         host = default_host
+    if not port or not port.isdigit():
+        return None
     return host, int(port)
 
 
@@ -144,17 +150,39 @@ def log(msg: str) -> None:
 
 
 def read_headers(conn: socket.socket) -> bytes:
-    """Read bytes through the end of the HTTP header block."""
+    """Read bytes through the end of the HTTP header block.
+
+    Peeks with MSG_PEEK until ``\\r\\n\\r\\n`` is present without consuming,
+    then consumes exactly the header bytes (through the delimiter) and leaves
+    any tail on the socket for ``pump``.  Consuming past the delimiter drops
+    bytes the peer expects to be relayed (RC-10).
+    """
     buf = b""
     conn.settimeout(15)
     while b"\r\n\r\n" not in buf:
-        chunk = conn.recv(4096)
+        chunk = conn.recv(65536, socket.MSG_PEEK)
         if not chunk:
             raise ConnectionError("closed during headers")
-        buf += chunk
+        # recv(MSG_PEEK) returns the cumulative available prefix without
+        # consuming, so appending duplicates data on partial delivery
+        # (measured 2026-10-23: a two-chunk send inflated `end` past the
+        # bytes on the wire and conn.recv(end) hung until socket timeout,
+        # dropping the upgraded connection before pump). Replace buf with
+        # each peek so buf holds the full available prefix up to the 64KB
+        # peek cap below; a header larger than the peek never exposes its
+        # \r\n\r\n delimiter and hangs until socket timeout. The tail past
+        # \r\n\r\n stays on the socket for pump.
+        buf = chunk
         if len(buf) > 65536:
             raise ConnectionError("header block too large")
-    return buf
+    end = buf.find(b"\r\n\r\n") + 4
+    consumed = b""
+    while len(consumed) < end:
+        chunk = conn.recv(end - len(consumed))
+        if not chunk:
+            raise ConnectionError("closed during header consume")
+        consumed += chunk
+    return consumed
 
 
 def request_path(headers: bytes) -> str:
@@ -212,7 +240,8 @@ def tunnel_conn(conn: socket.socket, addr: tuple[str, int]) -> None:
                     .decode("latin-1", "replace")
                     .lower()
                 )
-        if "upgrade" not in conn_hdr:
+        tokens = [t.strip() for t in conn_hdr.split(",")]
+        if "upgrade" not in tokens:
             refuse(conn, "400 Bad Request", "Connection header must contain Upgrade")
             return
         if token == UPGRADE_TOKEN:
@@ -226,6 +255,17 @@ def tunnel_conn(conn: socket.socket, addr: tuple[str, int]) -> None:
             if not valid_host(host):
                 refuse(conn, "400 Bad Request", f"invalid host name {host!r}")
                 return
+            q = host_queue(host)
+            if q is None:
+                refuse(conn, "503 Service Unavailable", "host queue full")
+                return
+            try:
+                q.put_nowait(conn)
+            except queue.Full:
+                log(f"tunnel queue full — dropping {addr}")
+                with contextlib.suppress(OSError):
+                    conn.close()
+                return
             conn.sendall(
                 b"HTTP/1.1 101 Switching Protocols\r\n"
                 b"Upgrade: " + UPGRADE_TOKEN.encode() + b"\r\n"
@@ -235,13 +275,6 @@ def tunnel_conn(conn: socket.socket, addr: tuple[str, int]) -> None:
             )
             conn.settimeout(None)
             log(f"host tunnel v2 attached from {addr} host {host}")
-            try:
-                host_queue(host).put_nowait(conn)
-            except queue.Full:
-                log(f"tunnel queue full — dropping {addr}")
-                with contextlib.suppress(OSError):
-                    conn.close()
-                return
             return
         if token != "websocket":  # noqa: S105 - a protocol identifier, not a secret
             refuse(conn, "400 Bad Request", f"unsupported upgrade token {token!r}")
@@ -336,7 +369,18 @@ def pump(a: socket.socket, b: socket.socket) -> None:
     t = threading.Thread(target=copy, args=(a, b, "host->peer"), daemon=True)
     t.start()
     copy(b, a, "peer->host")
-    t.join(timeout=5)
+    # One direction EOF'd: force the surviving copy thread to EOF too so it
+    # returns instead of blocking on recv() from a half-open peer.
+    # shutdown(SHUT_RD) makes recv() return b'' on both sockets, so both
+    # copy threads exit their loops and the join is unbounded — no 5s
+    # deadline that can drop LATE/in-flight bytes (measured 2026-10-24:
+    # t.join(timeout=5) dropped bytes on slow surviving directions;
+    # shutdown + unbounded join returns promptly with bytes already
+    # received preserved).
+    for s in (a, b):
+        with contextlib.suppress(OSError):
+            s.shutdown(socket.SHUT_RD)
+    t.join()
     for s in (a, b):
         with contextlib.suppress(OSError):
             s.close()
@@ -450,10 +494,14 @@ def relay_conn(conn: socket.socket, addr: tuple[str, int]) -> None:
 
 
 def serve(
-    listen: tuple[str, int],
+    listen: tuple[str, int] | None,
     handler: Callable[[socket.socket, tuple[str, int]], None],
     name: str,
 ) -> None:
+    global _listeners_up
+    if listen is None:
+        log(f"{name} listener not configured — skipping")
+        return
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
@@ -463,6 +511,8 @@ def serve(
         log(f"{name} bind {listen[0]}:{listen[1]} failed: {exc}")
         srv.close()
         return
+    with _listeners_lock:
+        _listeners_up += 1
     log(f"{name} listening on {listen[0]}:{listen[1]}")
     while True:
         conn, addr = srv.accept()
@@ -527,4 +577,10 @@ if __name__ == "__main__":
         ).start()
     # No listener owns the main thread: a bind conflict on one port must not
     # take down the other ten. SIGTERM still ends the process.
+    time.sleep(0.25)
+    with _listeners_lock:
+        up = _listeners_up
+    if up == 0:
+        log("no listener came up — exiting so systemd Restart=always can run")
+        sys.exit(1)
     threading.Event().wait()

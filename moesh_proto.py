@@ -2,8 +2,8 @@
 """moesh v2 — shared protocol core (framing, Noise session, state machine).
 
 This module is the single source of truth for the encrypted terminal protocol
-used by the host-side agent (``moesh_tunnel_v2.py``) and the operator-side
-client (``moesh_shell_v2.py``).  Neither endpoint re-declares a wire constant.
+used by the host-side agent (``moesh_tunnel.py``) and the operator-side
+client (``moesh_shell.py``).  Neither endpoint re-declares a wire constant.
 
 Wire format
 -----------
@@ -370,11 +370,16 @@ class NoiseSession:
             raise ProtocolError(f"unknown Noise role {role!r}")
         if len(static_private) != 32:
             raise ProtocolError("static private key must be 32 bytes")
-        if len(peer_static) != 32:
-            raise ProtocolError("peer static public key must be 32 bytes")
+        if isinstance(peer_static, (tuple, list, set)):
+            self._peer_static: tuple[bytes, ...] = tuple(bytes(k) for k in peer_static)
+            if not self._peer_static or not all(len(k) == 32 for k in self._peer_static):
+                raise ProtocolError("peer static public keys must be 32 bytes each")
+        else:
+            if len(peer_static) != 32:
+                raise ProtocolError("peer static public key must be 32 bytes")
+            self._peer_static = (bytes(peer_static),)
         keypair, connection = _import_noise()
         self._role = role
-        self._peer_static = bytes(peer_static)
         self._conn = connection.from_name(NOISE_NAME)
         self._conn.set_prologue(PROLOGUE if prologue is None else prologue)
         if role == "initiator":
@@ -448,9 +453,11 @@ class NoiseSession:
                     "Noise handshake finished without learning remote static key"
                 )
             return
-        if bytes(learned.public_bytes) != self._peer_static:
+        learned_bytes = bytes(learned.public_bytes)
+        if learned_bytes not in self._peer_static:
+            expected = ", ".join(hashlib.sha256(p).hexdigest()[:16] for p in self._peer_static)
             raise AuthenticationError(
-                f"peer static key mismatch: pinned {hashlib.sha256(self._peer_static).hexdigest()[:16]}, learned {hashlib.sha256(bytes(learned.public_bytes)).hexdigest()[:16]}"
+                f"peer static key mismatch: pinned [{expected}], learned {hashlib.sha256(learned_bytes).hexdigest()[:16]}"
             )
         self._pin_checked = True
         self._authenticated = True
@@ -498,10 +505,19 @@ class SecureChannel:
         return self._session
 
     def send(self, msg_type: int, payload: bytes = b"") -> None:
-        """Send one record of ``msg_type`` with a raw payload."""
-        if len(payload) > MAX_DATA_PAYLOAD:
+        """Send one record of ``msg_type`` with a raw payload.
+
+        DATA records are capped at ``MAX_DATA_PAYLOAD``; every control record
+        is capped at ``MAX_CONTROL_PAYLOAD`` so the control bound is enforced
+        on the session send path, not only in ``send_control`` (measured:
+        ``send(Msg.PING, 4108-byte payload)`` was accepted while
+        ``send_control`` rejected it, a parser downgrade on the same message
+        type).
+        """
+        limit = MAX_DATA_PAYLOAD if msg_type == Msg.DATA else MAX_CONTROL_PAYLOAD
+        if len(payload) > limit:
             raise FramingError(
-                f"payload of {len(payload)} bytes exceeds {MAX_DATA_PAYLOAD}"
+                f"payload of {len(payload)} bytes exceeds {limit}"
             )
         plaintext = bytes([int(msg_type)]) + payload
         self._channel.send_frame(self._session.encrypt(plaintext))
@@ -529,9 +545,10 @@ class SecureChannel:
             raise FramingError("empty transport record")
         msg_type = plaintext[0]
         payload = plaintext[1:]
-        if len(payload) > MAX_DATA_PAYLOAD:
+        limit = MAX_DATA_PAYLOAD if msg_type == Msg.DATA else MAX_CONTROL_PAYLOAD
+        if len(payload) > limit:
             raise FramingError(
-                f"inbound payload of {len(payload)} bytes exceeds {MAX_DATA_PAYLOAD}"
+                f"inbound payload of {len(payload)} bytes exceeds {limit}"
             )
         return msg_type, payload
 
@@ -568,9 +585,10 @@ class SecureChannel:
                 raise FramingError("empty transport record")
             msg_type = plaintext[0]
             payload = plaintext[1:]
-            if len(payload) > MAX_DATA_PAYLOAD:
+            limit = MAX_DATA_PAYLOAD if msg_type == Msg.DATA else MAX_CONTROL_PAYLOAD
+            if len(payload) > limit:
                 raise FramingError(
-                    f"inbound payload of {len(payload)} bytes exceeds {MAX_DATA_PAYLOAD}"
+                    f"inbound payload of {len(payload)} bytes exceeds {limit}"
                 )
             out.append((msg_type, payload))
         return out
@@ -671,19 +689,35 @@ def host_name(number: str, prefix: str = DEFAULT_PREFIX) -> str:
     """Return the routing name of a host.
 
     A number is expanded to ``<prefix>-<number>`` so both ends can speak in
-    the same single number: the host sets ``MOESH_TUNNEL_V2_HOST = 3`` and the
+    the same single number: the host sets ``MOESH_TUNNEL_HOST = 3`` and the
     operator asks for ``-n 3``.
+
+    The result is validated the same way on both ends: it must be ASCII
+    (the prelude is encoded latin-1 while the agent path is UTF-8, so only
+    ASCII agrees across encodings), at most 64 characters, and drawn from the
+    label charset (letters, digits, dot, dash, underscore).  The agent applies
+    the identical check, so the name the operator sends is the name the agent
+    queues and pins.
 
     Raises:
         ProtocolError: the number contains characters that are not allowed in
-            a routing label.
+            a routing label, or the expanded name is not a valid label.
     """
     number = number.strip()
     if not number:
-        return "default"
-    if not all(ch.isalnum() or ch in "._-" for ch in number):
-        raise ProtocolError(f"invalid host number {number!r}")
-    return f"{prefix}-{number}"
+        name = "default"
+    else:
+        if not all(ch.isalnum() or ch in "._-" for ch in number):
+            raise ProtocolError(f"invalid host number {number!r}")
+        name = f"{prefix}-{number}"
+    if (
+        not name
+        or len(name) > 64
+        or not name.isascii()
+        or not all(ch.isalnum() or ch in "._-" for ch in name)
+    ):
+        raise ProtocolError(f"invalid host name {name!r}")
+    return name
 
 
 def derive_static_key(master: bytes, name: str) -> bytes:
@@ -708,6 +742,8 @@ def derive_static_key(master: bytes, name: str) -> bytes:
     Raises:
         ProtocolError: the master secret is missing or the derivation failed.
     """
+    if not isinstance(master, (bytes, bytearray)):
+        raise ProtocolError("master secret must be bytes")
     if not master:
         raise ProtocolError("no master secret to derive from")
     try:
@@ -716,9 +752,12 @@ def derive_static_key(master: bytes, name: str) -> bytes:
     except ImportError as exc:  # pragma: no cover - environment dependent
         raise ProtocolError("the 'cryptography' package is required") from exc
     info = b"moesh-tunnel-v2/agent-static-key/v1/" + name.encode("utf-8")
-    return HKDF(algorithm=hashes.SHA256(), length=32, salt=None, info=info).derive(
-        master
-    )
+    try:
+        return HKDF(algorithm=hashes.SHA256(), length=32, salt=None, info=info).derive(
+            master
+        )
+    except Exception as exc:  # derivation failures are protocol errors, not TypeError
+        raise ProtocolError(f"key derivation failed: {exc}") from exc
 
 
 def public_key_of(private: bytes) -> str:
@@ -732,6 +771,8 @@ def public_key_of(private: bytes) -> str:
         from cryptography.hazmat.primitives.asymmetric import x25519
     except ImportError as exc:  # pragma: no cover - environment dependent
         raise ProtocolError("the 'cryptography' package is required") from exc
+    if len(private) != 32:
+        raise ProtocolError("private key must be 32 bytes")
     key = x25519.X25519PrivateKey.from_private_bytes(private)
     return (
         key.public_key()
@@ -747,6 +788,8 @@ def public_key_bytes(private: bytes) -> bytes:
         from cryptography.hazmat.primitives.asymmetric import x25519
     except ImportError as exc:  # pragma: no cover - environment dependent
         raise ProtocolError("the 'cryptography' package is required") from exc
+    if len(private) != 32:
+        raise ProtocolError("private key must be 32 bytes")
     key = x25519.X25519PrivateKey.from_private_bytes(private)
     return key.public_key().public_bytes(
         serialization.Encoding.Raw, serialization.PublicFormat.Raw

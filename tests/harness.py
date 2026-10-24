@@ -34,18 +34,18 @@ import termios
 import time
 from typing import Any
 
-import moesh_proto_v2 as proto
+import moesh_proto as proto
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TUNNEL_DIR = os.path.dirname(HERE)
 
 #: Interpreter for every subprocess the harness launches; the default is the
 #: running interpreter, so the suite is self-contained wherever it is
-#: invoked.  Override with MOESH_TUNNEL_V2_PYTHON.
-AGENT_PYTHON = os.environ.get("MOESH_TUNNEL_V2_PYTHON", sys.executable)
+#: invoked.  Override with MOESH_TUNNEL_PYTHON.
+AGENT_PYTHON = os.environ.get("MOESH_TUNNEL_PYTHON", sys.executable)
 BRIDGE = os.path.join(TUNNEL_DIR, "moesh-bridge.py")
-AGENT = os.path.join(TUNNEL_DIR, "moesh_tunnel_v2.py")
-CLIENT = os.path.join(TUNNEL_DIR, "moesh_shell_v2.py")
+AGENT = os.path.join(TUNNEL_DIR, "moesh_tunnel.py")
+CLIENT = os.path.join(TUNNEL_DIR, "moesh_shell.py")
 
 #: Where the evidence of a run is written.  The operator reads these paths
 #: when a test fails, so they are part of the contract with the operator.
@@ -244,11 +244,11 @@ def start_agent(
     env = dict(os.environ)
     env.update(
         {
-            "MOESH_TUNNEL_V2_RECEIVER": host,
-            "MOESH_TUNNEL_V2_RECEIVER_PORT": str(port),
-            "MOESH_TUNNEL_V2_AGENT_KEY": agent_private.hex(),
-            "MOESH_TUNNEL_V2_OPERATOR_PUB": operator_public.hex(),
-            "MOESH_TUNNEL_V2_CHILD_PIDFILE": os.path.join(str(tmp_path), "shell.pid"),
+            "MOESH_TUNNEL_RECEIVER": host,
+            "MOESH_TUNNEL_RECEIVER_PORT": str(port),
+            "MOESH_TUNNEL_AGENT_KEY": agent_private.hex(),
+            "MOESH_TUNNEL_OPERATOR_PUB": operator_public.hex(),
+            "MOESH_TUNNEL_CHILD_PIDFILE": os.path.join(str(tmp_path), "shell.pid"),
         }
     )
     # The agent keeps writing to it for as long as it runs.

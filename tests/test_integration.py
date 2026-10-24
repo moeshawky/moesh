@@ -25,7 +25,7 @@ if TYPE_CHECKING:
 
 import pytest
 
-import moesh_proto_v2 as proto
+import moesh_proto as proto
 from tests.harness import (
     AGENT_PYTHON,
     CLIENT,
@@ -73,10 +73,10 @@ def stack(tmp_path: Path) -> Iterator[Stack]:
     client_env = dict(os.environ)
     client_env.update(
         {
-            "MOESH_SHELL_V2_ADDR": f"127.0.0.1:{operator_v2_port}",
-            "MOESH_SHELL_V2_KEYFILE": operator_keyfile,
-            "MOESH_SHELL_V2_PEER_PUBFILE": agent_pubfile,
-            "MOESH_SHELL_V2_HOSTS_FILE": pins_file,
+            "MOESH_SHELL_ADDR": f"127.0.0.1:{operator_v2_port}",
+            "MOESH_SHELL_KEYFILE": operator_keyfile,
+            "MOESH_SHELL_PEER_PUBFILE": agent_pubfile,
+            "MOESH_SHELL_HOSTS_FILE": pins_file,
             "TERM": "xterm-256color",
         }
     )
@@ -171,7 +171,7 @@ def test_an_unauthenticated_operator_cannot_reach_the_shell(
     with open(wrong_keyfile, "w", encoding="ascii") as handle:
         handle.write(bogus_private.hex() + "\n")
     env = dict(stack["client_env"])
-    env["MOESH_SHELL_V2_KEYFILE"] = wrong_keyfile
+    env["MOESH_SHELL_KEYFILE"] = wrong_keyfile
     session = OperatorSession([AGENT_PYTHON, CLIENT], env, rows=24, cols=80)
     try:
         with pytest.raises(AssertionError):
@@ -383,8 +383,8 @@ def test_the_operator_reports_a_missing_agent(stack: Stack) -> None:
     )
     try:
         env = dict(stack["client_env"])
-        env["MOESH_SHELL_V2_HANDSHAKE_TIMEOUT"] = "5"
-        env["MOESH_SHELL_V2_ADDR"] = f"127.0.0.1:{lonely_v2}"
+        env["MOESH_SHELL_HANDSHAKE_TIMEOUT"] = "5"
+        env["MOESH_SHELL_ADDR"] = f"127.0.0.1:{lonely_v2}"
         master, slave = pty.openpty()
         try:
             proc = subprocess.Popen(
@@ -440,7 +440,7 @@ def test_the_operator_waits_for_a_restarting_host(
     host back and requires the client to attach to it without help.
     """
     env = dict(stack["client_env"])
-    env["MOESH_SHELL_V2_HANDSHAKE_TIMEOUT"] = "5"
+    env["MOESH_SHELL_HANDSHAKE_TIMEOUT"] = "5"
     session = OperatorSession([AGENT_PYTHON, CLIENT], env, rows=24, cols=80)
     replacement = None
     try:
@@ -530,7 +530,7 @@ def test_a_late_host_still_finds_the_operator_waiting(
     agent = None
     try:
         env = dict(stack["client_env"])
-        env["MOESH_SHELL_V2_ADDR"] = f"127.0.0.1:{operator_v2_port}"
+        env["MOESH_SHELL_ADDR"] = f"127.0.0.1:{operator_v2_port}"
         session = OperatorSession(
             [AGENT_PYTHON, CLIENT, "--no-reconnect"], env, rows=24, cols=80
         )
@@ -618,7 +618,7 @@ def test_the_bridge_does_not_eat_the_first_handshake_frame(stack: Stack) -> None
 
     The probe writes them together on purpose, so the race cannot hide.
     """
-    operator_keyfile = stack["client_env"]["MOESH_SHELL_V2_KEYFILE"]
+    operator_keyfile = stack["client_env"]["MOESH_SHELL_KEYFILE"]
     with open(operator_keyfile, encoding="ascii") as handle:
         private = bytes.fromhex(handle.read().strip())
     peer = bytes.fromhex(stack["agent_public"].hex())

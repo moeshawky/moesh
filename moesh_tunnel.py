@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""moesh v2 — host-side agent (Noise responder).
+"""moesh — host-side agent (Noise responder).
 
 The agent runs on the host that offers the shell (the side away from the
 operator's terminal).  It dials the receiver through an HTTP/1.1 Upgrade
@@ -28,17 +28,17 @@ Lifecycle (measured, 2026-10-20)
 
 Configuration (environment)
 ---------------------------
-``MOESH_TUNNEL_V2_RECEIVER``       receiver address to dial (no default: with
+``MOESH_TUNNEL_RECEIVER``       receiver address to dial (no default: with
                                    nothing set the agent refuses to start)
-``MOESH_TUNNEL_V2_RECEIVER_PORT``  receiver port (default ``80``)
-``MOESH_TUNNEL_V2_PATH``      Upgrade path (default ``/__moesh/tunnel``)
-``MOESH_TUNNEL_V2_AGENT_KEY``  agent static private key, 64 hex characters
-``MOESH_TUNNEL_V2_AGENT_KEYFILE``  file holding the same key
-``MOESH_TUNNEL_V2_OPERATOR_PUB``  pinned operator static public key (hex)
-``MOESH_TUNNEL_V2_HOST``      this host's NUMBER (the identity switch)
-``MOESH_TUNNEL_V2_MASTER``    master secret; the static key is derived from it
-``MOESH_TUNNEL_V2_NAME``      explicit routing name (when no number is set)
-``MOESH_TUNNEL_V2_CHILD_PIDFILE``  optional file receiving the shell's PID
+``MOESH_TUNNEL_RECEIVER_PORT``  receiver port (default ``80``)
+``MOESH_TUNNEL_PATH``      Upgrade path (default ``/__moesh/tunnel``)
+``MOESH_TUNNEL_AGENT_KEY``  agent static private key, 64 hex characters
+``MOESH_TUNNEL_AGENT_KEYFILE``  file holding the same key
+``MOESH_TUNNEL_OPERATOR_PUB``  pinned operator static public key (hex)
+``MOESH_TUNNEL_HOST``      this host's NUMBER (the identity switch)
+``MOESH_TUNNEL_MASTER``    master secret; the static key is derived from it
+``MOESH_TUNNEL_NAME``      explicit routing name (when no number is set)
+``MOESH_TUNNEL_CHILD_PIDFILE``  optional file receiving the shell's PID
 
 The agent private key is never embedded in this file, printed, or passed on a
 command line; it is read from the environment or from a file.  When no key is
@@ -51,6 +51,7 @@ import argparse
 import base64
 import contextlib
 import enum
+import errno
 import fcntl
 import hashlib
 import os
@@ -67,8 +68,8 @@ from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import moesh_proto_v2 as proto
-from moesh_proto_v2 import (
+import moesh_proto as proto
+from moesh_proto import (
     AuthenticationError,
     Msg,
     NegotiationError,
@@ -78,8 +79,8 @@ from moesh_proto_v2 import (
 )
 
 DEFAULT_RECEIVER = ""
-"""Receiver address to dial.  Empty by default: an address must be provisioned
-(through ``MOESH_TUNNEL_V2_RECEIVER``) or the agent refuses to start, so a
+"""Receiver address to dial. Empty by default: an address must be provisioned
+(through ``MOESH_TUNNEL_RECEIVER``) or the agent refuses to start, so a
 bare checkout never dials anywhere."""
 DEFAULT_PORT = 80
 DEFAULT_SESSIONS = 3
@@ -127,7 +128,7 @@ class Stop(Exception):
 
 def log(message: str) -> None:
     """Write one flushed log line; the caller polls this log for its postcondition."""
-    print("[tunnel-v2 {}] {}".format(time.strftime("%H:%M:%S"), message), flush=True)
+    print("[moesh-tunnel {}] {}".format(time.strftime("%H:%M:%S"), message), flush=True)
 
 
 def _on_stop(_signum: int, _frame: Any) -> None:
@@ -142,23 +143,35 @@ def _on_stop(_signum: int, _frame: Any) -> None:
 def load_agent_private_key() -> bytes:
     """Return the agent's static private key.
 
-    Sources, in order: ``MOESH_TUNNEL_V2_AGENT_KEY``, ``MOESH_TUNNEL_V2_AGENT_KEYFILE``.
+    Sources, in order: ``MOESH_TUNNEL_AGENT_KEY``, ``MOESH_TUNNEL_AGENT_KEYFILE``.
 
     Raises:
         ProtocolError: no key was provisioned or the key is malformed.
     """
-    raw = os.environ.get("MOESH_TUNNEL_V2_AGENT_KEY", "").strip()
-    path = os.environ.get("MOESH_TUNNEL_V2_AGENT_KEYFILE", "").strip()
+    raw = (
+        os.environ.get("MOESH_TUNNEL_AGENT_KEY", "").strip()
+        or os.environ.get("MOESH_TUNNEL_V2_AGENT_KEY", "").strip()
+        or os.environ.get("NB_TUNNEL_V2_AGENT_KEY", "").strip()
+    )
+    path = (
+        os.environ.get("MOESH_TUNNEL_AGENT_KEYFILE", "").strip()
+        or os.environ.get("MOESH_TUNNEL_V2_AGENT_KEYFILE", "").strip()
+        or os.environ.get("NB_TUNNEL_V2_AGENT_KEYFILE", "").strip()
+    )
     if not raw and path:
         try:
             with open(path, encoding="ascii") as handle:
                 raw = handle.read().strip()
-        except OSError as exc:
+        except (OSError, UnicodeDecodeError) as exc:
+            # A non-ASCII key file must not escape as a traceback: the tunnel
+            # worker does not catch ValueError (moesh_tunnel.py:1044-1056), so
+            # an undecodable key killed the worker instead of backing off
+            # (B-READ-TUNNEL / T2, measured 2026-10-23).
             raise ProtocolError(f"cannot read agent key file {path}: {exc}") from exc
     if not raw:
         raise ProtocolError(
-            "agent static key not provisioned: set MOESH_TUNNEL_V2_AGENT_KEY or "
-            "MOESH_TUNNEL_V2_AGENT_KEYFILE"
+            "agent static key not provisioned: set MOESH_TUNNEL_AGENT_KEY or "
+            "MOESH_TUNNEL_AGENT_KEYFILE"
         )
     raw = raw.removeprefix("0x").replace(":", "").strip()
     try:
@@ -177,13 +190,15 @@ def load_operator_pin() -> bytes:
         ProtocolError: no pin was provisioned.
     """
     raw = (
-        os.environ.get("MOESH_TUNNEL_V2_OPERATOR_PUB", "").strip()
+        os.environ.get("MOESH_TUNNEL_OPERATOR_PUB", "").strip()
+        or os.environ.get("MOESH_TUNNEL_V2_OPERATOR_PUB", "").strip()
+        or os.environ.get("NB_TUNNEL_V2_OPERATOR_PUB", "").strip()
         or PINNED_OPERATOR_PUB.strip()
     )
     if not raw:
         raise ProtocolError(
             "operator static public key not provisioned: set "
-            "MOESH_TUNNEL_V2_OPERATOR_PUB or bake PINNED_OPERATOR_PUB into the agent"
+            "MOESH_TUNNEL_OPERATOR_PUB or bake PINNED_OPERATOR_PUB into the agent"
         )
     try:
         pin = bytes.fromhex(raw.removeprefix("0x").replace(":", "").strip())
@@ -199,7 +214,7 @@ def load_operator_pin() -> bytes:
 def host_name() -> str:
     """Return this host's routing name.
 
-    ``MOESH_TUNNEL_V2_HOST`` carries the NUMBER that identifies this
+    ``MOESH_TUNNEL_HOST`` carries the NUMBER that identifies this
     host, exactly like the port number in the operator's SSH host
     entries: change the number and this host's identity changes.  The name
     is ``<prefix>-<number>``; with no number the host keeps the name
@@ -209,12 +224,21 @@ def host_name() -> str:
         ProtocolError: the name is empty or has characters the receiver will
             not accept.
     """
-    number = os.environ.get("MOESH_TUNNEL_V2_HOST", "").strip()
-    prefix = os.environ.get("MOESH_TUNNEL_V2_PREFIX", proto.DEFAULT_PREFIX).strip()
+    number = (
+        os.environ.get("MOESH_TUNNEL_HOST", "").strip()
+        or os.environ.get("MOESH_TUNNEL_V2_HOST", "").strip()
+        or os.environ.get("MOESH_TUNNEL_V2_NOTEBOOK", "").strip()
+        or os.environ.get("NB_TUNNEL_V2_NOTEBOOK", "").strip()
+    )
+    prefix = (
+        os.environ.get("MOESH_TUNNEL_PREFIX", "").strip()
+        or os.environ.get("MOESH_TUNNEL_V2_PREFIX", "").strip()
+        or proto.DEFAULT_PREFIX
+    ).strip()
     if number:
         name = proto.host_name(number, prefix or proto.DEFAULT_PREFIX)
     else:
-        name = os.environ.get("MOESH_TUNNEL_V2_NAME", DEFAULT_NAME).strip()
+        name = os.environ.get("MOESH_TUNNEL_NAME", DEFAULT_NAME).strip()
     if (
         not name
         or len(name) > 64
@@ -231,17 +255,21 @@ def agent_private_key(name: str) -> bytes:
 
     Two sources, in order:
 
-    1. ``MOESH_TUNNEL_V2_MASTER`` — a master secret, from which the key is
+    1. ``MOESH_TUNNEL_MASTER`` — a master secret, from which the key is
        derived for this host's name.  This is the mode that gives the
        operator the old "switch one number" ease: the identity NUMBER set
        on the host side changes the identity by itself.
-    2. ``MOESH_TUNNEL_V2_AGENT_KEY`` / ``MOESH_TUNNEL_V2_AGENT_KEYFILE`` — a raw
+    2. ``MOESH_TUNNEL_AGENT_KEY`` / ``MOESH_TUNNEL_AGENT_KEYFILE`` — a raw
        32-byte key, for hosts that want a key of their own.
 
     Raises:
         ProtocolError: no key could be obtained.
     """
-    master = os.environ.get("MOESH_TUNNEL_V2_MASTER", "").strip()
+    master = (
+        os.environ.get("MOESH_TUNNEL_MASTER", "").strip()
+        or os.environ.get("MOESH_TUNNEL_V2_MASTER", "").strip()
+        or os.environ.get("NB_TUNNEL_V2_MASTER", "").strip()
+    )
     if master:
         cleaned = master.removeprefix("0x").replace(":", "").strip()
         try:
@@ -385,10 +413,12 @@ class HostShell:
             os.environ["LANG"] = "C.UTF-8"
             os.environ["LC_ALL"] = "C.UTF-8"
             for secret_var in (
-                "MOESH_TUNNEL_V2_AGENT_KEY",
-                "MOESH_TUNNEL_V2_AGENT_MASTER_SECRET",
-                "MOESH_SHELL_V2_OPERATOR_KEY",
-                "MOESH_TUNNEL_V2_CHILD_PIDFILE",
+                "MOESH_TUNNEL_AGENT_KEY",
+                "MOESH_TUNNEL_AGENT_KEYFILE",
+                "MOESH_TUNNEL_MASTER",
+                "MOESH_TUNNEL_AGENT_MASTER_SECRET",
+                "MOESH_SHELL_OPERATOR_KEY",
+                "MOESH_TUNNEL_CHILD_PIDFILE",
             ):
                 os.environ.pop(secret_var, None)
             try:
@@ -409,7 +439,7 @@ class HostShell:
 
     def _write_pidfile(self) -> None:
         """Record the shell's PID where the operator asked for it."""
-        path = os.environ.get("MOESH_TUNNEL_V2_CHILD_PIDFILE", "").strip()
+        path = os.environ.get("MOESH_TUNNEL_CHILD_PIDFILE", "").strip()
         if not path or self.pid is None:
             return
         try:
@@ -420,7 +450,7 @@ class HostShell:
 
     def _remove_pidfile(self) -> None:
         """Remove the PID file if this agent owns it."""
-        path = os.environ.get("MOESH_TUNNEL_V2_CHILD_PIDFILE", "").strip()
+        path = os.environ.get("MOESH_TUNNEL_CHILD_PIDFILE", "").strip()
         if not path:
             return
         with contextlib.suppress(OSError):
@@ -457,9 +487,15 @@ class HostShell:
             self.dropped += excess
 
     def take(self) -> bytes:
-        """Return and clear the buffered output."""
+        """Return and clear the buffered output.
+
+        The drop counter is cleared here too: a stale count survives across
+        attaches otherwise, and negotiate logs it on replay
+        (G-SEM-2/L16 / T5, measured 2026-10-23).
+        """
         out = bytes(self.buffer)
         self.buffer.clear()
+        self.dropped = 0
         return out
 
     def reap(self) -> int:
@@ -788,12 +824,12 @@ def negotiate(
             shell.spawn(accepted["term"], accepted["rows"], accepted["cols"])
         else:
             shell.apply_size(accepted["rows"], accepted["cols"])
-            # The prompt the previous operator saw was already consumed. A newline
-            # makes the shell draw a fresh prompt, the way tmux does on attach.
-            fd = shell.fd
-            if fd is not None:
-                with contextlib.suppress(OSError):
-                    os.write(fd, b"\n")
+            # Resume does not inject a newline: keystrokes already queued in the
+            # PTY canonical buffer must not be submitted by the agent (B5/B09 /
+            # T4, measured 2026-10-23: an unconditional os.write(fd, b"\n")
+            # executed the previous operator's unfinished line).  The "no
+            # newline was typed" fact is not on this path, so negotiate must
+            # not manufacture one.
             log(f"attached to the running shell (pid {shell.pid})")
         held = shell.take()
         if held:
@@ -801,7 +837,7 @@ def negotiate(
                 log(f"replaying {len(held)} buffered bytes ({shell.dropped} dropped)")
             else:
                 log(f"replaying {len(held)} buffered bytes")
-            for piece in chunks(held, proto.MAX_DATA_PAYLOAD):
+            for piece in chunks(held, accepted["max_record"]):
                 secure.send(Msg.DATA, piece)
         accepted["_shell"] = shell
         success = True
@@ -832,8 +868,13 @@ def run_session(
     status = 0
     last_rx = time.time()
     last_ping = time.time()
-    ping_every = float(os.environ.get("MOESH_TUNNEL_V2_PING_INTERVAL", "15") or 0)
-    dead_after = float(os.environ.get("MOESH_TUNNEL_V2_DEAD_AFTER", "90") or 0)
+    ping_every = float(os.environ.get("MOESH_TUNNEL_PING_INTERVAL", "15") or 0)
+    dead_after = float(os.environ.get("MOESH_TUNNEL_DEAD_AFTER", "45") or 0)
+    # 45s of operator silence means the client has declared the tunnel dead
+    # (its own deadline); the shell stays alive for re-attach (B11 / T11,
+    # measured 2026-10-23: 90s left a half-open window in which the client
+    # reconnected while the old worker still held the shell, spawning a
+    # second shell).
     while True:
         if _stopping:
             log("the agent is stopping; the session ends abruptly")
@@ -869,6 +910,18 @@ def run_session(
                     # exit instead of waiting for the host to come back.
                     log("the agent is stopping; the session ends abruptly")
                     return "detached"
+                # The PTY reported EIO but waitpid has not handed us the child
+                # yet.  Do not fabricate an authenticated EXIT status 0: that
+                # suppresses the client's reconnect and conceals a live shell
+                # (B13 / T7, measured 2026-10-22: exit 7 reached the agent as
+                # status 0).  Only a reaped shell (pid None) has a real status
+                # to report; otherwise detach and let the client re-attach to
+                # the shell the pool still holds.
+                if shell.pid is not None:
+                    log(
+                        f"remote shell exited but is not yet reapable (pid {shell.pid}); detaching"
+                    )
+                    return "detached"
                 log(f"remote shell exited (status {status})")
                 try:
                     secure.send_control(Msg.EXIT, {"status": status, "signal": None})
@@ -876,7 +929,7 @@ def run_session(
                 except (OSError, ProtocolError):
                     pass
                 return "closed"
-            for piece in chunks(data, proto.MAX_DATA_PAYLOAD):
+            for piece in chunks(data, accepted["max_record"]):
                 secure.send(Msg.DATA, piece)
         # The transport's buffer is drained every pass, not only when the
         # socket says it is readable: a record that arrived together with
@@ -889,9 +942,30 @@ def run_session(
             last_rx = time.time()
             if msg_type == Msg.DATA:
                 if fd is not None:
-                    write_all(fd, payload)
+                    # A write to a PTY master the agent just closed (terminate_all
+                    # during shutdown) raises EBADF mid-write.  Detach quietly
+                    # instead of logging a false "session failed" (L17 / T9,
+                    # measured 2026-10-23: EBADF was logged as session failure
+                    # while the agent was stopping).  Any other OSError still
+                    # surfaces as a session failure so the worker backs off and
+                    # retries.
+                    try:
+                        write_all(fd, payload)
+                    except OSError as exc:
+                        if _stopping and exc.errno == errno.EBADF:
+                            log("the agent is stopping; the session ends abruptly")
+                            return "detached"
+                        raise
             elif msg_type == Msg.RESIZE:
-                rows, cols = decode_resize(payload)
+                # Reject an out-of-range RESIZE locally instead of letting the
+                # NegotiationError kill the socket (B10 / T6, measured
+                # 2026-10-23: cols=1001 dropped the whole session and the
+                # client reconnected into the same oversize window).
+                try:
+                    rows, cols = decode_resize(payload)
+                except NegotiationError as exc:
+                    log(f"resize rejected ({exc}); keeping the session alive")
+                    continue
                 shell.apply_size(rows, cols)
                 log(f"resized to {rows}x{cols}")
             elif msg_type == Msg.PING:
@@ -999,15 +1073,27 @@ def generate_key(keyfile: str, force: bool = False) -> int:
             file=sys.stderr,
         )
         return 1
-    os.makedirs(os.path.dirname(path), exist_ok=True) if os.path.dirname(path) else None
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, mode=0o700, exist_ok=True)
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    # fchmod before the first write: the private key is 0600 from the moment
+    # the inode exists, so there is no pre-chmod window under a lax umask
+    # (G-SEC-2 / T1, measured 2026-10-23: the old makedirs-default +
+    # open-then-chmod left the directory and any pre-existing inode
+    # world-readable during the write window).  Mirrors moesh_shell.py:185-187.
+    os.fchmod(descriptor, 0o600)
     with os.fdopen(descriptor, "w", encoding="ascii") as handle:
         handle.write(private.hex() + "\n")
-    os.chmod(path, 0o600)
+    # The .pub is created at 0644 at open time instead of world-writable under
+    # umask 0 until a later chmod (G-SEC-2 / T1, same witness).
     public_path = path + ".pub"
-    with open(public_path, "w", encoding="ascii") as handle:
+    with os.fdopen(
+        os.open(public_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644),
+        "w",
+        encoding="ascii",
+    ) as handle:
         handle.write(public.hex() + "\n")
-    os.chmod(public_path, 0o644)
     digest = hashlib.sha256(public).digest()
     fingerprint = base64.b64encode(digest).decode("ascii").rstrip("=")
     print(f"agent static private key written to {path} (mode 0600)")
@@ -1059,7 +1145,7 @@ def tunnel_worker(host: str, port: int, path: str, name: str, pool: ShellPool) -
 
 def main(argv: list[str] | None = None) -> int:
     """Run the agent until interrupted."""
-    parser = argparse.ArgumentParser(description="moesh v2 host agent")
+    parser = argparse.ArgumentParser(description="moesh host agent")
     parser.add_argument(
         "--generate-key",
         action="store_true",
@@ -1079,22 +1165,32 @@ def main(argv: list[str] | None = None) -> int:
     if args.generate_key:
         return generate_key(args.keyfile, args.force)
 
-    host = os.environ.get("MOESH_TUNNEL_V2_RECEIVER", DEFAULT_RECEIVER).strip()
+    host = (
+        os.environ.get("MOESH_TUNNEL_RECEIVER", "").strip()
+        or os.environ.get("MOESH_TUNNEL_V2_RECEIVER", "").strip()
+        or os.environ.get("NB_TUNNEL_V2_HOST", "").strip()
+        or DEFAULT_RECEIVER
+    ).strip()
     if not host:
         raise SystemExit(
-            "no receiver configured: set MOESH_TUNNEL_V2_RECEIVER (address or "
+            "no receiver configured: set MOESH_TUNNEL_RECEIVER (address or "
             "host name the agent dials) and, if it is not port 80, "
-            "MOESH_TUNNEL_V2_RECEIVER_PORT"
+            "MOESH_TUNNEL_RECEIVER_PORT"
         )
-    port = int(os.environ.get("MOESH_TUNNEL_V2_RECEIVER_PORT", str(DEFAULT_PORT)))
-    path = os.environ.get("MOESH_TUNNEL_V2_PATH", proto.DEFAULT_PATH)
+    port = int(
+        os.environ.get("MOESH_TUNNEL_RECEIVER_PORT", "").strip()
+        or os.environ.get("MOESH_TUNNEL_V2_PORT", "").strip()
+        or os.environ.get("NB_TUNNEL_V2_PORT", "").strip()
+        or str(DEFAULT_PORT)
+    )
+    path = os.environ.get("MOESH_TUNNEL_PATH", proto.DEFAULT_PATH)
     name = host_name()
 
     signal.signal(signal.SIGTERM, _on_stop)
     signal.signal(signal.SIGINT, _on_stop)
 
     pool = ShellPool()
-    sessions = max(1, int(os.environ.get("MOESH_TUNNEL_V2_SESSIONS", DEFAULT_SESSIONS)))
+    sessions = max(1, int(os.environ.get("MOESH_TUNNEL_SESSIONS", DEFAULT_SESSIONS)))
     log(f"serving up to {sessions} concurrent operator(s) for {name!r}")
     workers = [
         threading.Thread(

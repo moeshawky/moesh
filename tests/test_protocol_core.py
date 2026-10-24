@@ -22,9 +22,9 @@ from typing import Any
 
 import pytest
 
-import moesh_proto_v2 as proto
-import moesh_tunnel_v2 as agent
-from moesh_proto_v2 import (
+import moesh_proto as proto
+import moesh_tunnel as agent
+from moesh_proto import (
     AuthenticationError,
     FramingError,
     Msg,
@@ -577,7 +577,7 @@ def test_read_host_label_chunked_reads() -> None:
 
 def test_escape_filter_detach_sequence() -> None:
     """An escape sequence \r~. causes detach immediately."""
-    from moesh_shell_v2 import EscapeFilter
+    from moesh_shell import EscapeFilter
 
     ef = EscapeFilter()
     to_send, detached = ef.feed(b"\r~.")
@@ -587,7 +587,7 @@ def test_escape_filter_detach_sequence() -> None:
 
 def test_escape_filter_literal_escape() -> None:
     """Typing ~~ after a newline emits a single ~ and returns to normal state."""
-    from moesh_shell_v2 import EscapeFilter
+    from moesh_shell import EscapeFilter
 
     ef = EscapeFilter()
     to_send, detached = ef.feed(b"\r~~")
@@ -602,7 +602,7 @@ def test_escape_filter_literal_escape() -> None:
 
 def test_escape_filter_normal_text_with_tildes() -> None:
     """Normal text containing tildes (e.g. echo ~user) is not detached."""
-    from moesh_shell_v2 import EscapeFilter
+    from moesh_shell import EscapeFilter
 
     ef = EscapeFilter()
     # As a single chunk
@@ -622,7 +622,7 @@ def test_escape_filter_normal_text_with_tildes() -> None:
 
 def test_escape_filter_split_arrival() -> None:
     """An escape sequence split across separate reads triggers detach."""
-    from moesh_shell_v2 import EscapeFilter
+    from moesh_shell import EscapeFilter
 
     ef = EscapeFilter()
     out1, det1 = ef.feed(b"\r")
@@ -640,7 +640,7 @@ def test_escape_filter_split_arrival() -> None:
 
 def test_escape_filter_burst_paste_immunity() -> None:
     """A multi-byte burst (>3 bytes) containing \\r~. does not trigger detach (GAP-01)."""
-    from moesh_shell_v2 import EscapeFilter
+    from moesh_shell import EscapeFilter
 
     ef = EscapeFilter()
     payload = b"echo hello\r~.exit\n"
@@ -651,7 +651,7 @@ def test_escape_filter_burst_paste_immunity() -> None:
 
 def test_escape_filter_bracketed_paste_immunity() -> None:
     """Bracketed paste blocks containing \\r~. do not trigger detach (GAP-01)."""
-    from moesh_shell_v2 import EscapeFilter
+    from moesh_shell import EscapeFilter
 
     # Single chunk with bracketed paste wrapper
     ef = EscapeFilter()
@@ -677,7 +677,7 @@ def test_escape_filter_bracketed_paste_immunity() -> None:
 
 def test_escape_filter_trailing_bytes_on_detach() -> None:
     """When . is detected after ~, trailing bytes are not processed and detach returns immediately (GAP-04)."""
-    from moesh_shell_v2 import EscapeFilter
+    from moesh_shell import EscapeFilter
 
     ef = EscapeFilter()
     ef.feed(b"\r")
@@ -697,7 +697,7 @@ def test_escape_filter_trailing_bytes_on_detach() -> None:
 
 def test_escape_filter_flush_pending_tilde() -> None:
     """Pending held tilde is emitted on flush when stream ends."""
-    from moesh_shell_v2 import EscapeFilter
+    from moesh_shell import EscapeFilter
 
     ef = EscapeFilter()
     ef.feed(b"\r~")
@@ -711,7 +711,7 @@ def test_sigwinch_restoration_in_run_session() -> None:
     import signal
     from unittest.mock import MagicMock
 
-    from moesh_shell_v2 import run_session
+    from moesh_shell import run_session
 
     def dummy_handler(_signum: int, _frame: Any) -> None:
         pass

@@ -3,7 +3,7 @@
 
 The operator's SSH entries gave one number (the port) per host, and
 changing it switched identity.  The tunnel does the same: the host's
-``MOESH_TUNNEL_V2_HOST = 3`` and the operator's ``moesh-shell-v2 -n 3`` name the
+``MOESH_TUNNEL_HOST = 3`` and the operator's ``moesh -n 3`` name the
 same host, and the static key is derived from the master secret plus that
 number — so the identity follows the number.
 """
@@ -21,7 +21,7 @@ if TYPE_CHECKING:
 
 import pytest
 
-import moesh_proto_v2 as proto
+import moesh_proto as proto
 from tests.harness import AGENT_PYTHON, TUNNEL_DIR, Bridge, OperatorSession, next_ports
 
 PREFIX = "host"
@@ -33,13 +33,13 @@ def _agent_env(
     env = dict(os.environ)
     env.update(
         {
-            "MOESH_TUNNEL_V2_RECEIVER": "127.0.0.1",
-            "MOESH_TUNNEL_V2_RECEIVER_PORT": str(tunnel_port),
-            "MOESH_TUNNEL_V2_MASTER": master.hex(),
-            "MOESH_TUNNEL_V2_HOST": str(number),
+            "MOESH_TUNNEL_RECEIVER": "127.0.0.1",
+            "MOESH_TUNNEL_RECEIVER_PORT": str(tunnel_port),
+            "MOESH_TUNNEL_MASTER": master.hex(),
+            "MOESH_TUNNEL_HOST": str(number),
             # The agent authenticates the operator by pinning the
             # operator's static public key.
-            "MOESH_TUNNEL_V2_OPERATOR_PUB": operator_pub.hex(),
+            "MOESH_TUNNEL_OPERATOR_PUB": operator_pub.hex(),
         }
     )
     return env
@@ -79,7 +79,7 @@ def numbered(tmp_path: Path) -> Iterator[Numbered]:
         # The agent keeps writing to it for as long as it runs.
         log = open(os.path.join(tmp_path, f"agent-{number}.log"), "wb")  # noqa: SIM115
         agents[number] = subprocess.Popen(
-            [AGENT_PYTHON, os.path.join(TUNNEL_DIR, "moesh_tunnel_v2.py")],
+            [AGENT_PYTHON, os.path.join(TUNNEL_DIR, "moesh_tunnel.py")],
             stdout=log,
             stderr=subprocess.STDOUT,
             env=_agent_env(tunnel_port, master, number, operator_public),
@@ -90,10 +90,10 @@ def numbered(tmp_path: Path) -> Iterator[Numbered]:
         env = dict(os.environ)
         env.update(
             {
-                "MOESH_SHELL_V2_ADDR": f"127.0.0.1:{operator_v2_port}",
-                "MOESH_SHELL_V2_KEYFILE": str(operator_keyfile),
-                "MOESH_SHELL_V2_HOSTS_FILE": str(pins),
-                "MOESH_SHELL_V2_HANDSHAKE_TIMEOUT": "10",
+                "MOESH_SHELL_ADDR": f"127.0.0.1:{operator_v2_port}",
+                "MOESH_SHELL_KEYFILE": str(operator_keyfile),
+                "MOESH_SHELL_HOSTS_FILE": str(pins),
+                "MOESH_SHELL_HANDSHAKE_TIMEOUT": "10",
                 "TERM": "xterm-256color",
             }
         )
@@ -118,7 +118,7 @@ def numbered(tmp_path: Path) -> Iterator[Numbered]:
 def test_the_number_selects_the_host(numbered: Numbered) -> None:
     """`-n 3` reaches host 3, and its state is not host 4's."""
     three = OperatorSession(
-        [AGENT_PYTHON, os.path.join(TUNNEL_DIR, "moesh_shell_v2.py"), "-n", "3"],
+        [AGENT_PYTHON, os.path.join(TUNNEL_DIR, "moesh_shell.py"), "-n", "3"],
         numbered["client_env"](),
         rows=24,
         cols=80,
@@ -132,7 +132,7 @@ def test_the_number_selects_the_host(numbered: Numbered) -> None:
     time.sleep(2)
 
     four = OperatorSession(
-        [AGENT_PYTHON, os.path.join(TUNNEL_DIR, "moesh_shell_v2.py"), "-n", "4"],
+        [AGENT_PYTHON, os.path.join(TUNNEL_DIR, "moesh_shell.py"), "-n", "4"],
         numbered["client_env"](),
         rows=24,
         cols=80,

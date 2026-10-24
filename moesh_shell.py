@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""moesh v2 — operator-side client (Noise initiator).
+"""moesh — operator-side client (Noise initiator).
 
-The client attaches to the receiver bridge's v2 operator port and speaks the
+The client attaches to the receiver bridge's operator port and speaks the
 encrypted terminal protocol to the host agent.  It owns the **local**
 terminal: it measures the real window size, advertises it in HELLO, keeps the
 local line discipline in raw mode so control characters reach the remote PTY
@@ -18,10 +18,10 @@ invented.
 
 Configuration (environment)
 ---------------------------
-``MOESH_SHELL_V2_ADDR``       bridge operator endpoint (default ``127.0.0.1:44441``)
-``MOESH_SHELL_V2_KEYFILE``    operator static private key (default ``~/.config/moesh/operator.key``)
-``MOESH_SHELL_V2_PEER_PUBFILE`` pinned agent static public key (default ``~/.config/moesh/agent.pub``)
-``MOESH_SHELL_V2_HOSTS_FILE`` pins file, one entry per host (default ``~/.config/moesh/hosts.toml``)
+``MOESH_SHELL_ADDR``       bridge operator endpoint (default ``127.0.0.1:44441``)
+``MOESH_SHELL_KEYFILE``    operator static private key (default ``~/.config/moesh/operator.key``)
+``MOESH_SHELL_PEER_PUBFILE`` pinned agent static public key (default ``~/.config/moesh/agent.pub``)
+``MOESH_SHELL_HOSTS_FILE`` pins file, one entry per host (default ``~/.config/moesh/hosts.toml``)
 
 Side effects: reads the local terminal, puts it in raw mode while the session
 runs and restores it afterwards; writes the session's bytes to stdout.
@@ -38,6 +38,7 @@ import os
 import select
 import signal
 import socket
+import stat
 import struct
 import sys
 import termios
@@ -51,8 +52,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import contextlib
 
-import moesh_proto_v2 as proto
-from moesh_proto_v2 import (
+import moesh_proto as proto
+from moesh_proto import (
     AuthenticationError,
     Msg,
     NegotiationError,
@@ -65,7 +66,7 @@ DEFAULT_ADDR = "127.0.0.1:44441"
 # All of the operator's state lives in one config directory: the key material
 # and the pins file.  Override any piece with its environment variable.
 HOSTS_FILE = os.environ.get(
-    "MOESH_SHELL_V2_HOSTS_FILE",
+    "MOESH_SHELL_HOSTS_FILE",
     os.path.expanduser("~/.config/moesh/hosts.toml"),
 )
 DEFAULT_KEYFILE = os.path.expanduser("~/.config/moesh/operator.key")
@@ -77,7 +78,7 @@ CAPABILITIES = ("resize", "ping")
 def log(message: str) -> None:
     """Write one flushed log line to stderr (stdout carries the terminal)."""
     print(
-        "[shell-v2 {}] {}".format(time.strftime("%H:%M:%S"), message),
+        "[moesh {}] {}".format(time.strftime("%H:%M:%S"), message),
         file=sys.stderr,
         flush=True,
     )
@@ -102,12 +103,36 @@ def load_config() -> dict[str, Any]:
         raise ProtocolError(f"cannot read {HOSTS_FILE}: {exc}") from exc
 
 
+def _check_label(name: str) -> str:
+    """Validate a routing label the way the bridge does.
+
+    The prelude is encoded latin-1 while the agent request path is UTF-8, so
+    only ASCII labels agree across the two encodings (B-ECHO).  The label must
+    also fit the bridge's allowlist: non-empty, at most 64 characters, letters
+    digits dot dash underscore only (valid_host in moesh-bridge.py).  A label
+    that fails this is refused before the prelude is sent, so the queue key
+    the bridge derives from the prelude can never differ from the name the pin
+    is computed for (B-LABEL).
+    """
+    if (
+        not name
+        or len(name) > 64
+        or not name.isascii()
+        or not all(ch.isalnum() or ch in "._-" for ch in name)
+    ):
+        raise ProtocolError(f"invalid host label {name!r}")
+    return name
+
+
 def resolve_name(requested: str) -> str:
     """Turn what the operator typed into a host name.
 
     A number is expanded with the configured prefix, so ``-n 3`` means the
-    same host as the agent's ``MOESH_TUNNEL_V2_HOST = 3`` — one number on
-    both sides, the way the SSH host entries worked.
+    same host as the agent's ``MOESH_TUNNEL_HOST = 3`` — one number on
+    both sides, the way the SSH host entries worked.  The resolved label is
+    validated before it is placed on the prelude, so a name the bridge would
+    refuse (a newline, a slash, a non-ASCII character, more than 64
+    characters) is rejected here instead of silently cut at the first newline.
     """
     requested = requested.strip()
     if not requested:
@@ -115,8 +140,8 @@ def resolve_name(requested: str) -> str:
     if requested.isdigit():
         config = load_config()
         prefix = str(config.get("prefix") or proto.DEFAULT_PREFIX)
-        return proto.host_name(requested, prefix)
-    return requested
+        return _check_label(proto.host_name(requested, prefix))
+    return _check_label(requested)
 
 
 def new_master(host: str) -> int:
@@ -131,7 +156,7 @@ def new_master(host: str) -> int:
     public = proto.public_key_of(private)
     print(f"host:          {host}")
     print(f"master secret: {master.hex()}")
-    print("  -> provision this to the host as MOESH_TUNNEL_V2_MASTER")
+    print("  -> provision this to the host as MOESH_TUNNEL_MASTER")
     print(f"agent public:  {public}")
     print(f"  -> put this in {HOSTS_FILE} as [hosts.{host}] agent_pub")
     return 0
@@ -157,14 +182,17 @@ def generate_key(keyfile: str, force: bool = False) -> int:
         return 1
     directory = os.path.dirname(path)
     if directory:
-        os.makedirs(directory, exist_ok=True)
+        os.makedirs(directory, mode=0o700, exist_ok=True)
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.fchmod(descriptor, 0o600)
     with os.fdopen(descriptor, "w", encoding="ascii") as handle:
         handle.write(private.hex() + "\n")
-    os.chmod(path, 0o600)
-    with open(pub_path, "w", encoding="ascii") as handle:
+    with os.fdopen(
+        os.open(pub_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644),
+        "w",
+        encoding="ascii",
+    ) as handle:
         handle.write(public.hex() + "\n")
-    os.chmod(pub_path, 0o644)
     digest = hashlib.sha256(bytes.fromhex(public.hex())).digest()
     fingerprint = base64.b64encode(digest).decode("ascii").rstrip("=")
     print(public.hex())
@@ -172,21 +200,22 @@ def generate_key(keyfile: str, force: bool = False) -> int:
     return 0
 
 
-def pinned_key(host: str) -> bytes:
-    """Return the pinned public key of one host.
+def pinned_key(host: str) -> bytes | tuple[bytes, ...]:
+    """Return the pinned public key (or acceptable keys) of one host.
 
     The pins live in ``~/.config/moesh/hosts.toml``::
 
         prefix = "host"
         master = "<64 hex>"  # optional: one master for every host
+        legacy_agent_pub = "<64 hex>"  # optional: fallback key during migration
 
-        [hosts.host - 3]
+        [hosts.host-3]
         agent_pub = "<64 hex>"  # a pinned key
         # or
         master = "<64 hex>"  # derive the key from this master
 
     A host with no entry of its own falls back to the shared master, so
-    switching numbers needs no configuration change.  A host with neither
+    switching numbers needs no configuration change. A host with neither
     is refused: the client never trusts a key it has not been given.
 
     Raises:
@@ -197,6 +226,9 @@ def pinned_key(host: str) -> bytes:
     entry = pins.get(host) if isinstance(pins, dict) else None
     if not isinstance(entry, dict):
         entry = {}
+
+    candidates: list[bytes] = []
+
     if entry.get("agent_pub"):
         raw = str(entry["agent_pub"]).strip().removeprefix("0x")
         try:
@@ -207,17 +239,40 @@ def pinned_key(host: str) -> bytes:
             ) from exc
         if len(key) != 32:
             raise ProtocolError(f"the pinned key for host {host!r} must be 32 bytes")
-        return key
+        candidates.append(key)
+
     master_hex = entry.get("master") or config.get("master")
     if master_hex:
-        raw = str(master_hex).strip().removeprefix("0x")
+        raw = str(master_hex).strip().removeprefix("0x").replace(":", "")
         try:
             master = bytes.fromhex(raw)
         except ValueError as exc:
             raise ProtocolError(
                 f"the master secret for host {host!r} is not valid hex"
             ) from exc
-        return proto.public_key_bytes(proto.derive_static_key(master, host))
+        if len(master) < 16:
+            raise ProtocolError(
+                f"the master secret for host {host!r} must be at least 16 bytes, got {len(master)}"
+            )
+        derived = proto.public_key_bytes(proto.derive_static_key(master, host))
+        if derived not in candidates:
+            candidates.append(derived)
+
+    legacy_hex = config.get("legacy_agent_pub")
+    if legacy_hex:
+        raw_leg = str(legacy_hex).strip().removeprefix("0x").replace(":", "")
+        try:
+            leg_key = bytes.fromhex(raw_leg)
+            if len(leg_key) == 32 and leg_key not in candidates:
+                candidates.append(leg_key)
+        except ValueError:
+            pass
+
+    if len(candidates) == 1:
+        return candidates[0]
+    if len(candidates) > 1:
+        return tuple(candidates)
+
     raise ProtocolError(
         "no pin for host {!r} in {} (known: {})".format(
             host,
@@ -230,14 +285,31 @@ def pinned_key(host: str) -> bytes:
 def read_key(path: str, what: str) -> bytes:
     """Read a 32-byte hex key from ``path``.
 
+    The file is stat'ed before it is read: it must be a regular file and it
+    must be small enough to read in one bounded call, so a fifo, a device, or
+    a multi-gigabyte file cannot block or exhaust the process.  A non-ASCII
+    byte raises :class:`ProtocolError` (a :class:`ValueError` would escape the
+    :class:`OSError`-only handler and crash the caller).
+
     Raises:
-        ProtocolError: the file is missing or malformed.
+        ProtocolError: the file is missing, not a regular file, too large, or
+            malformed.
     """
+    try:
+        st = os.stat(path)
+    except OSError as exc:
+        raise ProtocolError(f"cannot read {what} at {path}: {exc}") from exc
+    if not stat.S_ISREG(st.st_mode):
+        raise ProtocolError(f"{what} at {path} is not a regular file")
+    if st.st_size > 4096:
+        raise ProtocolError(f"{what} at {path} is too large to read")
     try:
         with open(path, encoding="ascii") as handle:
             raw = handle.read().strip()
     except OSError as exc:
         raise ProtocolError(f"cannot read {what} at {path}: {exc}") from exc
+    except UnicodeDecodeError as exc:
+        raise ProtocolError(f"{what} at {path} is not valid ASCII") from exc
     raw = raw.removeprefix("0x").replace(":", "").strip()
     try:
         key = bytes.fromhex(raw)
@@ -385,7 +457,13 @@ def negotiate(
 
 
 def send_resize(secure: proto.SecureChannel, rows: int, cols: int) -> None:
-    """Send an authenticated RESIZE record."""
+    """Send an authenticated RESIZE record after validating the dimensions.
+
+    Validates locally before sending, so an out-of-range RESIZE is rejected
+    here instead of killing the agent session (B10 shell side, measured
+    2026-10-23).  Raises NegotiationError for out-of-range dimensions.
+    """
+    rows, cols = proto.validate_resize({"rows": rows, "cols": cols})
     secure.send(Msg.RESIZE, struct.pack(">HH", rows, cols))
 
 
@@ -416,6 +494,13 @@ class EscapeFilter:
     def __init__(self) -> None:
         self.state: int = _ESCAPE_AFTER_NEWLINE
         self.in_bracketed_paste: bool = False
+        # Tail retained across feeds so a bracketed-paste marker split across
+        # two os.read calls is still recognised (G-EDGE-2, measured 2026-10-23:
+        # a split start/end marker never armed or disarmed paste immunity, so a
+        # \r~. inside a paste detached the session).  Markers are 6 bytes, so
+        # the trailing 5 bytes of the stream are enough to re-assemble any
+        # split marker on the next feed.
+        self._paste_tail: bytes = b""
 
     def feed(self, data: bytes) -> tuple[bytes, bool]:
         """Process incoming stdin bytes.
@@ -427,9 +512,18 @@ class EscapeFilter:
         if not data:
             return b"", False
 
-        # Bracketed paste state tracking
-        if BRACKETED_PASTE_START in data:
+        # Re-assemble a bracketed-paste marker split across reads: check the
+        # carried tail together with the new bytes, then carry the trailing
+        # bytes that could complete a marker on the next feed (G-EDGE-2,
+        # measured 2026-10-23: a split start/end marker never armed or
+        # disarmed paste immunity, so a \r~. inside a paste detached the
+        # session).
+        combined = self._paste_tail + data
+        if BRACKETED_PASTE_START in combined:
             self.in_bracketed_paste = True
+        if BRACKETED_PASTE_END in combined:
+            self.in_bracketed_paste = False
+        self._paste_tail = combined[-5:]
 
         to_send = bytearray()
 
@@ -437,8 +531,6 @@ class EscapeFilter:
         # If bracketed paste is active or data arrives in a multi-byte burst (>3 bytes),
         # do not interpret local escape sequences.
         if self.in_bracketed_paste or len(data) > 3:
-            if BRACKETED_PASTE_END in data:
-                self.in_bracketed_paste = False
             if self.state == _ESCAPE_AFTER_TILDE:
                 to_send.append(126)
             to_send.extend(data)
@@ -490,6 +582,23 @@ class EscapeFilter:
         return b""
 
 
+def _write_all(fd: int, data: bytes) -> None:
+    """Write all of ``data`` to ``fd``, retrying on short writes (G-EDGE-5).
+
+    A single ``os.write`` may return fewer bytes than requested (a non-blocking
+    pipe, or a blocking write interrupted by a signal).  Dropping the tail
+    silently corrupts the relayed frame, and the transport has already consumed
+    the record so there is no retransmission.  Measured 2026-10-23: a
+    32768-byte write on a 4096-byte non-blocking pipe returned 4096.
+    """
+    view = memoryview(data)
+    while view:
+        written = os.write(fd, view)
+        if written <= 0:
+            raise OSError(f"os.write to fd {fd} wrote {written} bytes")
+        view = view[written:]
+
+
 def run_session(
     sock: socket.socket,
     secure: proto.SecureChannel,
@@ -528,6 +637,12 @@ def run_session(
     last_rx = time.time()
     last_ping = time.time()
     shell_exited = False
+    # The negotiated DATA ceiling (min of the peer's offer and the local cap);
+    # chunk outbound DATA at this bound, not at the frame cap, so a peer
+    # advertising a smaller max_record is honoured (B7 shell side, measured
+    # 2026-10-23).  A hand-built agreed dict (tests) may omit it; fall back to
+    # the frame cap so behaviour is unchanged when no ceiling was negotiated.
+    max_record = int(agreed.get("max_record", proto.MAX_DATA_PAYLOAD))
 
     def on_winch(_signum: int, _frame: Any) -> None:
         nonlocal resized
@@ -551,8 +666,17 @@ def run_session(
                     rows, cols = terminal_size(stdin_fd)
                     send_resize(secure, rows, cols)
                     log(f"sent resize {rows}x{cols}")
-                except (ProtocolError, OSError):
-                    pass
+                except NegotiationError as exc:
+                    # Rejected locally (out-of-range window): keep the session
+                    # alive instead of dropping the socket (G-ERR-1 / B10,
+                    # measured 2026-10-23).
+                    log(f"resize rejected ({exc}); keeping the session alive")
+                except (OSError, ProtocolError) as exc:
+                    # A transport failure on the resize write is fatal: surface
+                    # it at the failed write instead of ignoring it until
+                    # dead_after fires (G-ERR-1, measured 2026-10-23).
+                    log(f"resize transport failure ({exc}); raising")
+                    raise
             # The transport's buffer is drained every pass, not only when the
             # socket says it is readable: a record that arrived together with
             # another one is already there, and the socket has nothing left to
@@ -574,7 +698,7 @@ def run_session(
                 last_rx = time.time()
             for msg_type, payload in records:
                 if msg_type == Msg.DATA:
-                    os.write(stdout_fd, payload)
+                    _write_all(stdout_fd, payload)
                 elif msg_type == Msg.RESIZE:
                     log(
                         "remote requested a resize (ignored: the operator is authoritative)"
@@ -614,32 +738,42 @@ def run_session(
                 last_ping = now
                 try:
                     secure.send_control(Msg.PING, {"t": int(now)})
-                except (OSError, ProtocolError) as exc:
+                except OSError as exc:
+                    # A transport failure on the PING write means the peer is
+                    # gone; a ProtocolError (framing/pinning) is not a liveness
+                    # failure and must propagate instead of being masked as a
+                    # timeout (G-EDGE-7, measured 2026-10-23).
                     raise SessionTimeout("the peer stopped answering") from exc
             if dead_after > 0 and now - last_rx > dead_after:
+                # The shell already exited: return its status instead of
+                # raising "no traffic" (G-EDGE-7, measured 2026-10-23).  This
+                # mirrors the TransportEOF path which returns status when
+                # shell_exited.
+                if shell_exited:
+                    return status
                 raise SessionTimeout(f"no traffic from the host for {int(dead_after)}s")
             if stdin_fd in ready:
                 data = os.read(stdin_fd, 65536)
                 if not data:
                     pending = escape_filter.flush()
                     if pending:
-                        for index in range(0, len(pending), proto.MAX_DATA_PAYLOAD):
+                        for index in range(0, len(pending), max_record):
                             secure.send(
                                 Msg.DATA,
-                                bytes(pending[index : index + proto.MAX_DATA_PAYLOAD]),
+                                bytes(pending[index : index + max_record]),
                             )
                     log(
-                        "detached: the remote shell keeps running; run moesh-shell-v2 again to re-attach"
+                        "detached: the remote shell keeps running; run moesh again to re-attach"
                     )
                     with contextlib.suppress(Exception):
                         secure.send_control(Msg.CLOSE, {"reason": "detach"})
                     return status
                 to_send, detached = escape_filter.feed(data)
                 if to_send:
-                    for index in range(0, len(to_send), proto.MAX_DATA_PAYLOAD):
+                    for index in range(0, len(to_send), max_record):
                         secure.send(
                             Msg.DATA,
-                            bytes(to_send[index : index + proto.MAX_DATA_PAYLOAD]),
+                            bytes(to_send[index : index + max_record]),
                         )
                 if detached:
                     sys.stderr.write("\n[moesh: detached]\n")
@@ -647,7 +781,6 @@ def run_session(
                     with contextlib.suppress(Exception):
                         secure.send_control(Msg.CLOSE, {"reason": "detach"})
                     return 0
-        return status
     finally:
         if old_winch is not None:
             with contextlib.suppress(Exception):
@@ -662,16 +795,16 @@ def main(argv: list[str] | None = None) -> int:
     (with a growing pause between attempts).  ``--no-reconnect`` turns that
     off.
     """
-    parser = argparse.ArgumentParser(description="moesh v2 operator client")
+    parser = argparse.ArgumentParser(description="moesh operator client")
     parser.add_argument(
-        "--addr", default=os.environ.get("MOESH_SHELL_V2_ADDR", DEFAULT_ADDR)
+        "--addr", default=os.environ.get("MOESH_SHELL_ADDR", DEFAULT_ADDR)
     )
     parser.add_argument(
-        "--keyfile", default=os.environ.get("MOESH_SHELL_V2_KEYFILE", DEFAULT_KEYFILE)
+        "--keyfile", default=os.environ.get("MOESH_SHELL_KEYFILE", DEFAULT_KEYFILE)
     )
     parser.add_argument(
         "--peer-pubfile",
-        default=os.environ.get("MOESH_SHELL_V2_PEER_PUBFILE", DEFAULT_PEER_PUBFILE),
+        default=os.environ.get("MOESH_SHELL_PEER_PUBFILE", DEFAULT_PEER_PUBFILE),
     )
     parser.add_argument(
         "--fresh",
@@ -681,7 +814,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--host",
         "-n",
-        default=os.environ.get("MOESH_TUNNEL_V2_HOST", proto.DEFAULT_HOST),
+        default=os.environ.get("MOESH_TUNNEL_HOST", proto.DEFAULT_HOST),
         help=("host number or name to attach to, e.g. 3 (default: %(default)s)"),
     )
     parser.add_argument(
@@ -716,9 +849,11 @@ def main(argv: list[str] | None = None) -> int:
     private = read_key(args.keyfile, "operator static private key")
     config = load_config() if os.path.exists(HOSTS_FILE) else {}
     hosts = config.get("hosts", {})
-    if hosts:
+    if hosts or config.get("master"):
         # A configured host must be pinned: never fall back to "whatever
-        # key file happens to be there".
+        # key file happens to be there".  A top-level master (with an empty or
+        # missing [hosts] table) is the shared secret pinned_key derives from,
+        # so call pinned_key whenever the hosts file carries any secret.
         peer = pinned_key(host)
     elif host == proto.DEFAULT_HOST:
         # The single-host setup: one key file, no configuration.
@@ -726,12 +861,12 @@ def main(argv: list[str] | None = None) -> int:
     else:
         raise ProtocolError(
             f"no configuration for host {host!r} in {HOSTS_FILE}: add a [hosts.{host}] "
-            f"section, or run 'moesh-shell-v2 --new-master -n {host}' to create one"
+            f"section, or run 'moesh --new-master -n {host}' to create one"
         )
 
     if not os.isatty(sys.stdin.fileno()):
         raise ProtocolError(
-            "standard input is not a terminal: moesh-shell-v2 needs a real terminal "
+            "standard input is not a terminal: moesh needs a real terminal "
             "to advertise its size and to restore it afterwards"
         )
     term = os.environ.get("TERM", proto.DEFAULT_TERM)
@@ -747,6 +882,11 @@ def main(argv: list[str] | None = None) -> int:
             if not args.reconnect:
                 raise
             attempt += 1
+            # After the first attempt, re-attach to the running shell instead of
+            # re-spawning: every retry previously re-sent fresh_session=true and
+            # the pool always allocated a new shell (B12 / G-SEM-1, measured
+            # 2026-10-23).
+            args.fresh = False
             delay = min(2**attempt, 30)
             log(
                 f"connection lost ({exc}); re-attaching in {delay}s — the remote shell "
@@ -771,7 +911,7 @@ def run_one_session(
         SessionTimeout: the peer stopped answering.
     """
     handshake_timeout = float(
-        os.environ.get("MOESH_SHELL_V2_HANDSHAKE_TIMEOUT", proto.HANDSHAKE_TIMEOUT)
+        os.environ.get("MOESH_SHELL_HANDSHAKE_TIMEOUT", proto.HANDSHAKE_TIMEOUT)
     )
     # The address and the routing label are different things: ``host`` is
     # the label this operator asks for (a function parameter here), the
@@ -822,10 +962,10 @@ def run_one_session(
                 secure,
                 agreed,
                 ping_every=float(
-                    os.environ.get("MOESH_SHELL_V2_PING_INTERVAL", "15") or 0
+                    os.environ.get("MOESH_SHELL_PING_INTERVAL", "15") or 0
                 ),
                 dead_after=float(
-                    os.environ.get("MOESH_SHELL_V2_DEAD_AFTER", "45") or 0
+                    os.environ.get("MOESH_SHELL_DEAD_AFTER", "45") or 0
                 ),
             )
     finally:

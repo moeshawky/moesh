@@ -10,8 +10,8 @@
 # after every source edit.  Run it from the checkout.
 #
 # The project is *virtual* (``package = false``): the three programs are
-# scripts at the top of the tree — ``moesh-bridge.py``, ``moesh_tunnel_v2.py``
-# and ``moesh_shell_v2.py`` — and their names and paths are the contract the
+# scripts at the top of the tree — ``moesh-bridge.py``, ``moesh_tunnel.py``
+# and ``moesh_shell.py`` — and their names and paths are the contract the
 # deployments and the systemd unit use.  A package layout would rename them
 # and break every receiver and agent host installed from this tree, so the
 # scripts stay where they are and the project manages only its environment.
@@ -103,7 +103,7 @@ warn_return_any = true
 warn_unused_ignores = true
 warn_redundant_casts = true
 show_error_codes = true
-files = ["moesh_proto_v2.py", "moesh_tunnel_v2.py", "moesh_shell_v2.py", "moesh-bridge.py", "tests"]
+files = ["moesh_proto.py", "moesh_tunnel.py", "moesh_shell.py", "moesh-bridge.py", "tests"]
 
 # The Noise library ships no type information.  Its results are cast to the
 # types this project promises, at the four places they are used; the library

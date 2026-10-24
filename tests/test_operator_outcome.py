@@ -29,8 +29,8 @@ if TYPE_CHECKING:
 
 import pytest
 
-import moesh_proto_v2 as proto
-import moesh_tunnel_v2 as agent_mod
+import moesh_proto as proto
+import moesh_tunnel as agent_mod
 from tests.harness import (
     AGENT,
     AGENT_PYTHON,
@@ -79,16 +79,16 @@ def _start_agent(
     env = dict(os.environ)
     env.update(
         {
-            "MOESH_TUNNEL_V2_RECEIVER": "127.0.0.1",
-            "MOESH_TUNNEL_V2_RECEIVER_PORT": str(port),
-            "MOESH_TUNNEL_V2_AGENT_KEY": private.hex(),
-            "MOESH_TUNNEL_V2_OPERATOR_PUB": operator_public.hex(),
-            "MOESH_TUNNEL_V2_SESSIONS": str(sessions),
-            "MOESH_TUNNEL_V2_CHILD_PIDFILE": str(tmp_path / "shell.pid"),
+            "MOESH_TUNNEL_RECEIVER": "127.0.0.1",
+            "MOESH_TUNNEL_RECEIVER_PORT": str(port),
+            "MOESH_TUNNEL_AGENT_KEY": private.hex(),
+            "MOESH_TUNNEL_OPERATOR_PUB": operator_public.hex(),
+            "MOESH_TUNNEL_SESSIONS": str(sessions),
+            "MOESH_TUNNEL_CHILD_PIDFILE": str(tmp_path / "shell.pid"),
         }
     )
     if name:
-        env["MOESH_TUNNEL_V2_NAME"] = name
+        env["MOESH_TUNNEL_NAME"] = name
     log_path = tmp_path / "agent.log"
     with open(log_path, "ab") as handle:
         proc = subprocess.Popen(
@@ -129,11 +129,11 @@ class Stack:
         self.env = dict(os.environ)
         self.env.update(
             {
-                "MOESH_SHELL_V2_ADDR": f"127.0.0.1:{self.operator_v2_port}",
-                "MOESH_SHELL_V2_KEYFILE": self.operator_keyfile,
-                "MOESH_SHELL_V2_PEER_PUBFILE": self.agent_pubfile,
-                "MOESH_SHELL_V2_HOSTS_FILE": self.pins,
-                "MOESH_SHELL_V2_HANDSHAKE_TIMEOUT": "10",
+                "MOESH_SHELL_ADDR": f"127.0.0.1:{self.operator_v2_port}",
+                "MOESH_SHELL_KEYFILE": self.operator_keyfile,
+                "MOESH_SHELL_PEER_PUBFILE": self.agent_pubfile,
+                "MOESH_SHELL_HOSTS_FILE": self.pins,
+                "MOESH_SHELL_HANDSHAKE_TIMEOUT": "10",
                 "TERM": "xterm-256color",
             }
         )
@@ -179,7 +179,7 @@ def _wait_log(path: str, needle: str, timeout: float = 15.0) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Noise helpers (wire-level cases; constants come from moesh_proto_v2)
+# Noise helpers (wire-level cases; constants come from moesh_proto)
 # ---------------------------------------------------------------------------
 
 PRIV_A, PUB_A = proto.generate_static_keypair()
@@ -369,14 +369,14 @@ def test_reconnect_redials_transport_but_not_auth_failure(tmp_path: Path) -> Non
         wrong = tmp_path / "wrong.key"
         wrong.write_text(wrong_private.hex() + "\n", encoding="ascii")
         env = dict(stack.env)
-        env["MOESH_SHELL_V2_KEYFILE"] = str(wrong)
+        env["MOESH_SHELL_KEYFILE"] = str(wrong)
         session = OperatorSession(stack.argv(), env, rows=24, cols=80)
         try:
             with pytest.raises(AssertionError):
                 session.read_until(b"$", timeout=15)
         finally:
             session.close()
-        source = _source("moesh_shell_v2.py")
+        source = _source("moesh_shell.py")
         assert "except AuthenticationError:" in source
         assert "if not args.reconnect:" in source
 
@@ -403,10 +403,10 @@ def test_departed_tunnel_worker_is_not_paired(tmp_path: Path) -> None:
         env = dict(os.environ)
         env.update(
             {
-                "MOESH_SHELL_V2_ADDR": f"127.0.0.1:{operator_v2_port}",
-                "MOESH_SHELL_V2_KEYFILE": keys[0],
-                "MOESH_SHELL_V2_HOSTS_FILE": pins,
-                "MOESH_SHELL_V2_HANDSHAKE_TIMEOUT": "5",
+                "MOESH_SHELL_ADDR": f"127.0.0.1:{operator_v2_port}",
+                "MOESH_SHELL_KEYFILE": keys[0],
+                "MOESH_SHELL_HOSTS_FILE": pins,
+                "MOESH_SHELL_HANDSHAKE_TIMEOUT": "5",
                 "TERM": "xterm-256color",
             }
         )
@@ -738,7 +738,7 @@ def test_shutdown_does_not_close_a_pty_under_a_writer(tmp_path: Path) -> None:
 
 def test_agent_applies_a_handshake_deadline() -> None:
     """ERR-007 — the agent must name and apply a bounded handshake deadline."""
-    source = _source("moesh_tunnel_v2.py")
+    source = _source("moesh_tunnel.py")
     assert "proto.HANDSHAKE_TIMEOUT" in source
     assert "sock.settimeout(proto.HANDSHAKE_TIMEOUT)" in source
 
@@ -931,7 +931,7 @@ def test_wire_constants_have_one_authoritative_definition() -> None:
         "MAX_CONTROL_PAYLOAD",
     }
     duplicates: list[str] = []
-    for filename in ("moesh-bridge.py", "moesh_tunnel_v2.py", "moesh_shell_v2.py"):
+    for filename in ("moesh-bridge.py", "moesh_tunnel.py", "moesh_shell.py"):
         tree = ast.parse(_source(filename))
         for node in ast.walk(tree):
             if isinstance(node, (ast.Assign, ast.AnnAssign)):
@@ -964,7 +964,7 @@ def test_bridge_is_blind_and_docs_name_the_label_exception() -> None:
     source = _source("moesh-bridge.py")
     forbidden = ("NoiseSession", "decrypt(", "termios", "tcsetattr", "import pty")
     assert not any(token in source for token in forbidden)
-    doc = _source("PROTOCOL-v2.md").lower()
+    doc = _source("PROTOCOL.md").lower()
     assert "plaintext" in doc and "routing label" in doc
 
 
@@ -987,15 +987,15 @@ def test_receiver_log_has_no_terminal_plaintext(tmp_path: Path) -> None:
 
 def test_no_pty_or_terminal_byte_before_active() -> None:
     """SEC-003 — the agent spawns the shell only after the ACTIVE transition."""
-    source = _source("moesh_tunnel_v2.py")
+    source = _source("moesh_tunnel.py")
     negotiate = source.split("def negotiate(", 1)[1].split("def run_session(", 1)[0]
     assert negotiate.index("machine.to(State.ACTIVE)") < negotiate.index("shell.spawn(")
 
 
 def test_pin_is_checked_before_the_first_transport_record() -> None:
     """SEC-004 — READY implies authenticated, and the pin is enforced before records."""
-    assert "session.authenticated" in _source("moesh_tunnel_v2.py")
-    assert "session.authenticated" in _source("moesh_shell_v2.py")
+    assert "session.authenticated" in _source("moesh_tunnel.py")
+    assert "session.authenticated" in _source("moesh_shell.py")
 
 
 def test_prologue_binds_the_protocol_version() -> None:
@@ -1107,12 +1107,12 @@ def test_failed_client_leaves_no_orphan_shell_or_client(tmp_path: Path) -> None:
         children = subprocess.check_output(
             ["ps", "-o", "pid=,comm=", "--ppid", str(os.getpid())], text=True
         )
-        assert "moesh-shell-v2" not in children
+        assert "moesh_shell" not in children and "moesh-shell-v2" not in children
 
 
 def test_terminal_termios_is_restored() -> None:
     """UX-004 — RawTerminal restores the saved termios in a finally block."""
-    source = _source("moesh_shell_v2.py")
+    source = _source("moesh_shell.py")
     raw = source.split("class RawTerminal", 1)[1].split("class ", 1)[0]
     assert "def __exit__" in raw
     assert "self.restore()" in raw

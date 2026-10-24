@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 
 import pytest
 
-import moesh_proto_v2 as proto
+import moesh_proto as proto
 from tests.harness import AGENT_PYTHON, TUNNEL_DIR, Bridge, OperatorSession, next_ports
 
 _ALPHA = "alpha"
@@ -69,18 +69,18 @@ def hosts(tmp_path: Path) -> Iterator[Hosts]:
         env = dict(os.environ)
         env.update(
             {
-                "MOESH_TUNNEL_V2_RECEIVER": "127.0.0.1",
-                "MOESH_TUNNEL_V2_RECEIVER_PORT": str(tunnel_port),
-                "MOESH_TUNNEL_V2_AGENT_KEY": private.hex(),
+                "MOESH_TUNNEL_RECEIVER": "127.0.0.1",
+                "MOESH_TUNNEL_RECEIVER_PORT": str(tunnel_port),
+                "MOESH_TUNNEL_AGENT_KEY": private.hex(),
                 # The agent pins the OPERATOR's key, not its own.
-                "MOESH_TUNNEL_V2_OPERATOR_PUB": operator_public.hex(),
-                "MOESH_TUNNEL_V2_NAME": name,
+                "MOESH_TUNNEL_OPERATOR_PUB": operator_public.hex(),
+                "MOESH_TUNNEL_NAME": name,
             }
         )
         # The agent keeps writing to it for as long as it runs.
         log = open(os.path.join(tmp_path, f"agent-{name}.log"), "wb")  # noqa: SIM115
         return subprocess.Popen(
-            [AGENT_PYTHON, os.path.join(TUNNEL_DIR, "moesh_tunnel_v2.py")],
+            [AGENT_PYTHON, os.path.join(TUNNEL_DIR, "moesh_tunnel.py")],
             stdout=log,
             stderr=subprocess.STDOUT,
             env=env,
@@ -96,10 +96,10 @@ def hosts(tmp_path: Path) -> Iterator[Hosts]:
         env = dict(os.environ)
         env.update(
             {
-                "MOESH_SHELL_V2_ADDR": f"127.0.0.1:{operator_v2_port}",
-                "MOESH_SHELL_V2_KEYFILE": str(operator_keyfile),
-                "MOESH_SHELL_V2_HOSTS_FILE": str(pins),
-                "MOESH_SHELL_V2_HANDSHAKE_TIMEOUT": "10",
+                "MOESH_SHELL_ADDR": f"127.0.0.1:{operator_v2_port}",
+                "MOESH_SHELL_KEYFILE": str(operator_keyfile),
+                "MOESH_SHELL_HOSTS_FILE": str(pins),
+                "MOESH_SHELL_HANDSHAKE_TIMEOUT": "10",
                 "TERM": "xterm-256color",
             }
         )
@@ -124,7 +124,7 @@ def hosts(tmp_path: Path) -> Iterator[Hosts]:
 def test_each_host_gets_its_own_session(hosts: Hosts) -> None:
     """Two named hosts, two clients: each reaches its own host."""
     alpha = OperatorSession(
-        [AGENT_PYTHON, os.path.join(TUNNEL_DIR, "moesh_shell_v2.py"), "--host", _ALPHA],
+        [AGENT_PYTHON, os.path.join(TUNNEL_DIR, "moesh_shell.py"), "--host", _ALPHA],
         hosts["client_env"](_ALPHA),
         rows=24,
         cols=80,
@@ -138,7 +138,7 @@ def test_each_host_gets_its_own_session(hosts: Hosts) -> None:
     time.sleep(2)
 
     beta = OperatorSession(
-        [AGENT_PYTHON, os.path.join(TUNNEL_DIR, "moesh_shell_v2.py"), "--host", _BETA],
+        [AGENT_PYTHON, os.path.join(TUNNEL_DIR, "moesh_shell.py"), "--host", _BETA],
         hosts["client_env"](_BETA),
         rows=24,
         cols=80,
@@ -158,7 +158,7 @@ def test_a_host_without_a_pin_is_refused(hosts: Hosts) -> None:
     proc = subprocess.run(
         [
             AGENT_PYTHON,
-            os.path.join(TUNNEL_DIR, "moesh_shell_v2.py"),
+            os.path.join(TUNNEL_DIR, "moesh_shell.py"),
             "--host",
             "not-pinned",
         ],

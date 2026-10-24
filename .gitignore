@@ -41,3 +41,8 @@ AGENTS.md
 HANDOFF.md
 .opencode/
 TEST-PROTOCOL.md
+
+# Local code intelligence & search index caches
+.codegraph/
+.ix/
+.ixd.toml
