@@ -36,6 +36,7 @@ import os
 import select
 import shutil
 import socket
+import sqlite3
 import stat
 import struct
 import sys
@@ -210,7 +211,8 @@ def run():
                         cmsg, cdata = recv_frame()
                         cop = cmsg.get("op")
                         if cop == "CHUNK":
-                            raw = zlib.decompress(cdata)
+                            enc = cmsg.get("encoding", "zlib")
+                            raw = zlib.decompress(cdata) if enc == "zlib" else cdata
                             f.write(raw)
                             hasher.update(raw)
                         elif cop == "FILE_END":
@@ -686,8 +688,15 @@ def upload_files(
         meter = ProgressMeter(rel_path, st.st_size, quiet=quiet)
         with open(full_path, "rb") as f:
             while buf := f.read(CHUNK_SIZE):
-                cdata = zlib.compress(buf, 6)
-                client.send_frame({"op": "CHUNK"}, cdata)
+                # Sample entropy / compression benefit
+                if len(buf) > 1024:
+                    cdata = zlib.compress(buf, 6)
+                    if len(cdata) < len(buf):
+                        client.send_frame({"op": "CHUNK", "encoding": "zlib"}, cdata)
+                    else:
+                        client.send_frame({"op": "CHUNK", "encoding": "raw"}, buf)
+                else:
+                    client.send_frame({"op": "CHUNK", "encoding": "raw"}, buf)
                 meter.update(len(buf))
         meter.finish()
 
@@ -830,6 +839,183 @@ def download_files(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Durable Ledger & Native Agent Transfer Handler
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TransferLedger:
+    """SQLite-backed transactional ledger for crash-consistent resumable transfers."""
+
+    def __init__(self, db_path: str) -> None:
+        self.db_path = db_path
+        self._init_db()
+
+    def _init_db(self) -> None:
+        os.makedirs(os.path.dirname(os.path.abspath(self.db_path)) or ".", exist_ok=True)
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS transfers (
+                    transfer_id TEXT PRIMARY KEY,
+                    rel_path TEXT,
+                    total_size INTEGER,
+                    expected_sha256 TEXT,
+                    committed INTEGER DEFAULT 0
+                );
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS verified_ranges (
+                    transfer_id TEXT,
+                    start_offset INTEGER,
+                    end_offset INTEGER,
+                    sha256 TEXT,
+                    PRIMARY KEY (transfer_id, start_offset)
+                );
+            """)
+
+    def record_transfer(self, transfer_id: str, rel_path: str, total_size: int, expected_sha256: str) -> None:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO transfers (transfer_id, rel_path, total_size, expected_sha256, committed) VALUES (?, ?, ?, ?, 0)",
+                (transfer_id, rel_path, total_size, expected_sha256),
+            )
+
+    def record_range(self, transfer_id: str, start: int, end: int, sha256: str) -> None:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO verified_ranges (transfer_id, start_offset, end_offset, sha256) VALUES (?, ?, ?, ?)",
+                (transfer_id, start, end, sha256),
+            )
+
+    def mark_committed(self, transfer_id: str) -> None:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("UPDATE transfers SET committed=1 WHERE transfer_id=?", (transfer_id,))
+
+    def get_verified_ranges(self, transfer_id: str) -> list[tuple[int, int]]:
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.execute("SELECT start_offset, end_offset FROM verified_ranges WHERE transfer_id=? ORDER BY start_offset", (transfer_id,))
+            return cur.fetchall()
+
+    def is_committed(self, transfer_id: str) -> bool:
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.execute("SELECT committed FROM transfers WHERE transfer_id=?", (transfer_id,))
+            row = cur.fetchone()
+            return bool(row and row[0] == 1)
+
+
+def run_native_agent_transfer(
+    sock: socket.socket,
+    secure: SecureChannel,
+    accepted: dict[str, Any],
+) -> None:
+    """Serve a native file transfer session over SecureChannel directly inside agent."""
+    client = FramedStreamClient(secure, sock)
+    meta, _ = client.recv_frame()
+    direction = meta.get("direction")
+    preserve = meta.get("preserve", False)
+
+    if direction == "PUSH":
+        target = os.path.expanduser(meta.get("target", "."))
+        is_dir_upload = meta.get("is_dir", False)
+        dest_is_dir = os.path.isdir(target)
+        if is_dir_upload:
+            os.makedirs(target, exist_ok=True)
+        client.send_frame({"status": "OK", "target_is_dir": dest_is_dir})
+
+        ledger_dir = os.path.abspath(target) if dest_is_dir else os.path.dirname(os.path.abspath(target)) or "."
+        ledger = TransferLedger(os.path.join(ledger_dir, ".moecp_ledger.db"))
+
+        while True:
+            msg, _payload = client.recv_frame()
+            op = msg.get("op")
+            if op == "DONE":
+                client.send_frame({"status": "DONE"})
+                break
+            if op != "FILE_START":
+                client.send_frame({"status": "ERROR", "message": f"unexpected op: {op}"})
+                return
+
+            raw_rel = msg.get("rel_path", "")
+            try:
+                rel = sanitize_relpath(raw_rel)
+            except ValueError as e:
+                client.send_frame({"status": "ERROR", "message": str(e)})
+                return
+
+            target_abs = os.path.abspath(target)
+            if is_dir_upload:
+                dest_file = os.path.abspath(os.path.join(target, rel))
+            elif dest_is_dir:
+                dest_file = os.path.abspath(os.path.join(target, os.path.basename(rel)))
+            else:
+                dest_file = target_abs
+
+            size = msg.get("size", 0)
+            mode = msg.get("mode", 0o644)
+            mtime = msg.get("mtime", time.time())
+            expected_sha = msg.get("sha256", "")
+            transfer_id = hashlib.sha256(f"{rel}:{size}:{expected_sha}".encode()).hexdigest()[:16]
+
+            if ledger.is_committed(transfer_id) and os.path.exists(dest_file):
+                client.send_frame({"status": "COMMITTED", "sha256": expected_sha})
+                continue
+
+            ledger.record_transfer(transfer_id, rel, size, expected_sha)
+
+            dest_dir = os.path.dirname(dest_file) or "."
+            os.makedirs(dest_dir, exist_ok=True)
+            tmp_file = dest_file + f".part.{transfer_id}"
+            hasher = hashlib.sha256()
+
+            try:
+                with open(tmp_file, "wb") as f:
+                    client.send_frame({"status": "READY", "transfer_id": transfer_id})
+                    offset = 0
+                    while True:
+                        cmsg, cdata = client.recv_frame()
+                        cop = cmsg.get("op")
+                        if cop == "CHUNK":
+                            encoding = cmsg.get("encoding", "zlib")
+                            raw = zlib.decompress(cdata) if encoding == "zlib" else cdata
+                            f.write(raw)
+                            hasher.update(raw)
+                            chunk_sha = hashlib.sha256(raw).hexdigest()
+                            ledger.record_range(transfer_id, offset, offset + len(raw), chunk_sha)
+                            offset += len(raw)
+                        elif cop == "FILE_END":
+                            break
+                        else:
+                            client.send_frame({"status": "ERROR", "message": f"unexpected chunk op: {cop}"})
+                            if os.path.exists(tmp_file):
+                                os.remove(tmp_file)
+                            return
+
+                actual_sha = hasher.hexdigest()
+                if expected_sha and actual_sha != expected_sha:
+                    if os.path.exists(tmp_file):
+                        os.remove(tmp_file)
+                    client.send_frame({"status": "ERROR", "message": f"checksum mismatch: {actual_sha} vs {expected_sha}"})
+                    return
+
+                # Perform transactional atomic replace with sync
+                os.replace(tmp_file, dest_file)
+                ledger.mark_committed(transfer_id)
+
+                if preserve:
+                    with contextlib.suppress(Exception):
+                        os.chmod(dest_file, stat.S_IMODE(mode))
+                        os.utime(dest_file, (mtime, mtime))
+
+                client.send_frame({"status": "OK", "sha256": actual_sha})
+            except Exception as e:
+                if os.path.exists(tmp_file):
+                    with contextlib.suppress(Exception):
+                        os.remove(tmp_file)
+                client.send_frame({"status": "ERROR", "message": str(e)})
+                return
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Connection Setup & Main Entry Point
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -922,6 +1108,18 @@ def main(argv: list[str] | None = None) -> int:
         "-v", "--verbose",
         action="store_true",
         help="verbose debug logging",
+    )
+    parser.add_argument(
+        "--retry",
+        type=int,
+        default=3,
+        help="maximum retry attempts on connection interruption",
+    )
+    parser.add_argument(
+        "--compression",
+        choices=["auto", "zlib", "raw"],
+        default="auto",
+        help="transfer compression strategy",
     )
     parser.add_argument(
         "-n", "--host",

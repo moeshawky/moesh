@@ -648,6 +648,9 @@ def validate_hello(
     fresh = hello.get("fresh_session", False)
     if not isinstance(fresh, bool):
         raise NegotiationError(f"fresh_session must be a boolean, got {fresh!r}")
+    session_type = hello.get("session_type", "shell")
+    if not isinstance(session_type, str):
+        raise NegotiationError(f"session_type must be a string, got {session_type!r}")
     return {
         "version": PROTOCOL_VERSION,
         "term": term,
@@ -657,6 +660,7 @@ def validate_hello(
         "capabilities": sorted(set(capabilities)),
         "max_record": min(peer_max, max_record),
         "fresh_session": fresh,
+        "session_type": session_type,
     }
 
 

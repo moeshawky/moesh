@@ -783,12 +783,27 @@ def wait_for_handshake(channel: proto.Channel, pool: ShellPool) -> bytes:
             return channel.recv_frame()
 
 
+def run_native_transfer(
+    sock: socket.socket,
+    secure: proto.SecureChannel,
+    accepted: dict[str, Any],
+) -> str:
+    """Serve a native file transfer session directly within the agent."""
+    log("native transfer session active")
+    try:
+        import moecp
+        moecp.run_native_agent_transfer(sock, secure, accepted)
+    except Exception as exc:
+        log(f"native transfer error: {exc!r}")
+    return "closed"
+
+
 def negotiate(
     secure: proto.SecureChannel,
     machine: proto.SessionState,
     pool: ShellPool,
 ) -> dict[str, Any]:
-    """Run HELLO/ACCEPT/READY and attach to (or start) the shell.
+    """Run HELLO/ACCEPT/READY and attach to (or start) the shell or native transfer.
 
     Returns the accepted configuration.
 
@@ -804,6 +819,19 @@ def negotiate(
     peer_hash = str(hello.get("handshake_hash", ""))
     if peer_hash != secure.session.handshake_hash().hex():
         raise AuthenticationError("operator handshake hash does not match this session")
+
+    session_type = accepted.get("session_type", "shell")
+    if session_type == "transfer":
+        accepted["resumed"] = False
+        secure.send_control(Msg.ACCEPT, accepted)
+        machine.to(State.READY)
+        msg_type, _payload = secure.recv_control()
+        if msg_type != Msg.READY:
+            raise NegotiationError(f"expected READY, got message type {msg_type}")
+        secure.send_control(Msg.READY, {})
+        machine.to(State.ACTIVE)
+        return accepted
+
     fresh = bool(hello.get("fresh_session"))
     # The shell is chosen only now: the HELLO is what says whether this
     # session wants a fresh shell or the running one.
@@ -1047,6 +1075,8 @@ def serve_once(host: str, port: int, path: str, name: str, pool: ShellPool) -> s
         sock.settimeout(proto.NEGOTIATION_TIMEOUT)
         accepted = negotiate(secure, machine, pool)
         sock.settimeout(None)
+        if accepted.get("session_type") == "transfer":
+            return run_native_transfer(sock, secure, accepted)
         shell = accepted.pop("_shell")
         try:
             return run_session(sock, secure, shell, accepted)
