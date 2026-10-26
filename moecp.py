@@ -88,6 +88,27 @@ MAX_FRAME_PAYLOAD: int = 10485760
 MAGIC_READY: bytes = b"MOECP_READY_V1\n"
 """Handshake token emitted by the remote bootstrap worker once in raw mode."""
 
+# Pre-compressed file extensions where chunk compression is skipped under auto strategy.
+PRECOMPRESSED_EXTS: frozenset[str] = frozenset({
+    # Archives and compressed containers
+    ".gz", ".tgz", ".bz2", ".tbz2", ".xz", ".txz", ".zst", ".tzst",
+    ".7z", ".zip", ".rar", ".whl", ".jar",
+    # Model weights, tensors, and serialized graphs
+    ".pt", ".pth", ".bin", ".safetensors", ".gguf", ".onnx", ".tflite",
+    # Media: image, video, audio
+    ".png", ".jpg", ".jpeg", ".webp", ".gif", ".mp4", ".mov", ".webm",
+    ".mkv", ".mp3", ".flac", ".ogg",
+    # Compressed document formats
+    ".pdf", ".docx", ".xlsx", ".pptx",
+})
+"""File extensions where payload compression is skipped under auto strategy."""
+
+
+def is_precompressed(path: str) -> bool:
+    """Return True if the given file path has an extension indicating pre-compressed data."""
+    _, ext = os.path.splitext(path)
+    return ext.lower() in PRECOMPRESSED_EXTS
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Remote Bootstrap Worker Code
 # ─────────────────────────────────────────────────────────────────────────────
@@ -97,6 +118,15 @@ MAGIC_READY: bytes = b"MOECP_READY_V1\n"
 
 _WORKER_CODE = """
 import os, sys, struct, json, zlib, hashlib, stat, time
+
+PRECOMPRESSED_EXTS = {
+    ".gz", ".tgz", ".bz2", ".tbz2", ".xz", ".txz", ".zst", ".tzst",
+    ".7z", ".zip", ".rar", ".whl", ".jar",
+    ".pt", ".pth", ".bin", ".safetensors", ".gguf", ".onnx", ".tflite",
+    ".png", ".jpg", ".jpeg", ".webp", ".gif", ".mp4", ".mov", ".webm",
+    ".mkv", ".mp3", ".flac", ".ogg",
+    ".pdf", ".docx", ".xlsx", ".pptx",
+}
 
 def set_raw():
     try:
@@ -320,6 +350,7 @@ def run():
             if offset < 0 or offset > item["size"]:
                 offset = 0
 
+            skip_comp = os.path.splitext(full_path)[1].lower() in PRECOMPRESSED_EXTS
             hasher = hashlib.sha256()
             try:
                 with open(full_path, "rb") as f:
@@ -336,14 +367,14 @@ def run():
                         if not buf:
                             break
                         hasher.update(buf)
-                        if compression == "raw":
+                        if compression == "raw" or (compression == "auto" and skip_comp):
                             send_frame({"op": "CHUNK", "encoding": "raw"}, buf)
                         elif compression == "zlib":
-                            cdata = zlib.compress(buf, 6)
+                            cdata = zlib.compress(buf, 1)
                             send_frame({"op": "CHUNK", "encoding": "zlib"}, cdata)
                         else:  # auto
                             if len(buf) > 1024:
-                                cdata = zlib.compress(buf, 6)
+                                cdata = zlib.compress(buf, 1)
                                 if len(cdata) < len(buf):
                                     send_frame({"op": "CHUNK", "encoding": "zlib"}, cdata)
                                 else:
@@ -786,18 +817,19 @@ def upload_files(
         meter = ProgressMeter(rel_path, st.st_size, quiet=quiet)
         if resume_offset > 0:
             meter.update(resume_offset)
+        skip_comp = is_precompressed(rel_path)
         with open(full_path, "rb") as f:
             if resume_offset > 0:
                 f.seek(resume_offset)
             while buf := f.read(CHUNK_SIZE):
-                if compression == "raw":
+                if compression == "raw" or (compression == "auto" and skip_comp):
                     client.send_frame({"op": "CHUNK", "encoding": "raw"}, buf)
                 elif compression == "zlib":
-                    cdata = zlib.compress(buf, 6)
+                    cdata = zlib.compress(buf, 1)
                     client.send_frame({"op": "CHUNK", "encoding": "zlib"}, cdata)
                 else:  # auto
                     if len(buf) > 1024:
-                        cdata = zlib.compress(buf, 6)
+                        cdata = zlib.compress(buf, 1)
                         if len(cdata) < len(buf):
                             client.send_frame({"op": "CHUNK", "encoding": "zlib"}, cdata)
                         else:
@@ -1504,6 +1536,7 @@ def run_native_agent_transfer(
             if offset < 0 or offset > item["size"]:
                 offset = 0
 
+            skip_comp = is_precompressed(full_path)
             hasher = hashlib.sha256()
             try:
                 with open(full_path, "rb") as f:
@@ -1520,14 +1553,14 @@ def run_native_agent_transfer(
                         if not buf:
                             break
                         hasher.update(buf)
-                        if compression == "raw":
+                        if compression == "raw" or (compression == "auto" and skip_comp):
                             client.send_frame({"op": "CHUNK", "encoding": "raw"}, buf)
                         elif compression == "zlib":
-                            cdata = zlib.compress(buf, 6)
+                            cdata = zlib.compress(buf, 1)
                             client.send_frame({"op": "CHUNK", "encoding": "zlib"}, cdata)
                         else:  # auto
                             if len(buf) > 1024:
-                                cdata = zlib.compress(buf, 6)
+                                cdata = zlib.compress(buf, 1)
                                 if len(cdata) < len(buf):
                                     client.send_frame({"op": "CHUNK", "encoding": "zlib"}, cdata)
                                 else:
@@ -1667,7 +1700,7 @@ def main(argv: list[str] | None = None) -> int:
         "--compression",
         choices=["auto", "zlib", "raw"],
         default="auto",
-        help="transfer compression strategy",
+        help="transfer compression strategy (auto=zlib-1 with precompressed bypass, zlib=zlib-1, raw=uncompressed)",
     )
     parser.add_argument(
         "-n", "--host",

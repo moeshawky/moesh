@@ -178,6 +178,22 @@ def test_worker_code_compiles_and_decompresses() -> None:
     assert decompressed.strip() == moecp._WORKER_CODE.strip()
 
 
+def test_precompressed_extensions_parity() -> None:
+    """Precompressed extension set in _WORKER_CODE matches moecp.PRECOMPRESSED_EXTS exactly."""
+    # Check helper classification
+    for ext in [".gz", ".tgz", ".zip", ".zst", ".safetensors", ".gguf", ".pt", ".bin", ".onnx", ".png", ".jpg", ".mp4"]:
+        assert moecp.is_precompressed(f"model{ext}")
+        assert moecp.is_precompressed(f"/path/to/archive{ext.upper()}")
+    for ext in [".txt", ".py", ".json", ".csv", ".tar", ".log", ".md", ".toml"]:
+        assert not moecp.is_precompressed(f"source{ext}")
+
+    # Worker code parity
+    ns: dict = {}
+    exec(compile(moecp._WORKER_CODE, "<test>", "exec"), ns)  # noqa: S102
+    worker_exts = set(ns["PRECOMPRESSED_EXTS"])
+    assert worker_exts == set(moecp.PRECOMPRESSED_EXTS)
+
+
 def test_local_to_local_file_copy(tmp_path: Path) -> None:
     """Local-to-local fallback mirrors scp behavior for local files."""
     src = tmp_path / "src.txt"
