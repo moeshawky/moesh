@@ -54,6 +54,7 @@ import enum
 import errno
 import fcntl
 import hashlib
+import json
 import os
 import pty
 import select
@@ -78,11 +79,14 @@ from moesh_proto import (
     TransportEOF,
 )
 
+# Receiver address to dial; empty by default so the agent refuses to start unless MOESH_TUNNEL_RECEIVER provisions one, preventing a bare checkout from dialing anywhere.
 DEFAULT_RECEIVER = ""
 """Receiver address to dial. Empty by default: an address must be provisioned
 (through ``MOESH_TUNNEL_RECEIVER``) or the agent refuses to start, so a
 bare checkout never dials anywhere."""
+# Default TCP port (80) used when connecting to the receiver; may be overridden by environment or configuration.
 DEFAULT_PORT = 80
+# Number of concurrent operator sessions served (3); each gets a separate connection and shell so keystrokes never interleave.
 DEFAULT_SESSIONS = 3
 """How many operators this agent serves at once.
 
@@ -90,6 +94,7 @@ Three is enough for one person with a few terminals plus a spare.  Each one
 is a separate connection with its own shell, so two operators never share a
 PTY and their keystrokes cannot interleave.
 """
+# Default host routing label 'default' used when the environment does not name one; identifies which host an operator requests, not the agent's identity (static key).
 DEFAULT_NAME = "default"
 """Host name used when the environment does not name one.
 
@@ -97,6 +102,7 @@ The name is a routing label: it tells the receiver which host an
 operator is asking for.  It is NOT the identity — that is the static key,
 which the operator pins per host.
 """
+# Filesystem path to the agent's static private key (~/.config/moesh/agent.key); overridden by env var. Used to authenticate to the receiver/operator.
 DEFAULT_KEYFILE = os.path.expanduser("~/.config/moesh/agent.key")
 
 #: Pinned operator static public key (hex).  Provisioned at build time; it is a
@@ -105,16 +111,25 @@ DEFAULT_KEYFILE = os.path.expanduser("~/.config/moesh/agent.key")
 #: tracked file; prefer the env var or a key file outside the tree.
 PINNED_OPERATOR_PUB = ""
 
+# Seconds (60.0) to wait after an authentication failure before retrying; prevents fast retry loops.
 AUTH_BACKOFF = 60.0
 """Seconds to wait after an authentication failure (never a fast retry loop)."""
 
+# Upper bound (30.0 seconds) of exponential backoff for ordinary network loss.
 NET_BACKOFF_MAX = 30.0
 """Upper bound of the exponential backoff used for ordinary network loss."""
 
+# Bytes (262144 = 256 KiB) of shell output retained while no operator is attached, held in a bounded bytearray.
 DETACHED_BUFFER = 262144
 """Bytes of shell output kept while no operator is attached (256 KiB)."""
 
 _stopping = False
+_conflict_refused = False
+CARRIER_ID = os.environ.get("MOESH_TUNNEL_ID", "").strip() or os.urandom(8).hex()
+
+
+class HostConflictError(ProtocolError):
+    """The receiver refused this tunnel with 409 Conflict because another tunnel holds the host."""
 
 
 class Stop(Exception):
@@ -183,32 +198,60 @@ def load_agent_private_key() -> bytes:
     return key
 
 
-def load_operator_pin() -> bytes:
-    """Return the pinned operator static public key.
+def load_operator_pin() -> bytes | tuple[bytes, ...]:
+    """Return the pinned operator static public key (or acceptable keys).
+
+    Accepts ``MOESH_TUNNEL_OPERATOR_PUB`` when set, and also derives the
+    operator public key from ``MOESH_TUNNEL_MASTER`` (``info="operator"``) when
+    the master secret is provisioned.  An agent configured with only
+    ``MOESH_TUNNEL_MASTER`` therefore needs no separate ``MOESH_TUNNEL_OPERATOR_PUB``.
 
     Raises:
-        ProtocolError: no pin was provisioned.
+        ProtocolError: neither ``MOESH_TUNNEL_OPERATOR_PUB`` nor ``MOESH_TUNNEL_MASTER`` was provisioned.
     """
+    candidates: list[bytes] = []
     raw = (
         os.environ.get("MOESH_TUNNEL_OPERATOR_PUB", "").strip()
         or os.environ.get("MOESH_TUNNEL_V2_OPERATOR_PUB", "").strip()
         or os.environ.get("NB_TUNNEL_V2_OPERATOR_PUB", "").strip()
         or PINNED_OPERATOR_PUB.strip()
     )
-    if not raw:
-        raise ProtocolError(
-            "operator static public key not provisioned: set "
-            "MOESH_TUNNEL_OPERATOR_PUB or bake PINNED_OPERATOR_PUB into the agent"
-        )
-    try:
-        pin = bytes.fromhex(raw.removeprefix("0x").replace(":", "").strip())
-    except ValueError as exc:
-        raise ProtocolError("operator static public key is not valid hex") from exc
-    if len(pin) != 32:
-        raise ProtocolError(
-            f"operator static public key must be 32 bytes, got {len(pin)}"
-        )
-    return pin
+    if raw:
+        try:
+            pin = bytes.fromhex(raw.removeprefix("0x").replace(":", "").strip())
+        except ValueError as exc:
+            raise ProtocolError("operator static public key is not valid hex") from exc
+        if len(pin) != 32:
+            raise ProtocolError(
+                f"operator static public key must be 32 bytes, got {len(pin)}"
+            )
+        candidates.append(pin)
+
+    master = (
+        os.environ.get("MOESH_TUNNEL_MASTER", "").strip()
+        or os.environ.get("MOESH_TUNNEL_V2_MASTER", "").strip()
+        or os.environ.get("NB_TUNNEL_V2_MASTER", "").strip()
+    )
+    if master:
+        cleaned = master.removeprefix("0x").replace(":", "").strip()
+        try:
+            secret = bytes.fromhex(cleaned)
+        except ValueError as exc:
+            raise ProtocolError("the master secret is not valid hex") from exc
+        if len(secret) < 16:
+            raise ProtocolError("the master secret must be at least 16 bytes")
+        derived_op = proto.public_key_bytes(proto.derive_static_key(secret, "operator"))
+        if derived_op not in candidates:
+            candidates.append(derived_op)
+
+    if len(candidates) == 1:
+        return candidates[0]
+    if len(candidates) > 1:
+        return tuple(candidates)
+    raise ProtocolError(
+        "operator static public key not provisioned: set MOESH_TUNNEL_MASTER or "
+        "MOESH_TUNNEL_OPERATOR_PUB"
+    )
 
 
 def host_name() -> str:
@@ -293,6 +336,7 @@ def http_upgrade(
     downgraded.
 
     Raises:
+        HostConflictError: the receiver returned 409 Conflict because another tunnel owns ``name``.
         ProtocolError: the server refused the upgrade or echoed another token.
     """
     request = (
@@ -300,7 +344,8 @@ def http_upgrade(
         f"Host: {host}\r\n"
         f"Upgrade: {proto.UPGRADE_TOKEN}\r\n"
         f"Connection: Upgrade\r\n"
-        f"X-Moesh-Tunnel-Version: {proto.PROTOCOL_VERSION}\r\n\r\n"
+        f"X-Moesh-Tunnel-Version: {proto.PROTOCOL_VERSION}\r\n"
+        f"X-Moesh-Carrier-Id: {CARRIER_ID}\r\n\r\n"
     ).encode()
 
     sock.sendall(request)
@@ -315,7 +360,15 @@ def http_upgrade(
     head, rest = buffer.split(b"\r\n\r\n", 1)
     status = head.split(b"\r\n", 1)[0].decode("latin-1", "replace")
     if " 101" not in status:
-        raise ProtocolError(f"upgrade refused: {status}")
+        detail = rest.decode("latin-1", "replace").strip()
+        if " 409" in status:
+            sock.settimeout(1.0)
+            with contextlib.suppress(OSError):
+                more = sock.recv(4096)
+                if more:
+                    detail = (rest + more).decode("latin-1", "replace").strip()
+            raise HostConflictError(f"upgrade refused ({status}): {detail or status}")
+        raise ProtocolError(f"upgrade refused: {detail or status}")
     token = ""
     for line in head.split(b"\r\n")[1:]:
         if line.lower().startswith(b"upgrade:"):
@@ -367,6 +420,7 @@ def decode_resize(payload: bytes) -> tuple[int, int]:
 
 
 class ShellState(enum.Enum):
+    """Enum of shell lifecycle states: CREATED, RUNNING, EXITED, REAPED, TERMINATED. Tracks HostShell process status."""
     CREATED = "created"
     RUNNING = "running"
     EXITED = "exited"
@@ -383,6 +437,7 @@ class HostShell:
     """
 
     def __init__(self, max_buffer: int = DETACHED_BUFFER) -> None:
+        """Initializes a shell with no process (pid/fd None), CREATED state, empty output buffer, zero dropped bytes, given max_buffer (default DETACHED_BUFFER), and default terminal dimensions from proto; no process is spawned until spawn()."""
         self.pid: int | None = None
         self.fd: int | None = None
         self.state: ShellState = ShellState.CREATED
@@ -633,6 +688,7 @@ class ShellPool:
     """
 
     def __init__(self, max_idle: int = 4) -> None:
+        """Creates an empty shell list and busy set, a lock and condition variable, max_idle (default 4), and starts the daemon idle-drain thread that pumps output for idle shells."""
         self._shells: list[HostShell] = []
         self._busy: set[int] = set()
         self._lock = threading.Lock()
@@ -1134,6 +1190,50 @@ def generate_key(keyfile: str, force: bool = False) -> int:
     return 0
 
 
+def fetch_status(host: str, port: int) -> dict[str, Any]:
+    """Query ``GET /__moesh/status`` on the receiver and return the parsed JSON."""
+    with socket.create_connection((host, port), timeout=10) as sock:
+        req = (
+            f"GET /__moesh/status HTTP/1.1\r\n"
+            f"Host: {host}\r\n"
+            "Connection: close\r\n\r\n"
+        ).encode()
+        sock.sendall(req)
+        raw = b""
+        while True:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            raw += chunk
+    if b"\r\n\r\n" not in raw:
+        raise ProtocolError("invalid HTTP response from /__moesh/status")
+    head, body = raw.split(b"\r\n\r\n", 1)
+    status_line = head.split(b"\r\n", 1)[0].decode("latin-1", "replace")
+    if " 200" not in status_line:
+        raise ProtocolError(f"status probe failed: {status_line}")
+    result: dict[str, Any] = json.loads(body.decode("utf-8", "replace"))
+    return result
+
+
+def resolve_auto_host(host: str, port: int) -> str:
+    """Query receiver status and return the lowest free ``<prefix>-<N>`` host name."""
+    prefix = (
+        os.environ.get("MOESH_TUNNEL_PREFIX", "").strip()
+        or os.environ.get("MOESH_TUNNEL_V2_PREFIX", "").strip()
+        or proto.DEFAULT_PREFIX
+    ).strip() or proto.DEFAULT_PREFIX
+    try:
+        data = fetch_status(host, port)
+        in_use = set(data.get("hosts", {}).get("in_use", []))
+    except Exception:
+        in_use = set()
+    for n in range(1, 256):
+        cand = f"{prefix}-{n}"
+        if cand not in in_use:
+            return cand
+    return f"{prefix}-1"
+
+
 def tunnel_worker(host: str, port: int, path: str, name: str, pool: ShellPool) -> None:
     """Hold one tunnel to the receiver and serve whoever claims it.
 
@@ -1147,7 +1247,9 @@ def tunnel_worker(host: str, port: int, path: str, name: str, pool: ShellPool) -
     shells and every operator brings its own transport, instead of one
     transport carrying many channels (RFC 4254 section 5).
     """
+    global _conflict_refused, _stopping
     backoff = 2.0
+    claim_deadline = time.time() + 2.0
     while not _stopping:
         try:
             outcome = serve_once(host, port, path, name, pool)
@@ -1158,6 +1260,13 @@ def tunnel_worker(host: str, port: int, path: str, name: str, pool: ShellPool) -
                 log("an operator detached; its shell keeps running")
         except Stop:
             break
+        except HostConflictError as exc:
+            log(f"ERROR: {exc}")
+            if time.time() >= claim_deadline:
+                _conflict_refused = True
+                _stopping = True
+                break
+            time.sleep(1.5)
         except AuthenticationError as exc:
             log(
                 f"AUTHENTICATION FAILED: {exc} — refusing to retry for {int(AUTH_BACKOFF)}s"
@@ -1192,12 +1301,35 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="overwrite an existing key file when generating",
     )
+    parser.add_argument(
+        "--probe",
+        action="store_true",
+        help="query receiver /__moesh/status for active hosts and open/free relay ports",
+    )
+    parser.add_argument(
+        "--receiver",
+        default="",
+        help="receiver address override (or set MOESH_TUNNEL_RECEIVER)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=0,
+        help="receiver port override (default: 80 or MOESH_TUNNEL_RECEIVER_PORT)",
+    )
+    parser.add_argument(
+        "--host",
+        "-n",
+        default="",
+        help="host number or 'auto' (or set MOESH_TUNNEL_HOST)",
+    )
     args = parser.parse_args(argv)
     if args.generate_key:
         return generate_key(args.keyfile, args.force)
 
     host = (
-        os.environ.get("MOESH_TUNNEL_RECEIVER", "").strip()
+        args.receiver.strip()
+        or os.environ.get("MOESH_TUNNEL_RECEIVER", "").strip()
         or os.environ.get("MOESH_TUNNEL_V2_RECEIVER", "").strip()
         or os.environ.get("NB_TUNNEL_V2_HOST", "").strip()
         or DEFAULT_RECEIVER
@@ -1208,14 +1340,29 @@ def main(argv: list[str] | None = None) -> int:
             "host name the agent dials) and, if it is not port 80, "
             "MOESH_TUNNEL_RECEIVER_PORT"
         )
-    port = int(
+    port = args.port or int(
         os.environ.get("MOESH_TUNNEL_RECEIVER_PORT", "").strip()
         or os.environ.get("MOESH_TUNNEL_V2_PORT", "").strip()
         or os.environ.get("NB_TUNNEL_V2_PORT", "").strip()
         or str(DEFAULT_PORT)
     )
+    if args.probe:
+        try:
+            print(json.dumps(fetch_status(host, port), indent=2))
+            return 0
+        except Exception as exc:
+            log(f"probe failed against {host}:{port}: {exc}")
+            return 1
+
+    if args.host:
+        os.environ["MOESH_TUNNEL_HOST"] = args.host.strip()
+    raw_host = os.environ.get("MOESH_TUNNEL_HOST", "").strip()
     path = os.environ.get("MOESH_TUNNEL_PATH", proto.DEFAULT_PATH)
-    name = host_name()
+    if raw_host.lower() == "auto":
+        name = resolve_auto_host(host, port)
+        log(f"auto-selected free host slot: {name!r}")
+    else:
+        name = host_name()
 
     signal.signal(signal.SIGTERM, _on_stop)
     signal.signal(signal.SIGINT, _on_stop)
@@ -1250,7 +1397,7 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as exc:
             log(f"error during pool termination: {exc}")
         log("agent stopped")
-    return 0
+    return 3 if _conflict_refused else 0
 
 
 if __name__ == "__main__":

@@ -55,8 +55,8 @@ The client requires a valid TTY when starting an interactive terminal session.
 | `MOESH_TUNNEL_PATH` | `/__moesh/tunnel` | `moesh_tunnel.py:1186`, constant at `moesh_wire.py:23` |
 | `MOESH_TUNNEL_AGENT_KEY` | *none* — the agent's private key as hex | `moesh_tunnel.py:151-155` |
 | `MOESH_TUNNEL_AGENT_KEYFILE` | *none* — a file holding that key | `moesh_tunnel.py:156-160` |
-| `MOESH_TUNNEL_OPERATOR_PUB` | *none* — the pinned operator public key | `moesh_tunnel.py:192-200` |
-| `MOESH_TUNNEL_HOST` | *none* — host number; defaults to name below | `moesh_tunnel.py:227-233` |
+| `MOESH_TUNNEL_OPERATOR_PUB` | *none* — optional pinned operator public key (when unset, derived from `MOESH_TUNNEL_MASTER`) | `moesh_tunnel.py:203-239` |
+| `MOESH_TUNNEL_HOST` | *none* — host number or `auto`; defaults to name below | `moesh_tunnel.py:242-255` |
 | `MOESH_TUNNEL_PREFIX` | `host` | `moesh_tunnel.py:234-236`, constant at `moesh_proto.py:730` |
 | `MOESH_TUNNEL_NAME` | `default` | `moesh_tunnel.py:241`, constant at `:93` |
 | `MOESH_TUNNEL_MASTER` | *none* — fleet master secret for HKDF key derivation | `moesh_tunnel.py:268-283` |
@@ -73,9 +73,13 @@ Legacy aliases `MOESH_TUNNEL_V2_*` and `NB_TUNNEL_V2_*` are supported for backwa
 
 | flag | effect | source |
 |---|---|---|
-| `--generate-key` | write a fresh agent key pair and print the public half | `moesh_tunnel.py:1149-1153` |
-| `--keyfile PATH` | where `--generate-key` writes the private key | `moesh_tunnel.py:1154-1158` |
-| `--force` | overwrite an existing key file when generating | `moesh_tunnel.py:1159-1163` |
+| `--generate-key` | write a fresh agent key pair and print the public half | `moesh_tunnel.py` |
+| `--keyfile PATH` | where `--generate-key` writes the private key | `moesh_tunnel.py` |
+| `--force` | overwrite an existing key file when generating | `moesh_tunnel.py` |
+| `--probe` | query `/__moesh/status` for active hosts and relay ports and exit | `moesh_tunnel.py` |
+| `--host`, `-n` | host number, name, or `auto` | `moesh_tunnel.py` |
+| `--receiver` | receiver hostname or IP override | `moesh_tunnel.py` |
+| `--receiver-port` | receiver HTTP port override | `moesh_tunnel.py` |
 
 ### Back-off and Timings
 
@@ -117,30 +121,37 @@ moecp [-h] [-r] [-p] [-q] [-v] [-n HOST] [--addr ADDR] [--keyfile KEYFILE] paths
 
 ---
 
-## Accelerator Service Reverse Relay (`moesh_relay.py`)
+## Outbound TCP Reverse Relay (`moesh_relay.py`)
 
 ### Environment
 
 | variable | default | source |
 |---|---|---|
-| `MOESH_RELAY_RECEIVER` | *none* — target receiver hostname/IP | `moesh_relay.py:28`, used at `:158` |
-| `MOESH_RELAY_PORT` | `80` | `moesh_relay.py:29`, used at `:161` |
-| `MOESH_RELAY_SERVICE` | `gpu` | `moesh_relay.py:153` |
-| `MOESH_RELAY_TARGET` | `127.0.0.1:8001` | `moesh_relay.py:30`, used at `:168` |
-| `MOESH_RELAY_WORKERS` | `4` concurrent connections | `moesh_relay.py:31`, used at `:171` |
-| `MOESH_RELAY_IDLE` | `900` seconds | `moesh_relay.py:32`, used at `:174` |
+| `MOESH_RELAY_RECEIVER` | *none* — target receiver hostname/IP | `moesh_relay.py` |
+| `MOESH_RELAY_PORT` | `80` | `moesh_relay.py` |
+| `MOESH_RELAY_REMOTE_PORT` | `auto` (when `--service` is unset) | `moesh_relay.py` |
+| `MOESH_RELAY_SERVICE` | *none* — optional label | `moesh_relay.py` |
+| `MOESH_RELAY_TARGET` | `127.0.0.1:8000` | `moesh_relay.py` |
+| `MOESH_RELAY_WORKERS` | `4` standby tunnel workers | `moesh_relay.py` |
+| `MOESH_RELAY_IDLE` | `900` seconds (standby tunnel refresh interval) | `moesh_relay.py` |
+| `MOESH_RELAY_SESSION_IDLE` | `120` seconds (active paired session idle timeout) | `moesh_relay.py` |
 
 ### Flags
 
 | flag | effect | source |
 |---|---|---|
-| `--service SERVICE` | Service name (e.g. `vllm`, `gpu`, `embed`, `custom`) | `moesh_relay.py:152-155` |
-| `--receiver RECEIVER` | Receiver hostname or IP | `moesh_relay.py:157-159` |
-| `--port PORT` | Receiver HTTP port (default 80) | `moesh_relay.py:160-162` |
-| `--url URL` | Full URL override (e.g. `http://receiver.example.com/__relay/vllm`) | `moesh_relay.py:163-165` |
-| `--target TARGET` | Target service on this accelerator machine (default `127.0.0.1:8001`) | `moesh_relay.py:167-169` |
-| `--workers WORKERS` | Number of concurrent queued connections (default 4) | `moesh_relay.py:170-172` |
-| `--idle IDLE` | Idle timeout in seconds before refreshing tunnel (default 900) | `moesh_relay.py:173-175` |
+| `--remote-port`, `-R` | Public relay port on receiver (`26420..26430`) or `auto` | `moesh_relay.py` |
+| `--service SERVICE` | Optional service label; returns `409 Conflict` if already held | `moesh_relay.py` |
+| `--probe` | Query `/__moesh/status` for open/free/in-use/unavailable ports and exit | `moesh_relay.py` |
+| `--receiver RECEIVER` | Receiver hostname or IP | `moesh_relay.py` |
+| `--port PORT` | Receiver HTTP port (default 80) | `moesh_relay.py` |
+| `--url URL` | Full URL override (e.g. `http://receiver.example.com/__relay/26425`) | `moesh_relay.py` |
+| `--target TARGET` | Local TCP target `host:port` to forward to (default `127.0.0.1:8000`) | `moesh_relay.py` |
+| `--workers WORKERS` | Number of standby queued tunnels (default 4) | `moesh_relay.py` |
+| `--id ID` | Carrier identity (default random per process; reuse across restarts to reclaim your own lease) | `moesh_relay.py` |
+| `--claim-wait SECONDS` | Retry window when another carrier holds the port/label, then exit 3 (default 45) | `moesh_relay.py` |
+| `--idle IDLE` | Standby tunnel refresh timeout in seconds (default 900) | `moesh_relay.py` |
+| `--session-idle SECONDS` | Active session idle timeout in seconds (default 120) | `moesh_relay.py` |
 
 ---
 
@@ -148,12 +159,13 @@ moecp [-h] [-r] [-p] [-q] [-v] [-n HOST] [--addr ADDR] [--keyfile KEYFILE] paths
 
 | variable | default | source |
 |---|---|---|
-| `MOESH_BRIDGE_TUNNEL_LISTEN` | `127.0.0.1:9447` — where nginx proxies the upgrade | `moesh-bridge.py:61` |
-| `MOESH_BRIDGE_OPERATOR_V2_LISTEN` | `127.0.0.1:44441` — where the operator client connects | `moesh-bridge.py:63` |
-| `MOESH_BRIDGE_OPERATOR_LISTEN` | `127.0.0.1:44440` — legacy v1 operator listener | `moesh-bridge.py:62` |
-| `MOESH_BRIDGE_ALLOW_V1` | `1` — whether to allow legacy v1 connections | `moesh-bridge.py:70` |
-| `MOESH_RELAYS` | `gpu:26430,lemonade:26426` — comma-separated `<service>:<port>` mappings | `moesh-bridge.py:526` |
-| `MOESH_BRIDGE_GPU_PORTS` | `26420-26430` — legacy port range | `moesh-bridge.py:524` |
+| `MOESH_BRIDGE_TUNNEL_LISTEN` | `127.0.0.1:9447` — where nginx proxies the upgrade | `moesh-bridge.py` |
+| `MOESH_BRIDGE_OPERATOR_V2_LISTEN` | `127.0.0.1:44441` — where the operator client connects | `moesh-bridge.py` |
+| `MOESH_BRIDGE_OPERATOR_LISTEN` | `127.0.0.1:44440` — legacy v1 operator listener | `moesh-bridge.py` |
+| `MOESH_BRIDGE_ALLOW_V1` | `1` — whether to allow legacy v1 connections | `moesh-bridge.py` |
+| `MOESH_RELAY_PORTS` | `26420-26430` — public TCP relay port pool (fallback: `MOESH_BRIDGE_GPU_PORTS`) | `moesh-bridge.py` |
+| `MOESH_RELAYS` | *none* — optional comma-separated `<label>:<port>` mappings | `moesh-bridge.py` |
+| `MOESH_BRIDGE_LEASE_GRACE` | `30` — seconds a host slot or relay port stays held after its carrier's last live tunnel | `moesh-bridge.py` |
 
 ---
 

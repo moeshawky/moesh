@@ -75,18 +75,23 @@ __all__ = [
     "UPGRADE_TOKEN",
 ]
 
+# Noise protocol identifier selecting the XX pattern with X25519, ChaChaPoly, and BLAKE2s for transport sessions.
 NOISE_NAME = b"Noise_XX_25519_ChaChaPoly_BLAKE2s"
 """Noise pattern and cipher suite used for the transport."""
 
+# Fixed application prologue binding the cryptographic handshake schema revision to PROTOCOL_VERSION; peers must agree on it.
 PROLOGUE = f"moesh-tunnel-v2/{PROTOCOL_VERSION}/noise_xx_25519_chachapoly_blake2s".encode("ascii")
 """Fixed application prologue binding cryptographic handshake schema revision to PROTOCOL_VERSION."""
 
+# Maximum ciphertext bytes in one framed message, matching Noise MAX_MESSAGE_LEN; larger frames are rejected.
 MAX_CIPHERTEXT = 65535
 """Maximum ciphertext in one frame (Noise MAX_MESSAGE_LEN)."""
 
+# Maximum accepted Noise handshake message size; handshake frames above this bound are rejected.
 MAX_HANDSHAKE_FRAME = 4096
 """Maximum Noise handshake message (measured size is 32..112 bytes)."""
 
+# Seconds either side waits for the other during the Noise handshake; it must exceed the bridge queue wait to avoid aborting late hosts.
 HANDSHAKE_TIMEOUT = 150.0
 """Seconds a side waits for the other end of the handshake.
 
@@ -100,18 +105,25 @@ attempt was thrown away by the bridge's 120s timer.
 """
 """Seconds allowed for the three-message Noise handshake."""
 
+# Seconds allowed for HELLO, ACCEPT, and READY messages after the Noise handshake.
 NEGOTIATION_TIMEOUT = 30.0
 """Seconds allowed for HELLO/ACCEPT/READY."""
 
+# Upper bound for terminal rows because TIOCSWINSZ uses unsigned shorts; values above this are invalid.
 MAX_ROWS = 1000
 """Upper bound for terminal rows (TIOCSWINSZ uses unsigned shorts)."""
 
+# Upper bound for terminal columns; values above this are invalid.
 MAX_COLS = 1000
 """Upper bound for terminal columns."""
 
+# Default terminal row count used when a peer does not specify dimensions.
 DEFAULT_ROWS = 24
+# Default terminal column count used when a peer does not specify dimensions.
 DEFAULT_COLS = 80
+# Default TERM value used for remote PTY sessions.
 DEFAULT_TERM = "xterm-256color"
+# Default text encoding used for terminal input and output.
 DEFAULT_ENCODING = "utf-8"
 
 
@@ -184,6 +196,7 @@ class SessionState:
     """
 
     def __init__(self) -> None:
+        """Initialize the session state to CONNECTED; later transitions are validated by to()."""
         self._state = State.CONNECTED
 
     @property
@@ -221,6 +234,7 @@ class FrameReader:
     """
 
     def __init__(self, max_frame: int = MAX_CIPHERTEXT) -> None:
+        """Create an empty reassembly buffer with max_frame as the largest accepted frame size."""
         self._buffer = bytearray()
         self._max_frame = max_frame
 
@@ -276,6 +290,7 @@ class Channel:
     """
 
     def __init__(self, sock: Any, max_frame: int = MAX_CIPHERTEXT) -> None:
+        """Wrap the given socket and create a FrameReader using max_frame for incoming frames."""
         self._sock = sock
         self._reader = FrameReader(max_frame)
 
@@ -363,9 +378,10 @@ class NoiseSession:
         self,
         role: str,
         static_private: bytes,
-        peer_static: bytes,
+        peer_static: bytes | tuple[bytes, ...],
         prologue: bytes | None = None,
     ) -> None:
+        """Validate role and key lengths, store static and peer static keys, and initialize Noise state; raises ProtocolError on invalid role or key sizes."""
         if role not in ("initiator", "responder"):
             raise ProtocolError(f"unknown Noise role {role!r}")
         if len(static_private) != 32:
@@ -496,6 +512,7 @@ class SecureChannel:
     """
 
     def __init__(self, channel: Channel, session: NoiseSession) -> None:
+        """Wrap a Channel and NoiseSession without performing I/O; encryption and framing happen in later send and receive calls."""
         self._channel = channel
         self._session = session
 
@@ -683,6 +700,7 @@ def validate_resize(resize: dict[str, Any]) -> tuple[int, int]:
     return rows, cols
 
 
+# Prefix for host names; a number is expanded to prefix-number so one number names the same host on both ends.
 DEFAULT_PREFIX = "host"
 """Prefix for host names: a number is expanded to ``<prefix>-<number>``, so one
 number names the same host on both ends (the way SSH host entries used to

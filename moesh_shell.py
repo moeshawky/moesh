@@ -62,6 +62,7 @@ from moesh_proto import (
     TransportEOF,
 )
 
+# Default operator-shell receiver address as 'host:port' ('127.0.0.1:44441'); overridden by MOESH_SHELL_ADDR. Used as the default --addr for the shell client.
 DEFAULT_ADDR = "127.0.0.1:44441"
 # All of the operator's state lives in one config directory: the key material
 # and the pins file.  Override any piece with its environment variable.
@@ -69,9 +70,12 @@ HOSTS_FILE = os.environ.get(
     "MOESH_SHELL_HOSTS_FILE",
     os.path.expanduser("~/.config/moesh/hosts.toml"),
 )
+# Filesystem path to the operator's static private key (~/.config/moesh/operator.key); overridden by MOESH_SHELL_KEYFILE. Used to authenticate to agents.
 DEFAULT_KEYFILE = os.path.expanduser("~/.config/moesh/operator.key")
+# Filesystem path to the pinned agent static public key (~/.config/moesh/agent.pub); overridden by MOESH_SHELL_PEER_PUBFILE. Used to verify the remote agent's identity.
 DEFAULT_PEER_PUBFILE = os.path.expanduser("~/.config/moesh/agent.pub")
 
+# Tuple of protocol capability names ('resize', 'ping') advertised by the shell client during the handshake. Sent to the agent to negotiate supported features.
 CAPABILITIES = ("resize", "ping")
 
 
@@ -241,7 +245,12 @@ def pinned_key(host: str) -> bytes | tuple[bytes, ...]:
             raise ProtocolError(f"the pinned key for host {host!r} must be 32 bytes")
         candidates.append(key)
 
-    master_hex = entry.get("master") or config.get("master")
+    master_hex = (
+        entry.get("master")
+        or config.get("master")
+        or os.environ.get("MOESH_TUNNEL_MASTER", "").strip()
+        or os.environ.get("MOESH_SHELL_MASTER", "").strip()
+    )
     if master_hex:
         raw = str(master_hex).strip().removeprefix("0x").replace(":", "")
         try:
@@ -320,6 +329,54 @@ def read_key(path: str, what: str) -> bytes:
     return key
 
 
+def resolve_operator_keys(
+    keyfile: str, host: str, explicit_keyfile: bool = False
+) -> list[bytes]:
+    """Return candidate operator static private keys for ``host``.
+
+    When ``explicit_keyfile`` is True (``--keyfile`` or ``MOESH_SHELL_KEYFILE``
+    set), only ``keyfile`` is used so an explicit override never silently falls
+    back.  Otherwise, both ``keyfile`` (if present) and the operator key derived
+    from the master secret (``derive_static_key(master, "operator")``) are
+    returned, allowing any agent with ``MOESH_TUNNEL_MASTER`` to connect without
+    a separate ``operator.key`` file.
+    """
+    if explicit_keyfile:
+        return [read_key(keyfile, "operator static private key")]
+
+    keys: list[bytes] = []
+    if os.path.exists(keyfile):
+        keys.append(read_key(keyfile, "operator static private key"))
+
+    config = load_config() if os.path.exists(HOSTS_FILE) else {}
+    pins = config.get("hosts", {})
+    entry = pins.get(host) if isinstance(pins, dict) else None
+    if not isinstance(entry, dict):
+        entry = {}
+    env_master = (
+        os.environ.get("MOESH_TUNNEL_MASTER", "").strip()
+        or os.environ.get("MOESH_SHELL_MASTER", "").strip()
+    )
+    master_hex = env_master or entry.get("master") or config.get("master")
+    if master_hex:
+        raw = str(master_hex).strip().removeprefix("0x").replace(":", "")
+        try:
+            master = bytes.fromhex(raw)
+            if len(master) >= 16:
+                derived_op = proto.derive_static_key(master, "operator")
+                if derived_op not in keys:
+                    if env_master and not os.path.exists(keyfile):
+                        keys.insert(0, derived_op)
+                    else:
+                        keys.append(derived_op)
+        except ValueError:
+            pass
+
+    if not keys:
+        return [read_key(keyfile, "operator static private key")]
+    return keys
+
+
 def terminal_size(fd: int) -> tuple[int, int]:
     """Return ``(rows, cols)`` of the terminal behind ``fd``.
 
@@ -342,6 +399,7 @@ class RawTerminal:
     """
 
     def __init__(self, fd: int) -> None:
+        """Stores the file descriptor to put in raw mode and initializes saved termios attributes to None; no terminal changes occur until __enter__ saves and applies them."""
         self._fd = fd
         self._saved: list[Any] | None = None
 
@@ -491,7 +549,9 @@ _ESCAPE_NORMAL = 0
 _ESCAPE_AFTER_NEWLINE = 1
 _ESCAPE_AFTER_TILDE = 2
 
+# Byte sequence marking the start of a bracketed paste block (ESC[200~). Used by EscapeFilter to disable escape-sequence detection during pasted input.
 BRACKETED_PASTE_START = b"\x1b[200~"
+# Byte sequence marking the end of a bracketed paste block (ESC[201~). Used by EscapeFilter to re-enable escape-sequence detection after paste.
 BRACKETED_PASTE_END = b"\x1b[201~"
 
 
@@ -508,6 +568,7 @@ class EscapeFilter:
     """
 
     def __init__(self) -> None:
+        """Initializes state to _ESCAPE_AFTER_NEWLINE, paste flag to False, and an empty 5-byte tail buffer for split-marker detection; no input is processed until feed() is called."""
         self.state: int = _ESCAPE_AFTER_NEWLINE
         self.in_bracketed_paste: bool = False
         # Tail retained across feeds so a bracketed-paste marker split across
@@ -862,10 +923,20 @@ def main(argv: list[str] | None = None) -> int:
     host = resolve_name(args.host)
     if args.new_master:
         return new_master(host)
-    private = read_key(args.keyfile, "operator static private key")
+    explicit_kf = bool(
+        os.environ.get("MOESH_SHELL_KEYFILE")
+        or (argv is not None and "--keyfile" in argv)
+        or (argv is None and "--keyfile" in sys.argv)
+    )
+    op_keys = resolve_operator_keys(args.keyfile, host, explicit_keyfile=explicit_kf)
+    private = op_keys[0]
     config = load_config() if os.path.exists(HOSTS_FILE) else {}
     hosts = config.get("hosts", {})
-    if hosts or config.get("master"):
+    env_master = (
+        os.environ.get("MOESH_TUNNEL_MASTER", "").strip()
+        or os.environ.get("MOESH_SHELL_MASTER", "").strip()
+    )
+    if hosts or config.get("master") or env_master:
         # A configured host must be pinned: never fall back to "whatever
         # key file happens to be there".  A top-level master (with an empty or
         # missing [hosts] table) is the shared secret pinned_key derives from,
@@ -888,16 +959,22 @@ def main(argv: list[str] | None = None) -> int:
     term = os.environ.get("TERM", proto.DEFAULT_TERM)
 
     attempt = 0
+    key_idx = 0
     while True:
+        private = op_keys[key_idx % len(op_keys)]
         try:
             return run_one_session(args, host, private, peer, term)
         except AuthenticationError:
             # An identity failure is not a network failure: never retry it.
             raise
         except (TransportEOF, SessionTimeout, ProtocolError, OSError) as exc:
+            if len(op_keys) > 1 and key_idx == 0 and isinstance(exc, TransportEOF):
+                key_idx += 1
+                continue
             if not args.reconnect:
                 raise
             attempt += 1
+            key_idx += 1
             # After the first attempt, re-attach to the running shell instead of
             # re-spawning: every retry previously re-sent fresh_session=true and
             # the pool always allocated a new shell (B12 / G-SEM-1, measured
@@ -915,7 +992,7 @@ def run_one_session(
     args: argparse.Namespace,
     host: str,
     private: bytes,
-    peer: bytes,
+    peer: bytes | tuple[bytes, ...],
     term: str,
 ) -> int:
     """Run one session: connect, authenticate, negotiate, relay the terminal.

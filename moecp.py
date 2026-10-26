@@ -42,7 +42,7 @@ import struct
 import sys
 import time
 import zlib
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -67,20 +67,24 @@ from moesh_shell import (
     handshake,
     negotiate,
     pinned_key,
-    read_key,
     resolve_name,
+    resolve_operator_keys,
 )
 from moesh_wire import PRELUDE_PREFIX
 
+# Maximum uncompressed chunk size for file transfer streaming, fixed at 32768 bytes (32 KiB).
 CHUNK_SIZE: int = 32768
 """Maximum uncompressed chunk size for file transfer streaming (32 KiB)."""
 
+# Maximum allowed JSON metadata header size, fixed at 65536 bytes (64 KiB).
 MAX_FRAME_HDR: int = 65536
 """Maximum allowed JSON metadata header size in bytes (64 KiB)."""
 
+# Maximum allowed chunk payload size, fixed at 10485760 bytes (10 MiB).
 MAX_FRAME_PAYLOAD: int = 10485760
 """Maximum allowed chunk payload size in bytes (10 MiB)."""
 
+# Handshake token bytes emitted by the remote bootstrap worker after switching to raw framed mode.
 MAGIC_READY: bytes = b"MOECP_READY_V1\n"
 """Handshake token emitted by the remote bootstrap worker once in raw mode."""
 
@@ -1087,6 +1091,7 @@ class TransferLedger:
     """SQLite-backed transactional ledger for crash-consistent resumable transfers."""
 
     def __init__(self, db_path: str) -> None:
+        """Stores db_path and creates the parent directory, SQLite database, WAL mode, auto_vacuum, and transfers and verified_ranges tables."""
         self.db_path = db_path
         self._init_db()
 
@@ -1127,6 +1132,7 @@ class TransferLedger:
         expected_sha256: str,
         updated_at: float | None = None,
     ) -> None:
+        """Inserts or replaces a transfer row with committed=0, total size, expected SHA-256, relative path, and timestamp (current time or updated_at)."""
         ts = time.time() if updated_at is None else updated_at
         with sqlite3.connect(self.db_path, timeout=10.0) as conn:
             conn.execute(
@@ -1141,6 +1147,7 @@ class TransferLedger:
         end: int,
         sha256: str,
     ) -> None:
+        """Inserts or replaces a verified range row for transfer_id and updates that transfer's updated_at timestamp."""
         with sqlite3.connect(self.db_path, timeout=10.0) as conn:
             conn.execute(
                 "INSERT OR REPLACE INTO verified_ranges (transfer_id, start_offset, end_offset, sha256) VALUES (?, ?, ?, ?)",
@@ -1152,6 +1159,7 @@ class TransferLedger:
             )
 
     def mark_committed(self, transfer_id: str, sha256: str | None = None) -> None:
+        """Sets committed=1 and updated_at to the current time for transfer_id; when sha256 is provided it also updates expected_sha256."""
         with sqlite3.connect(self.db_path, timeout=10.0) as conn:
             if sha256:
                 conn.execute(
@@ -1165,6 +1173,7 @@ class TransferLedger:
                 )
 
     def get_expected_sha256(self, transfer_id: str) -> str:
+        """Returns the stored expected SHA-256 string for transfer_id, or an empty string when the row or value is missing."""
         with sqlite3.connect(self.db_path, timeout=10.0) as conn:
             cur = conn.execute(
                 "SELECT expected_sha256 FROM transfers WHERE transfer_id=?",
@@ -1174,6 +1183,7 @@ class TransferLedger:
             return str(row[0]) if row and row[0] else ""
 
     def get_verified_ranges(self, transfer_id: str) -> list[tuple[int, int]]:
+        """Returns verified (start_offset, end_offset) tuples for transfer_id ordered by start_offset."""
         with sqlite3.connect(self.db_path, timeout=10.0) as conn:
             cur = conn.execute(
                 "SELECT start_offset, end_offset FROM verified_ranges WHERE transfer_id=? ORDER BY start_offset",
@@ -1182,6 +1192,7 @@ class TransferLedger:
             return cur.fetchall()
 
     def get_verified_range_hashes(self, transfer_id: str) -> list[tuple[int, int, str]]:
+        """Returns verified (start_offset, end_offset, sha256) tuples for transfer_id ordered by start_offset."""
         with sqlite3.connect(self.db_path, timeout=10.0) as conn:
             cur = conn.execute(
                 "SELECT start_offset, end_offset, sha256 FROM verified_ranges WHERE transfer_id=? ORDER BY start_offset",
@@ -1190,6 +1201,7 @@ class TransferLedger:
             return cur.fetchall()
 
     def clear_ranges(self, transfer_id: str) -> None:
+        """Deletes all verified_ranges rows associated with transfer_id."""
         with sqlite3.connect(self.db_path, timeout=10.0) as conn:
             conn.execute(
                 "DELETE FROM verified_ranges WHERE transfer_id=?",
@@ -1238,6 +1250,7 @@ class TransferLedger:
             return len(stale_rows)
 
     def is_committed(self, transfer_id: str) -> bool:
+        """Returns True only when a transfers row exists for transfer_id with committed equal to 1."""
         with sqlite3.connect(self.db_path, timeout=10.0) as conn:
             cur = conn.execute(
                 "SELECT committed FROM transfers WHERE transfer_id=?",
@@ -1552,7 +1565,12 @@ def connect_and_run(
     Returns:
         Process exit code.
     """
-    private = read_key(args.keyfile, "operator static private key")
+    explicit_kf = (
+        bool(os.environ.get("MOESH_SHELL_KEYFILE"))
+        or bool(os.environ.get("MOESH_SHELL_V2_KEYFILE"))
+        or (args.keyfile != DEFAULT_KEYFILE)
+    )
+    op_keys = resolve_operator_keys(args.keyfile, host, explicit_keyfile=explicit_kf)
     peer = pinned_key(host)
 
     addr_host, _, port_text = args.addr.rpartition(":")
@@ -1561,8 +1579,9 @@ def connect_and_run(
         return 1
     port = int(port_text)
 
-    retries = max(1, getattr(args, "retry", 1))
+    retries = max(1, getattr(args, "retry", 1), len(op_keys))
     for attempt in range(retries):
+        private = op_keys[attempt % len(op_keys)]
         try:
             sock = socket.create_connection((addr_host, port), timeout=15)
         except OSError as exc:
@@ -1577,7 +1596,7 @@ def connect_and_run(
 
         try:
             channel = Channel(sock)
-            session = NoiseSession("initiator", private, cast("bytes", peer))
+            session = NoiseSession("initiator", private, peer)
             sock.settimeout(30.0)
             handshake(session, channel)
 

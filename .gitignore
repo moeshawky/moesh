@@ -45,5 +45,11 @@ TEST-PROTOCOL.md
 
 # Local code intelligence & search index caches
 .codegraph/
+.codegraphinclude
+.githooks/
 .ix/
 .ixd.toml
+
+# Annotation protocol artifacts
+.annotations/
+.drain/
