@@ -17,7 +17,7 @@
 # scripts stay where they are and the project manages only its environment.
 [project]
 name = "moesh"
-version = "0.2.0"
+version = "0.2.0a1"
 description = "An SSH-like encrypted remote shell: Noise over an HTTP upgrade, with a persistent shell"
 readme = "README.md"
 requires-python = ">=3.11"

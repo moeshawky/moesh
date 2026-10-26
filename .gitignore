@@ -41,6 +41,7 @@ AGENTS.md
 HANDOFF.md
 .opencode/
 TEST-PROTOCOL.md
+.workflows/
 
 # Local code intelligence & search index caches
 .codegraph/

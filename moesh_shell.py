@@ -419,6 +419,7 @@ def negotiate(
     fresh: bool = False,
     rows: int | None = None,
     cols: int | None = None,
+    session_type: str = "shell",
 ) -> dict[str, Any]:
     """Send HELLO, exchange ACCEPT/READY and return the accepted configuration.
 
@@ -449,6 +450,7 @@ def negotiate(
             "max_record": proto.MAX_DATA_PAYLOAD,
             "handshake_hash": secure.session.handshake_hash().hex(),
             "fresh_session": fresh,
+            "session_type": session_type,
         },
     )
     msg_type, accept = secure.recv_control()
@@ -457,6 +459,8 @@ def negotiate(
     agreed = proto.validate_hello(accept)
     if accept.get("resumed"):
         log("re-attached to the running shell: the previous session continues")
+    elif accept.get("session_type") == "transfer":
+        log("native transfer session established")
     else:
         log("a new shell was started")
     secure.send_control(Msg.READY, {})

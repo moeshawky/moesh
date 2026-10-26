@@ -36,6 +36,7 @@ import os
 import select
 import shutil
 import socket
+import sqlite3
 import stat
 import struct
 import sys
@@ -210,7 +211,13 @@ def run():
                         cmsg, cdata = recv_frame()
                         cop = cmsg.get("op")
                         if cop == "CHUNK":
-                            raw = zlib.decompress(cdata)
+                            enc = cmsg.get("encoding", "zlib")
+                            if enc == "zlib":
+                                raw = zlib.decompress(cdata)
+                            elif enc == "raw":
+                                raw = cdata
+                            else:
+                                raise ValueError(f"unsupported chunk encoding: {enc}")
                             f.write(raw)
                             hasher.update(raw)
                         elif cop == "FILE_END":
@@ -222,7 +229,7 @@ def run():
                             return 1
 
                 actual_sha = hasher.hexdigest()
-                if actual_sha != expected_sha:
+                if not expected_sha or actual_sha != expected_sha:
                     if os.path.exists(tmp_file):
                         os.remove(tmp_file)
                     send_frame({"status": "ERROR", "message": f"checksum mismatch: {actual_sha} vs {expected_sha}"})
@@ -250,6 +257,7 @@ def run():
     elif direction == "PULL":
         source = os.path.expanduser(meta.get("source", "."))
         recursive = meta.get("recursive", False)
+        compression = meta.get("compression", "auto")
 
         if not os.path.exists(source):
             send_frame({"status": "ERROR", "message": f"{source}: No such file or directory"})
@@ -266,12 +274,10 @@ def run():
             for root, _, files in os.walk(base_dir):
                 for fname in files:
                     full = os.path.join(root, fname)
-                    try:
+                    with contextlib.suppress(Exception):
                         rel = sanitize_relpath(os.path.relpath(full, base_dir))
                         st = os.stat(full)
                         file_list.append({"rel": rel, "full": full, "size": st.st_size, "mode": st.st_mode, "mtime": st.st_mtime})
-                    except Exception:
-                        pass
         else:
             try:
                 st = os.stat(source)
@@ -283,23 +289,63 @@ def run():
 
         send_frame({"status": "OK", "is_dir": is_dir, "files": [{"rel": f["rel"], "size": f["size"], "mode": f["mode"], "mtime": f["mtime"]} for f in file_list]})
 
-        for item in file_list:
-            full_path = item["full"]
+        file_map = {f["rel"]: f for f in file_list}
+        file_iter = iter(file_list)
+        while True:
             req, _ = recv_frame()
-            if req.get("op") != "PULL_FILE":
-                send_frame({"status": "ERROR", "message": f"expected PULL_FILE, got {req.get('op')}"})
+            op = req.get("op")
+            if op == "DONE":
+                send_frame({"status": "DONE"})
+                break
+            if op != "PULL_FILE":
+                send_frame({"status": "ERROR", "message": f"expected PULL_FILE, got {op}"})
                 return 1
+
+            rel_req = req.get("rel")
+            if rel_req and rel_req in file_map:
+                item = file_map[rel_req]
+            else:
+                try:
+                    item = next(file_iter)
+                except StopIteration:
+                    send_frame({"status": "ERROR", "message": "no more files in manifest"})
+                    return 1
+
+            full_path = item["full"]
+            offset = int(req.get("offset", 0))
+            if offset < 0 or offset > item["size"]:
+                offset = 0
 
             hasher = hashlib.sha256()
             try:
                 with open(full_path, "rb") as f:
+                    if offset > 0:
+                        while f.tell() < offset:
+                            to_read = min(32768, offset - f.tell())
+                            pbuf = f.read(to_read)
+                            if not pbuf:
+                                break
+                            hasher.update(pbuf)
+                        f.seek(offset)
                     while True:
                         buf = f.read(32768)
                         if not buf:
                             break
                         hasher.update(buf)
-                        cdata = zlib.compress(buf, 6)
-                        send_frame({"op": "CHUNK"}, cdata)
+                        if compression == "raw":
+                            send_frame({"op": "CHUNK", "encoding": "raw"}, buf)
+                        elif compression == "zlib":
+                            cdata = zlib.compress(buf, 6)
+                            send_frame({"op": "CHUNK", "encoding": "zlib"}, cdata)
+                        else:  # auto
+                            if len(buf) > 1024:
+                                cdata = zlib.compress(buf, 6)
+                                if len(cdata) < len(buf):
+                                    send_frame({"op": "CHUNK", "encoding": "zlib"}, cdata)
+                                else:
+                                    send_frame({"op": "CHUNK", "encoding": "raw"}, buf)
+                            else:
+                                send_frame({"op": "CHUNK", "encoding": "raw"}, buf)
                 sha = hasher.hexdigest()
                 send_frame({"op": "FILE_END", "sha256": sha})
                 ack, _ = recv_frame()
@@ -308,9 +354,6 @@ def run():
             except Exception as e:
                 send_frame({"status": "ERROR", "message": str(e)})
                 return 1
-
-        done_req, _ = recv_frame()
-        send_frame({"status": "DONE"})
 
     return 0
 
@@ -341,6 +384,23 @@ class PathSpec:
     is_remote: bool
     host: str
     path: str
+
+
+@dataclasses.dataclass
+class TransferSummary:
+    """Summary metrics of a batch file transfer operation."""
+
+    total: int = 0
+    succeeded: int = 0
+    failed: int = 0
+    skipped: int = 0
+
+    def print_summary(self) -> None:
+        """Write concise summary line to stderr."""
+        sys.stderr.write(
+            f"moecp: transfer summary: {self.total} total, "
+            f"{self.succeeded} succeeded, {self.failed} failed, {self.skipped} skipped\n"
+        )
 
 
 def sanitize_relpath(path: str) -> str:
@@ -443,50 +503,58 @@ class FramedStreamClient:
             chunk = raw[idx : idx + MAX_DATA_PAYLOAD]
             self.secure.send(Msg.DATA, chunk)
 
-    def _read_more(self, timeout: float = 30.0) -> None:
+    def _read_more(self, deadline: float | None = None, timeout: float = 30.0) -> None:
         """Drain incoming data from SecureChannel into buffer.
 
         Args:
-            timeout: Seconds to wait for socket readability before error.
+            deadline: Optional absolute monotonic deadline timestamp.
+            timeout: Seconds to wait for socket readability before error if deadline not given.
 
         Raises:
-            TimeoutError: If peer fails to respond within timeout.
+            TimeoutError: If peer fails to respond within timeout or before deadline.
             TransportEOF: If connection is broken.
         """
-        deadline = time.monotonic() + timeout
+        if deadline is None:
+            deadline = time.monotonic() + timeout
         while True:
             records = self.secure.buffered()
             if records:
                 for msg_type, data in records:
                     if msg_type == Msg.DATA:
                         self._buf.extend(data)
-                return
+                if self._buf:
+                    return
 
-            rem = max(0.1, deadline - time.monotonic())
+            rem = deadline - time.monotonic()
             if rem <= 0:
                 raise TimeoutError("timed out waiting for remote response")
 
             ready, _, _ = select.select([self.sock], [], [], rem)
-            if self.sock in ready:
-                records = self.secure.drain()
-                for msg_type, data in records:
-                    if msg_type == Msg.DATA:
-                        self._buf.extend(data)
-                if self._buf:
-                    return
+            if not ready or self.sock not in ready:
+                raise TimeoutError("timed out waiting for remote response")
 
-    def _read_exact(self, n: int, timeout: float = 30.0) -> bytes:
+            records = self.secure.drain()
+            for msg_type, data in records:
+                if msg_type == Msg.DATA:
+                    self._buf.extend(data)
+            if self._buf:
+                return
+
+    def _read_exact(self, n: int, deadline: float | None = None, timeout: float = 30.0) -> bytes:
         """Read exactly n bytes from the accumulated buffer.
 
         Args:
             n: Number of bytes to consume.
-            timeout: Timeout in seconds.
+            deadline: Optional absolute monotonic deadline timestamp.
+            timeout: Timeout in seconds if deadline is not provided.
 
         Returns:
             Extracted bytes.
         """
+        if deadline is None:
+            deadline = time.monotonic() + timeout
         while len(self._buf) < n:
-            self._read_more(timeout=timeout)
+            self._read_more(deadline=deadline)
         out = bytes(self._buf[:n])
         del self._buf[:n]
         return out
@@ -500,13 +568,14 @@ class FramedStreamClient:
         Returns:
             Tuple of (metadata_dict, payload_bytes).
         """
-        prefix = self._read_exact(8, timeout=timeout)
+        deadline = time.monotonic() + timeout
+        prefix = self._read_exact(8, deadline=deadline)
         hlen, dlen = struct.unpack(">II", prefix)
         if hlen > MAX_FRAME_HDR or dlen > MAX_FRAME_PAYLOAD:
             raise ProtocolError(f"received frame exceeding safety bounds: hdr={hlen}, data={dlen}")
-        hdr_bytes = self._read_exact(hlen, timeout=timeout)
+        hdr_bytes = self._read_exact(hlen, deadline=deadline)
         meta = json.loads(hdr_bytes.decode("utf-8"))
-        payload = self._read_exact(dlen, timeout=timeout) if dlen > 0 else b""
+        payload = self._read_exact(dlen, deadline=deadline) if dlen > 0 else b""
         return meta, payload
 
     def wait_for_ready(self, timeout: float = 15.0) -> None:
@@ -589,6 +658,8 @@ def upload_files(
     recursive: bool,
     preserve: bool,
     quiet: bool,
+    compression: str = "auto",
+    summary: TransferSummary | None = None,
 ) -> int:
     """Upload local source files to remote destination path.
 
@@ -599,18 +670,26 @@ def upload_files(
         recursive: Whether directory recursion is enabled.
         preserve: Whether permissions and timestamps should be preserved.
         quiet: Whether to suppress progress bars.
+        compression: Transfer compression strategy ("auto", "zlib", "raw").
+        summary: Optional TransferSummary tracker for batch progress and outcome.
 
     Returns:
         0 on success, non-zero exit code on failure.
     """
+    summary = summary or TransferSummary()
+
     for src in sources:
         if not os.path.exists(src):
             sys.stderr.write(f"moecp: {src}: No such file or directory\n")
+            summary.failed += 1
+            summary.print_summary()
             return 1
 
     is_dir_upload = len(sources) == 1 and os.path.isdir(sources[0])
     if is_dir_upload and not recursive:
         sys.stderr.write(f"moecp: {sources[0]}: Is a directory (not copied, use -r)\n")
+        summary.failed += 1
+        summary.print_summary()
         return 1
 
     file_manifest: list[tuple[str, str]] = []  # (abs_path, rel_path)
@@ -629,6 +708,8 @@ def upload_files(
             if os.path.isdir(src):
                 if not recursive:
                     sys.stderr.write(f"moecp: {src}: Is a directory (not copied, use -r)\n")
+                    summary.failed += 1
+                    summary.print_summary()
                     return 1
                 base = src.rstrip("/")
                 prefix = os.path.basename(base)
@@ -646,7 +727,11 @@ def upload_files(
                     file_manifest.append((src, rel))
                 except ValueError as err:
                     sys.stderr.write(f"moecp: invalid source filename {src!r}: {err}\n")
+                    summary.failed += 1
+                    summary.print_summary()
                     return 1
+
+    summary.total = len(file_manifest)
 
     client.send_frame({
         "op": "INIT",
@@ -658,6 +743,8 @@ def upload_files(
     init_ack, _ = client.recv_frame()
     if init_ack.get("status") != "OK":
         sys.stderr.write(f"moecp: remote init failed: {init_ack.get('message', 'unknown')}\n")
+        summary.failed = summary.total
+        summary.print_summary()
         return 1
 
     for full_path, rel_path in file_manifest:
@@ -679,15 +766,40 @@ def upload_files(
             "sha256": expected_sha,
         })
         ready_ack, _ = client.recv_frame()
+        if ready_ack.get("status") == "COMMITTED":
+            meter = ProgressMeter(rel_path, st.st_size, quiet=quiet)
+            meter.update(st.st_size)
+            meter.finish()
+            summary.skipped += 1
+            continue
         if ready_ack.get("status") != "READY":
             sys.stderr.write(f"moecp: remote refused file {rel_path}: {ready_ack.get('message')}\n")
+            summary.failed += 1
+            summary.print_summary()
             return 1
 
+        resume_offset = int(ready_ack.get("offset", 0))
         meter = ProgressMeter(rel_path, st.st_size, quiet=quiet)
+        if resume_offset > 0:
+            meter.update(resume_offset)
         with open(full_path, "rb") as f:
+            if resume_offset > 0:
+                f.seek(resume_offset)
             while buf := f.read(CHUNK_SIZE):
-                cdata = zlib.compress(buf, 6)
-                client.send_frame({"op": "CHUNK"}, cdata)
+                if compression == "raw":
+                    client.send_frame({"op": "CHUNK", "encoding": "raw"}, buf)
+                elif compression == "zlib":
+                    cdata = zlib.compress(buf, 6)
+                    client.send_frame({"op": "CHUNK", "encoding": "zlib"}, cdata)
+                else:  # auto
+                    if len(buf) > 1024:
+                        cdata = zlib.compress(buf, 6)
+                        if len(cdata) < len(buf):
+                            client.send_frame({"op": "CHUNK", "encoding": "zlib"}, cdata)
+                        else:
+                            client.send_frame({"op": "CHUNK", "encoding": "raw"}, buf)
+                    else:
+                        client.send_frame({"op": "CHUNK", "encoding": "raw"}, buf)
                 meter.update(len(buf))
         meter.finish()
 
@@ -695,10 +807,15 @@ def upload_files(
         file_ack, _ = client.recv_frame()
         if file_ack.get("status") != "OK":
             sys.stderr.write(f"moecp: remote failed verification for {rel_path}: {file_ack.get('message')}\n")
+            summary.failed += 1
+            summary.print_summary()
             return 1
+
+        summary.succeeded += 1
 
     client.send_frame({"op": "DONE"})
     done_ack, _ = client.recv_frame()
+    summary.print_summary()
     return 0 if done_ack.get("status") == "DONE" else 1
 
 
@@ -709,6 +826,8 @@ def download_files(
     recursive: bool,
     preserve: bool,
     quiet: bool,
+    compression: str = "auto",
+    summary: TransferSummary | None = None,
 ) -> int:
     """Download remote source files to local target destination.
 
@@ -719,24 +838,43 @@ def download_files(
         recursive: Whether directory recursion is enabled.
         preserve: Whether permissions and timestamps should be preserved.
         quiet: Whether to suppress progress bars.
+        compression: Transfer compression strategy ("auto", "zlib", "raw").
+        summary: Optional TransferSummary tracker for batch progress and outcome.
 
     Returns:
         0 on success, non-zero exit code on failure.
     """
+    summary = summary or TransferSummary()
+
+    ledger_db = os.environ.get(
+        "MOECP_CLIENT_LEDGER_PATH",
+        os.environ.get(
+            "MOECP_LEDGER_PATH",
+            os.path.expanduser("~/.local/state/moesh/ledger.db"),
+        ),
+    )
+    ledger = TransferLedger(ledger_db)
+    with contextlib.suppress(sqlite3.Error, ValueError):
+        ledger.prune_stale_transfers(days=int(os.environ.get("MOECP_LEDGER_TTL_DAYS", "7")))
+
     client.send_frame({
         "op": "INIT",
         "direction": "PULL",
         "source": source_spec.path,
         "recursive": recursive,
         "preserve": preserve,
+        "compression": compression,
     })
     manifest, _ = client.recv_frame()
     if manifest.get("status") != "OK":
         sys.stderr.write(f"moecp: {manifest.get('message', 'remote error')}\n")
+        summary.failed = 1
+        summary.print_summary()
         return 1
 
     is_dir = manifest.get("is_dir", False)
     files = manifest.get("files", [])
+    summary.total = len(files)
     target_is_dir = os.path.isdir(local_target)
 
     target_abs = os.path.abspath(local_target)
@@ -749,6 +887,8 @@ def download_files(
         except ValueError as err:
             sys.stderr.write(f"moecp: remote path rejected: {err}\n")
             client.send_frame({"status": "ERROR"})
+            summary.failed += 1
+            summary.print_summary()
             return 1
 
         size = item["size"]
@@ -766,29 +906,95 @@ def download_files(
             if os.path.commonpath([target_abs, dest_file]) != target_abs and dest_file != target_abs:
                 sys.stderr.write(f"moecp: remote path escapes local target: {dest_file}\n")
                 client.send_frame({"status": "ERROR"})
+                summary.failed += 1
+                summary.print_summary()
                 return 1
         except ValueError:
             sys.stderr.write(f"moecp: invalid target path: {dest_file}\n")
             client.send_frame({"status": "ERROR"})
+            summary.failed += 1
+            summary.print_summary()
             return 1
 
         dest_dir = os.path.dirname(dest_file) or "."
         os.makedirs(dest_dir, exist_ok=True)
-        tmp_file = dest_file + f".part.{os.getpid()}"
-        client.send_frame({"op": "PULL_FILE", "rel": item["rel"]})
+        pull_id = hashlib.sha256(f"pull:{dest_file}:{size}:{mtime!r}".encode()).hexdigest()[:16]
+        tmp_file = dest_file + f".part.{pull_id}"
+
+        if ledger.is_committed(pull_id) and os.path.exists(dest_file):
+            try:
+                if os.path.getsize(dest_file) == size:
+                    expected_sha = ledger.get_expected_sha256(pull_id)
+                    disk_sha = compute_file_sha256(dest_file)
+                    if not expected_sha or disk_sha == expected_sha:
+                        if not expected_sha:
+                            ledger.record_transfer(pull_id, dest_file, size, disk_sha)
+                            ledger.mark_committed(pull_id, disk_sha)
+                        meter = ProgressMeter(rel, size, quiet=quiet)
+                        meter.finish()
+                        summary.skipped += 1
+                        continue
+            except OSError:
+                pass
+
+        ledger.record_transfer(pull_id, dest_file, size, "")
+
+        resume_offset = 0
+        hasher = hashlib.sha256()
+        if os.path.exists(tmp_file):
+            range_rows = ledger.get_verified_range_hashes(pull_id)
+            if range_rows:
+                try:
+                    with open(tmp_file, "rb") as rf:
+                        for start_off, end_off, expected_chunk_sha in range_rows:
+                            if start_off != resume_offset or end_off < start_off:
+                                break
+                            chunk_len = end_off - start_off
+                            disk_bytes = rf.read(chunk_len)
+                            if (
+                                len(disk_bytes) != chunk_len
+                                or hashlib.sha256(disk_bytes).hexdigest() != expected_chunk_sha
+                            ):
+                                break
+                            hasher.update(disk_bytes)
+                            resume_offset = end_off
+                except OSError:
+                    resume_offset = 0
+                    hasher = hashlib.sha256()
+            ledger.truncate_ranges_after(pull_id, resume_offset)
+        else:
+            ledger.truncate_ranges_after(pull_id, 0)
+
+        offset = resume_offset
+        client.send_frame({"op": "PULL_FILE", "rel": item["rel"], "offset": offset})
 
         meter = ProgressMeter(rel, size, quiet=quiet)
-        hasher = hashlib.sha256()
+        if offset > 0:
+            meter.update(offset)
 
+        open_mode = "r+b" if offset > 0 else "wb"
         try:
-            with open(tmp_file, "wb") as f:
+            with open(tmp_file, open_mode) as f:
+                if offset > 0:
+                    f.seek(offset)
+                    f.truncate(offset)
                 while True:
                     cmsg, cdata = client.recv_frame()
                     cop = cmsg.get("op")
                     if cop == "CHUNK":
-                        raw = zlib.decompress(cdata)
+                        enc = cmsg.get("encoding", "zlib")
+                        if enc == "zlib":
+                            raw = zlib.decompress(cdata)
+                        elif enc == "raw":
+                            raw = cdata
+                        else:
+                            raise ValueError(f"unsupported chunk encoding: {enc}")
                         f.write(raw)
+                        f.flush()
                         hasher.update(raw)
+                        chunk_sha = hashlib.sha256(raw).hexdigest()
+                        ledger.record_range(pull_id, offset, offset + len(raw), chunk_sha)
+                        offset += len(raw)
                         meter.update(len(raw))
                     elif cop == "FILE_END":
                         expected_sha = cmsg.get("sha256", "")
@@ -798,17 +1004,28 @@ def download_files(
                         sys.stderr.write(f"moecp: unexpected chunk op: {cop}\n")
                         if os.path.exists(tmp_file):
                             os.remove(tmp_file)
+                        ledger.clear_ranges(pull_id)
+                        summary.failed += 1
+                        summary.print_summary()
                         return 1
 
+                f.flush()
+                os.fsync(f.fileno())
+
             actual_sha = hasher.hexdigest()
-            if expected_sha and actual_sha != expected_sha:
+            if not expected_sha or actual_sha != expected_sha:
                 if os.path.exists(tmp_file):
                     os.remove(tmp_file)
+                ledger.clear_ranges(pull_id)
                 sys.stderr.write(f"moecp: integrity failure on {rel}: {actual_sha} vs {expected_sha}\n")
                 client.send_frame({"status": "ERROR"})
+                summary.failed += 1
+                summary.print_summary()
                 return 1
 
             os.replace(tmp_file, dest_file)
+            ledger.mark_committed(pull_id, actual_sha)
+            ledger.purge_committed_ranges(pull_id)
 
             if preserve:
                 with contextlib.suppress(Exception):
@@ -816,17 +1033,504 @@ def download_files(
                     os.utime(dest_file, (mtime, mtime))
 
             client.send_frame({"status": "OK"})
+            summary.succeeded += 1
+        except (TransportEOF, TimeoutError, OSError):
+            # Preserve staging file for resumption on reconnect
+            summary.failed += 1
+            summary.print_summary()
+            raise
         except Exception as e:
             if os.path.exists(tmp_file):
                 with contextlib.suppress(Exception):
                     os.remove(tmp_file)
             sys.stderr.write(f"moecp: download failed for {rel}: {e}\n")
             client.send_frame({"status": "ERROR"})
+            summary.failed += 1
+            summary.print_summary()
             return 1
 
     client.send_frame({"op": "DONE"})
     done_ack, _ = client.recv_frame()
+    summary.print_summary()
     return 0 if done_ack.get("status") == "DONE" else 1
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Durable Ledger & Native Agent Transfer Handler
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def compute_file_sha256(path: str, block_size: int = 65536) -> str:
+    """Compute SHA-256 digest of a local file in fixed blocks.
+
+    Args:
+        path: Path to the local file.
+        block_size: Size of each read block in bytes.
+
+    Returns:
+        Hex-encoded SHA-256 digest string.
+
+    Raises:
+        OSError: If reading the file fails.
+    """
+    hasher = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(block_size)
+            if not chunk:
+                break
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+class TransferLedger:
+    """SQLite-backed transactional ledger for crash-consistent resumable transfers."""
+
+    def __init__(self, db_path: str) -> None:
+        self.db_path = db_path
+        self._init_db()
+
+    def _init_db(self) -> None:
+        parent = os.path.dirname(os.path.abspath(self.db_path))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with sqlite3.connect(self.db_path, timeout=10.0) as conn:
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA auto_vacuum = INCREMENTAL;")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS transfers (
+                    transfer_id TEXT PRIMARY KEY,
+                    rel_path TEXT,
+                    total_size INTEGER,
+                    expected_sha256 TEXT,
+                    committed INTEGER DEFAULT 0,
+                    updated_at REAL DEFAULT 0
+                );
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS verified_ranges (
+                    transfer_id TEXT,
+                    start_offset INTEGER,
+                    end_offset INTEGER,
+                    sha256 TEXT,
+                    PRIMARY KEY (transfer_id, start_offset)
+                );
+            """)
+            with contextlib.suppress(sqlite3.OperationalError):
+                conn.execute("ALTER TABLE transfers ADD COLUMN updated_at REAL DEFAULT 0;")
+
+    def record_transfer(
+        self,
+        transfer_id: str,
+        rel_path: str,
+        total_size: int,
+        expected_sha256: str,
+        updated_at: float | None = None,
+    ) -> None:
+        ts = time.time() if updated_at is None else updated_at
+        with sqlite3.connect(self.db_path, timeout=10.0) as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO transfers (transfer_id, rel_path, total_size, expected_sha256, committed, updated_at) VALUES (?, ?, ?, ?, 0, ?)",
+                (transfer_id, rel_path, total_size, expected_sha256, ts),
+            )
+
+    def record_range(
+        self,
+        transfer_id: str,
+        start: int,
+        end: int,
+        sha256: str,
+    ) -> None:
+        with sqlite3.connect(self.db_path, timeout=10.0) as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO verified_ranges (transfer_id, start_offset, end_offset, sha256) VALUES (?, ?, ?, ?)",
+                (transfer_id, start, end, sha256),
+            )
+            conn.execute(
+                "UPDATE transfers SET updated_at=? WHERE transfer_id=?",
+                (time.time(), transfer_id),
+            )
+
+    def mark_committed(self, transfer_id: str, sha256: str | None = None) -> None:
+        with sqlite3.connect(self.db_path, timeout=10.0) as conn:
+            if sha256:
+                conn.execute(
+                    "UPDATE transfers SET committed=1, expected_sha256=?, updated_at=? WHERE transfer_id=?",
+                    (sha256, time.time(), transfer_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE transfers SET committed=1, updated_at=? WHERE transfer_id=?",
+                    (time.time(), transfer_id),
+                )
+
+    def get_expected_sha256(self, transfer_id: str) -> str:
+        with sqlite3.connect(self.db_path, timeout=10.0) as conn:
+            cur = conn.execute(
+                "SELECT expected_sha256 FROM transfers WHERE transfer_id=?",
+                (transfer_id,),
+            )
+            row = cur.fetchone()
+            return str(row[0]) if row and row[0] else ""
+
+    def get_verified_ranges(self, transfer_id: str) -> list[tuple[int, int]]:
+        with sqlite3.connect(self.db_path, timeout=10.0) as conn:
+            cur = conn.execute(
+                "SELECT start_offset, end_offset FROM verified_ranges WHERE transfer_id=? ORDER BY start_offset",
+                (transfer_id,),
+            )
+            return cur.fetchall()
+
+    def get_verified_range_hashes(self, transfer_id: str) -> list[tuple[int, int, str]]:
+        with sqlite3.connect(self.db_path, timeout=10.0) as conn:
+            cur = conn.execute(
+                "SELECT start_offset, end_offset, sha256 FROM verified_ranges WHERE transfer_id=? ORDER BY start_offset",
+                (transfer_id,),
+            )
+            return cur.fetchall()
+
+    def clear_ranges(self, transfer_id: str) -> None:
+        with sqlite3.connect(self.db_path, timeout=10.0) as conn:
+            conn.execute(
+                "DELETE FROM verified_ranges WHERE transfer_id=?",
+                (transfer_id,),
+            )
+
+    def truncate_ranges_after(self, transfer_id: str, offset: int) -> None:
+        """Purge chunk ranges starting at or after offset upon verification fault."""
+        with sqlite3.connect(self.db_path, timeout=10.0) as conn:
+            conn.execute(
+                "DELETE FROM verified_ranges WHERE transfer_id=? AND start_offset >= ?",
+                (transfer_id, offset),
+            )
+
+    def purge_committed_ranges(self, transfer_id: str) -> None:
+        """Purge chunk ranges for a committed transfer to prevent unbounded ledger growth."""
+        with sqlite3.connect(self.db_path, timeout=10.0) as conn:
+            conn.execute(
+                "DELETE FROM verified_ranges WHERE transfer_id=?",
+                (transfer_id,),
+            )
+            with contextlib.suppress(sqlite3.Error):
+                conn.execute("PRAGMA incremental_vacuum;")
+
+    def prune_stale_transfers(self, days: int = 7) -> int:
+        """Purge uncommitted transfers and orphaned chunk ranges older than TTL days."""
+        cutoff = time.time() - (days * 86400.0)
+        with sqlite3.connect(self.db_path, timeout=10.0) as conn:
+            cur = conn.execute(
+                "SELECT transfer_id, rel_path FROM transfers WHERE committed=0 AND updated_at < ?",
+                (cutoff,),
+            )
+            stale_rows = cur.fetchall()
+            if not stale_rows:
+                return 0
+            for tid, rel_path in stale_rows:
+                if rel_path:
+                    part_file = f"{rel_path}.part.{tid}"
+                    with contextlib.suppress(OSError):
+                        if os.path.exists(part_file):
+                            os.unlink(part_file)
+                conn.execute("DELETE FROM verified_ranges WHERE transfer_id=?", (tid,))
+                conn.execute("DELETE FROM transfers WHERE transfer_id=?", (tid,))
+            with contextlib.suppress(sqlite3.Error):
+                conn.execute("PRAGMA incremental_vacuum;")
+            return len(stale_rows)
+
+    def is_committed(self, transfer_id: str) -> bool:
+        with sqlite3.connect(self.db_path, timeout=10.0) as conn:
+            cur = conn.execute(
+                "SELECT committed FROM transfers WHERE transfer_id=?",
+                (transfer_id,),
+            )
+            row = cur.fetchone()
+            return bool(row and row[0] == 1)
+
+
+def run_native_agent_transfer(
+    sock: socket.socket,
+    secure: SecureChannel,
+    accepted: dict[str, Any],
+) -> None:
+    """Serve a native file transfer session over SecureChannel directly inside agent."""
+    client = FramedStreamClient(secure, sock)
+    meta, _ = client.recv_frame()
+    direction = meta.get("direction")
+    preserve = meta.get("preserve", False)
+
+    ledger_db = os.environ.get(
+        "MOECP_LEDGER_PATH",
+        os.path.expanduser("~/.local/state/moesh/ledger.db"),
+    )
+    ledger = TransferLedger(ledger_db)
+    with contextlib.suppress(sqlite3.Error, ValueError):
+        ledger.prune_stale_transfers(days=int(os.environ.get("MOECP_LEDGER_TTL_DAYS", "7")))
+
+    if direction == "PUSH":
+        target = os.path.expanduser(meta.get("target", "."))
+        is_dir_upload = meta.get("is_dir", False)
+        dest_is_dir = os.path.isdir(target)
+        if is_dir_upload:
+            os.makedirs(target, exist_ok=True)
+        client.send_frame({"status": "OK", "target_is_dir": dest_is_dir})
+
+        while True:
+            msg, _payload = client.recv_frame()
+            op = msg.get("op")
+            if op == "DONE":
+                client.send_frame({"status": "DONE"})
+                break
+            if op != "FILE_START":
+                client.send_frame({"status": "ERROR", "message": f"unexpected op: {op}"})
+                return
+
+            raw_rel = msg.get("rel_path", "")
+            try:
+                rel = sanitize_relpath(raw_rel)
+            except ValueError as e:
+                client.send_frame({"status": "ERROR", "message": str(e)})
+                return
+
+            target_abs = os.path.abspath(target)
+            if is_dir_upload:
+                dest_file = os.path.abspath(os.path.join(target, rel))
+            elif dest_is_dir:
+                dest_file = os.path.abspath(os.path.join(target, os.path.basename(rel)))
+            else:
+                dest_file = target_abs
+
+            try:
+                if os.path.commonpath([target_abs, dest_file]) != target_abs and dest_file != target_abs:
+                    client.send_frame({"status": "ERROR", "message": f"path escapes target directory: {dest_file}"})
+                    return
+            except ValueError:
+                client.send_frame({"status": "ERROR", "message": f"invalid target path: {dest_file}"})
+                return
+
+            size = msg.get("size", 0)
+            mode = msg.get("mode", 0o644)
+            mtime = msg.get("mtime", time.time())
+            expected_sha = msg.get("sha256", "")
+            transfer_id = hashlib.sha256(f"{dest_file}:{size}:{expected_sha}".encode()).hexdigest()[:16]
+
+            if ledger.is_committed(transfer_id) and os.path.exists(dest_file):
+                try:
+                    if (
+                        os.path.getsize(dest_file) == size
+                        and compute_file_sha256(dest_file) == expected_sha
+                    ):
+                        client.send_frame({"status": "COMMITTED", "sha256": expected_sha})
+                        continue
+                except OSError:
+                    pass
+
+            ledger.record_transfer(transfer_id, dest_file, size, expected_sha)
+
+            dest_dir = os.path.dirname(dest_file) or "."
+            os.makedirs(dest_dir, exist_ok=True)
+            tmp_file = dest_file + f".part.{transfer_id}"
+            hasher = hashlib.sha256()
+
+            resume_offset = 0
+            if os.path.exists(tmp_file):
+                range_rows = ledger.get_verified_range_hashes(transfer_id)
+                if range_rows:
+                    try:
+                        with open(tmp_file, "rb") as rf:
+                            for start_off, end_off, expected_chunk_sha in range_rows:
+                                if start_off != resume_offset or end_off < start_off:
+                                    break
+                                chunk_len = end_off - start_off
+                                disk_bytes = rf.read(chunk_len)
+                                if (
+                                    len(disk_bytes) != chunk_len
+                                    or hashlib.sha256(disk_bytes).hexdigest() != expected_chunk_sha
+                                ):
+                                    break
+                                hasher.update(disk_bytes)
+                                resume_offset = end_off
+                    except OSError:
+                        resume_offset = 0
+                        hasher = hashlib.sha256()
+                ledger.truncate_ranges_after(transfer_id, resume_offset)
+            else:
+                ledger.truncate_ranges_after(transfer_id, 0)
+
+            open_mode = "r+b" if resume_offset > 0 else "wb"
+            try:
+                with open(tmp_file, open_mode) as f:
+                    if resume_offset > 0:
+                        f.seek(resume_offset)
+                        f.truncate(resume_offset)
+                    client.send_frame(
+                        {"status": "READY", "transfer_id": transfer_id, "offset": resume_offset}
+                    )
+                    offset = resume_offset
+                    while True:
+                        cmsg, cdata = client.recv_frame()
+                        cop = cmsg.get("op")
+                        if cop == "CHUNK":
+                            encoding = cmsg.get("encoding", "zlib")
+                            if encoding == "zlib":
+                                raw = zlib.decompress(cdata)
+                            elif encoding == "raw":
+                                raw = cdata
+                            else:
+                                raise ValueError(f"unsupported chunk encoding: {encoding}")
+                            f.write(raw)
+                            f.flush()
+                            hasher.update(raw)
+                            chunk_sha = hashlib.sha256(raw).hexdigest()
+                            ledger.record_range(transfer_id, offset, offset + len(raw), chunk_sha)
+                            offset += len(raw)
+                        elif cop == "FILE_END":
+                            break
+                        else:
+                            client.send_frame({"status": "ERROR", "message": f"unexpected chunk op: {cop}"})
+                            if os.path.exists(tmp_file):
+                                os.remove(tmp_file)
+                            ledger.clear_ranges(transfer_id)
+                            return
+
+                    f.flush()
+                    os.fsync(f.fileno())
+
+                actual_sha = hasher.hexdigest()
+                if not expected_sha or actual_sha != expected_sha:
+                    if os.path.exists(tmp_file):
+                        os.remove(tmp_file)
+                    ledger.clear_ranges(transfer_id)
+                    client.send_frame({"status": "ERROR", "message": f"checksum mismatch: {actual_sha} vs {expected_sha}"})
+                    return
+
+                os.replace(tmp_file, dest_file)
+                ledger.mark_committed(transfer_id, actual_sha)
+                ledger.purge_committed_ranges(transfer_id)
+
+                if preserve:
+                    with contextlib.suppress(Exception):
+                        os.chmod(dest_file, stat.S_IMODE(mode))
+                        os.utime(dest_file, (mtime, mtime))
+
+                client.send_frame({"status": "OK", "sha256": actual_sha})
+            except (TransportEOF, TimeoutError, ConnectionError):
+                # Preserve staging file and verified ranges on network drop for resumption
+                return
+            except Exception as e:
+                if os.path.exists(tmp_file):
+                    with contextlib.suppress(Exception):
+                        os.remove(tmp_file)
+                with contextlib.suppress(Exception):
+                    ledger.clear_ranges(transfer_id)
+                client.send_frame({"status": "ERROR", "message": str(e)})
+                return
+
+    elif direction == "PULL":
+        source = os.path.expanduser(meta.get("source", "."))
+        recursive = meta.get("recursive", False)
+        compression = meta.get("compression", "auto")
+
+        if not os.path.exists(source):
+            client.send_frame({"status": "ERROR", "message": f"{source}: No such file or directory"})
+            return
+
+        is_dir = os.path.isdir(source)
+        if is_dir and not recursive:
+            client.send_frame({"status": "ERROR", "message": f"{source}: Is a directory (not copied, use -r)"})
+            return
+
+        file_list = []
+        if is_dir:
+            base_dir = source.rstrip("/")
+            for root, _, files in os.walk(base_dir):
+                for fname in files:
+                    full = os.path.join(root, fname)
+                    with contextlib.suppress(Exception):
+                        rel = sanitize_relpath(os.path.relpath(full, base_dir))
+                        st = os.stat(full)
+                        file_list.append({"rel": rel, "full": full, "size": st.st_size, "mode": st.st_mode, "mtime": st.st_mtime})
+        else:
+            try:
+                st = os.stat(source)
+                rel = sanitize_relpath(os.path.basename(source))
+                file_list.append({"rel": rel, "full": source, "size": st.st_size, "mode": st.st_mode, "mtime": st.st_mtime})
+            except Exception as e:
+                client.send_frame({"status": "ERROR", "message": str(e)})
+                return
+
+        client.send_frame({
+            "status": "OK",
+            "is_dir": is_dir,
+            "files": [{"rel": f["rel"], "size": f["size"], "mode": f["mode"], "mtime": f["mtime"]} for f in file_list],
+        })
+
+        file_map = {f["rel"]: f for f in file_list}
+        file_iter = iter(file_list)
+        while True:
+            req, _ = client.recv_frame()
+            op = req.get("op")
+            if op == "DONE":
+                client.send_frame({"status": "DONE"})
+                break
+            if op != "PULL_FILE":
+                client.send_frame({"status": "ERROR", "message": f"expected PULL_FILE, got {op}"})
+                return
+
+            rel_req = req.get("rel")
+            if rel_req and rel_req in file_map:
+                item = file_map[rel_req]
+            else:
+                try:
+                    item = next(file_iter)
+                except StopIteration:
+                    client.send_frame({"status": "ERROR", "message": "no more files in manifest"})
+                    return
+
+            full_path = item["full"]
+            offset = int(req.get("offset", 0))
+            if offset < 0 or offset > item["size"]:
+                offset = 0
+
+            hasher = hashlib.sha256()
+            try:
+                with open(full_path, "rb") as f:
+                    if offset > 0:
+                        while f.tell() < offset:
+                            to_read = min(CHUNK_SIZE, offset - f.tell())
+                            pbuf = f.read(to_read)
+                            if not pbuf:
+                                break
+                            hasher.update(pbuf)
+                        f.seek(offset)
+                    while True:
+                        buf = f.read(CHUNK_SIZE)
+                        if not buf:
+                            break
+                        hasher.update(buf)
+                        if compression == "raw":
+                            client.send_frame({"op": "CHUNK", "encoding": "raw"}, buf)
+                        elif compression == "zlib":
+                            cdata = zlib.compress(buf, 6)
+                            client.send_frame({"op": "CHUNK", "encoding": "zlib"}, cdata)
+                        else:  # auto
+                            if len(buf) > 1024:
+                                cdata = zlib.compress(buf, 6)
+                                if len(cdata) < len(buf):
+                                    client.send_frame({"op": "CHUNK", "encoding": "zlib"}, cdata)
+                                else:
+                                    client.send_frame({"op": "CHUNK", "encoding": "raw"}, buf)
+                            else:
+                                client.send_frame({"op": "CHUNK", "encoding": "raw"}, buf)
+                sha = hasher.hexdigest()
+                client.send_frame({"op": "FILE_END", "sha256": sha})
+                ack, _ = client.recv_frame()
+                if ack.get("status") != "OK":
+                    return
+            except Exception as e:
+                client.send_frame({"status": "ERROR", "message": str(e)})
+                return
+    else:
+        client.send_frame({"status": "ERROR", "message": f"unknown direction {direction!r}"})
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -857,37 +1561,48 @@ def connect_and_run(
         return 1
     port = int(port_text)
 
-    try:
-        sock = socket.create_connection((addr_host, port), timeout=15)
-    except OSError as exc:
-        sys.stderr.write(f"moecp: cannot connect to receiver bridge at {args.addr}: {exc}\n")
-        return 1
+    retries = max(1, getattr(args, "retry", 1))
+    for attempt in range(retries):
+        try:
+            sock = socket.create_connection((addr_host, port), timeout=15)
+        except OSError as exc:
+            if attempt + 1 < retries:
+                time.sleep(0.5 * (attempt + 1))
+                continue
+            sys.stderr.write(f"moecp: cannot connect to receiver bridge at {args.addr}: {exc}\n")
+            return 1
 
-    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-    sock.sendall(PRELUDE_PREFIX + host.encode("latin-1") + b"\n")
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        sock.sendall(PRELUDE_PREFIX + host.encode("latin-1") + b"\n")
 
-    try:
-        channel = Channel(sock)
-        session = NoiseSession("initiator", private, cast("bytes", peer))
-        sock.settimeout(30.0)
-        handshake(session, channel)
+        try:
+            channel = Channel(sock)
+            session = NoiseSession("initiator", private, cast("bytes", peer))
+            sock.settimeout(30.0)
+            handshake(session, channel)
 
-        machine = SessionState()
-        machine.to(State.AUTHENTICATED)
-        secure = SecureChannel(channel, session)
-        negotiate(secure, machine, term="dumb", fresh=True)
+            machine = SessionState()
+            machine.to(State.AUTHENTICATED)
+            secure = SecureChannel(channel, session)
+            agreed = negotiate(secure, machine, term="dumb", fresh=True, session_type="transfer")
 
-        # Launch the remote worker directly replacing the subshell
-        bootstrap_cmd = generate_bootstrap_cmd()
-        secure.send(Msg.DATA, bootstrap_cmd)
+            client = FramedStreamClient(secure, sock)
+            if agreed.get("session_type") != "transfer":
+                bootstrap_cmd = generate_bootstrap_cmd()
+                secure.send(Msg.DATA, bootstrap_cmd)
+                client.wait_for_ready(timeout=15.0)
 
-        client = FramedStreamClient(secure, sock)
-        client.wait_for_ready(timeout=15.0)
-
-        return action_fn(client)
-    finally:
-        with contextlib.suppress(OSError):
-            sock.close()
+            return action_fn(client)
+        except (TimeoutError, TransportEOF, OSError) as exc:
+            if attempt + 1 < retries:
+                time.sleep(0.5 * (attempt + 1))
+                continue
+            sys.stderr.write(f"moecp: connection interrupted: {exc}\n")
+            return 1
+        finally:
+            with contextlib.suppress(OSError):
+                sock.close()
+    return 1
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -922,6 +1637,18 @@ def main(argv: list[str] | None = None) -> int:
         "-v", "--verbose",
         action="store_true",
         help="verbose debug logging",
+    )
+    parser.add_argument(
+        "--retry",
+        type=int,
+        default=3,
+        help="maximum retry attempts on connection interruption",
+    )
+    parser.add_argument(
+        "--compression",
+        choices=["auto", "zlib", "raw"],
+        default="auto",
+        help="transfer compression strategy",
     )
     parser.add_argument(
         "-n", "--host",
@@ -994,6 +1721,7 @@ def main(argv: list[str] | None = None) -> int:
                 recursive=args.recursive,
                 preserve=args.preserve,
                 quiet=args.quiet,
+                compression=args.compression,
             ),
         )
 
@@ -1013,6 +1741,7 @@ def main(argv: list[str] | None = None) -> int:
             recursive=args.recursive,
             preserve=args.preserve,
             quiet=args.quiet,
+            compression=args.compression,
         ),
     )
 
