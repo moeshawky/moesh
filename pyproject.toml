@@ -21,7 +21,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "moesh"
-version = "0.2.0a2"
+version = "0.2.0a3"
 description = "An SSH-like encrypted remote shell: Noise_XX over an HTTP/1.1 Upgrade, with a persistent shell"
 readme = "README.md"
 license = "Apache-2.0"
@@ -104,6 +104,7 @@ moesh-bridge = "moesh_bridge:main"
 "moesh_tunnel.py" = "moesh_tunnel.py"
 "moesh_relay.py" = "moesh_relay.py"
 "moesh_bridge.py" = "moesh_bridge.py"
+"moesh-bridge.py" = "moesh-bridge.py"
 "moecp.py" = "moecp.py"
 
 [tool.hatch.build.targets.sdist]

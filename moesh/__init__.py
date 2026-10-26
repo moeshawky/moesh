@@ -9,7 +9,7 @@ import moesh_shell as shell
 import moesh_tunnel as tunnel
 import moesh_wire as wire
 
-__version__ = "0.2.0a2"
+__version__ = "0.2.0a3"
 
 __all__ = [
     "__version__",

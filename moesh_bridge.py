@@ -5,7 +5,18 @@ import importlib.util
 import sys
 from pathlib import Path
 
-_script_path = Path(__file__).resolve().parent / "moesh-bridge.py"
+_candidates = [
+    Path(__file__).resolve().parent / "moesh-bridge.py",
+    Path.cwd() / "moesh-bridge.py",
+    Path("/usr/local/bin/moesh-bridge.py"),
+]
+_script_path: Path | None = next((p for p in _candidates if p.is_file()), None)
+if _script_path is None:
+    raise ImportError(
+        f"Cannot locate 'moesh-bridge.py' in any expected location: "
+        f"{[str(p) for p in _candidates]}"
+    )
+
 _spec = importlib.util.spec_from_file_location("moesh_bridge_impl", _script_path)
 if _spec is None or _spec.loader is None:
     raise ImportError(f"Cannot load bridge module from {_script_path}")
