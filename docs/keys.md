@@ -20,10 +20,15 @@ Both programs generate keypairs using the same flags:
 
 ```sh
 # On the agent host
-python3 moesh_tunnel.py --generate-key
+moesh-tunnel --generate-key
 
 # On the operator's terminal
-python3 moesh_shell.py --generate-key
+moesh --generate-key
+```
+
+Or generate a single master key for your entire fleet:
+```sh
+moesh --new-master
 ```
 
 Without `--keyfile`, the agent writes `~/.config/moesh/agent.key` and the
@@ -71,8 +76,8 @@ refusing to overwrite existing key: /home/you/.config/moesh/operator.key (use --
 Use `--force` to deliberately replace it:
 
 ```sh
-python3 moesh_shell.py --generate-key --force
-python3 moesh_tunnel.py --generate-key --force
+moesh --generate-key --force
+moesh-tunnel --generate-key --force
 ```
 
 ---

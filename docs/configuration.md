@@ -98,26 +98,28 @@ Legacy aliases `MOESH_TUNNEL_V2_*` and `NB_TUNNEL_V2_*` are supported for backwa
 
 | variable | default | source |
 |---|---|---|
-| `MOESH_SHELL_ADDR` | `127.0.0.1:44441` | `moecp.py:59`, used at `:933` |
-| `MOESH_SHELL_KEYFILE` | `~/.config/moesh/operator.key` | `moecp.py:60`, used at `:938` |
-| `MOESH_SHELL_HOSTS_FILE` | `~/.config/moesh/hosts.toml` | `moecp.py:61` |
+| `MOESH_SHELL_ADDR` | `127.0.0.1:44441` | `moecp.py:65` |
+| `MOESH_SHELL_KEYFILE` | `~/.config/moesh/operator.key` | `moecp.py:66` |
+| `MOESH_SHELL_HOSTS_FILE` | `~/.config/moesh/hosts.toml` | `moecp.py:67` |
 
 ### Flags
 
 ```
-moecp [-h] [-r] [-p] [-q] [-v] [-n HOST] [--addr ADDR] [--keyfile KEYFILE] paths [paths ...]
+moecp [-h] [-r] [-p] [-q] [-v] [--retry RETRY] [--compression {auto,zlib,raw}] [-n HOST] [--addr ADDR] [--keyfile KEYFILE] paths [paths ...]
 ```
 
 | flag | effect | source |
 |---|---|---|
-| `paths` | Source path(s) followed by destination target | `moecp.py:915` |
-| `-r`, `--recursive` | Recursively copy entire directories | `moecp.py:917` |
-| `-p`, `--preserve` | Preserves modification times, access times, and modes | `moecp.py:920` |
-| `-q`, `--quiet` | Quiet mode: disables progress meter and non-fatal warnings | `moecp.py:923` |
-| `-v`, `--verbose` | Verbose debug logging to stderr | `moecp.py:926` |
-| `-n`, `--host HOST` | Designated remote host number or name (e.g. `3` or `host-3`) | `moecp.py:929` |
-| `--addr ADDR` | Receiver operator bridge address | `moecp.py:932-934` |
-| `--keyfile KEYFILE` | Operator private key file path | `moecp.py:937-939` |
+| `paths` | Source path(s) followed by destination target | `moecp.py:1653` |
+| `-r`, `--recursive` | Recursively copy entire directories | `moecp.py:1675` |
+| `-p`, `--preserve` | Preserves modification times, access times, and modes | `moecp.py:1680` |
+| `-q`, `--quiet` | Quiet mode: disables progress meter and non-fatal warnings | `moecp.py:1684` |
+| `-v`, `--verbose` | Verbose debug logging to stderr | `moecp.py:1689` |
+| `--retry RETRY` | Maximum retry attempts on connection interruption (default: 3) | `moecp.py:1694` |
+| `--compression` | Transfer compression strategy (`auto`=fast zlib-1 with pre-compressed bypass, `zlib`=force zlib-1, `raw`=uncompressed) | `moecp.py:1700` |
+| `-n`, `--host HOST` | Designated remote host number or name (e.g. `3` or `host-3`) | `moecp.py:1706` |
+| `--addr ADDR` | Receiver operator bridge address | `moecp.py:1711` |
+| `--keyfile KEYFILE` | Operator private key file path | `moecp.py:1716` |
 
 ---
 

@@ -36,18 +36,16 @@ tail -f /var/log/moesh-agent.log
 Foreground run for interactive testing:
 
 ```sh
-python3 /opt/moesh/moesh_tunnel.py
+moesh-tunnel
 ```
 
 Stopping the agent terminates active shells (`SIGHUP`) and reaps child processes cleanly. A shell does not outlive its parent agent process.
 
-### The operator's shell client (`moesh_shell.py` / `moesh`)
+### The operator's shell client (`moesh`)
 
 ```sh
 # Connect to host-3
 moesh -n 3
-# Or via python:
-python3 /opt/moesh/moesh_shell.py -n 3
 ```
 
 | action | how to do it |
@@ -69,12 +67,12 @@ moecp -r host-3:/var/log/train ./logs/
 moecp -r -p -q ./dataset host-3:/data/
 ```
 
-### Accelerator service relay (`moesh_relay.py`)
+### Accelerator service relay (`moesh-relay`)
 
 On remote GPU/TPU machines exposing background compute services:
 
 ```sh
-python3 moesh_relay.py \
+moesh-relay \
     --service vllm \
     --target 127.0.0.1:8001 \
     --receiver receiver.example.com

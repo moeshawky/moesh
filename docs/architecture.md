@@ -8,15 +8,15 @@ is in [../PROTOCOL.md](../PROTOCOL.md).
 
 ## The components
 
-| file | role |
+| CLI command / file | role |
 |---|---|
 | `moesh_wire.py` | wire protocol constants and defaults: framing limits, payload bounds, upgrade tokens, route paths, version identifiers. Pure Python standard library with zero external dependencies. |
 | `moesh_proto.py` | the wire protocol engine: framing serialization, the Noise_XX session state machine, deterministic HKDF key derivation, terminal size negotiation. |
-| `moesh_tunnel.py` | **the agent**: runs on the target host that offers the shell, holds the pool of tunnels and the pool of persistent PTY shells. |
-| `moesh_shell.py` | **the operator client**: attaches to the receiver's operator port, performs mutual Noise_XX authentication, handles raw terminal discipline and window resizes. |
-| `moecp.py` | **secure file copy**: scp-like utility over encrypted moesh transport, bootstrapping an ephemeral in-memory worker in a dedicated fresh PTY session with end-to-end SHA-256 verification and atomic staging. |
-| `moesh_relay.py` | **accelerator reverse relay**: zero-dependency HTTP/1.1 Upgrade reverse pump connecting accelerator services (vLLM, GPU runners, embeddings) on remote nodes to receiver listening ports. |
-| `moesh-bridge.py` | **the receiver**: pairs an operator with an agent's tunnel and copies bytes. It is a blind socket pump holding 0 keys and decrypting 0 bytes. |
+| `moesh-tunnel` (`moesh_tunnel.py`) | **the agent daemon**: runs on the target host that offers the shell, holds the pool of tunnels and the pool of persistent PTY shells. |
+| `moesh` (`moesh_shell.py`) | **the operator client**: attaches to the receiver's operator port, performs mutual Noise_XX authentication, handles raw terminal discipline and window resizes. |
+| `moecp` (`moecp.py`) | **secure file copy**: scp-like utility over encrypted moesh transport, bootstrapping an ephemeral in-memory worker in a dedicated fresh PTY session with end-to-end SHA-256 verification and atomic staging. |
+| `moesh-relay` (`moesh_relay.py`) | **accelerator reverse relay**: zero-dependency HTTP/1.1 Upgrade reverse pump connecting accelerator services (vLLM, GPU runners, embeddings) on remote nodes to receiver listening ports. |
+| `moesh-bridge` (`moesh-bridge.py`) | **the receiver broker**: pairs an operator with an agent's tunnel and copies bytes. It is a blind socket pump holding 0 keys and decrypting 0 bytes. |
 | `moesh-bridge.service` | the systemd unit for the receiver bridge. |
 | `PROTOCOL.md` | the wire contract and framing specification. |
 | `tests/` | the integration and verification suite: 149 tests covering protocol core, key generation, host identity, operator outcomes, moecp file transfers, and adversarial security boundaries. |
