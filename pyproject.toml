@@ -15,14 +15,61 @@
 # deployments and the systemd unit use.  A package layout would rename them
 # and break every receiver and agent host installed from this tree, so the
 # scripts stay where they are and the project manages only its environment.
+[build-system]
+requires = ["hatchling>=1.21"]
+build-backend = "hatchling.build"
+
 [project]
 name = "moesh"
 version = "0.2.0a1"
-description = "An SSH-like encrypted remote shell: Noise over an HTTP upgrade, with a persistent shell"
+description = "An SSH-like encrypted remote shell: Noise_XX over an HTTP/1.1 Upgrade, with a persistent shell"
 readme = "README.md"
+license = "Apache-2.0"
 requires-python = ">=3.11"
+authors = [
+    { name = "Moe Shawky", email = "57296463+moeshawky@users.noreply.github.com" },
+]
+keywords = [
+    "ssh",
+    "noise-protocol",
+    "remote-shell",
+    "encrypted-tunnel",
+    "pty",
+    "relay",
+    "moesh",
+    "moecp",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Internet",
+    "Topic :: Security :: Cryptography",
+    "Topic :: System :: Networking",
+    "Topic :: System :: Shells",
+]
 dependencies = [
     "noiseprotocol==0.3.1",
+    "cryptography>=42.0.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-cov>=6",
+    "ruff>=0.6",
+    "mypy>=1.11",
+    "pre-commit>=4.0",
+    "build>=1.0",
+    "twine>=5.0",
 ]
 
 [project.optional-dependencies]
@@ -32,10 +79,48 @@ dev = [
     "ruff>=0.6",
     "mypy>=1.11",
     "pre-commit>=4.0",
+    "build>=1.0",
+    "twine>=5.0",
 ]
 
-[tool.uv]
-package = false
+[project.urls]
+Homepage = "https://github.com/moeshawky/moesh"
+Repository = "https://github.com/moeshawky/moesh"
+Documentation = "https://github.com/moeshawky/moesh#readme"
+Issues = "https://github.com/moeshawky/moesh/issues"
+Changelog = "https://github.com/moeshawky/moesh/blob/master/HANDOFF.md"
+
+[project.scripts]
+moesh = "moesh_shell:main"
+moecp = "moecp:main"
+moesh-tunnel = "moesh_tunnel:main"
+moesh-relay = "moesh_relay:main"
+moesh-bridge = "moesh_bridge:main"
+
+[tool.hatch.build.targets.wheel.force-include]
+"moesh_proto.py" = "moesh_proto.py"
+"moesh_wire.py" = "moesh_wire.py"
+"moesh_shell.py" = "moesh_shell.py"
+"moesh_tunnel.py" = "moesh_tunnel.py"
+"moesh_relay.py" = "moesh_relay.py"
+"moesh_bridge.py" = "moesh_bridge.py"
+"moecp.py" = "moecp.py"
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "moesh_*.py",
+    "moecp.py",
+    "moesh-bridge.py",
+    "moesh-bridge.service",
+    "moesh/**",
+    "README.md",
+    "LICENSE",
+    "NOTICE",
+    "PROTOCOL.md",
+    "HANDOFF.md",
+    "pyproject.toml",
+    "docs/**",
+]
 
 # ── Ruff (linter + formatter) ──────────────────────────────────────────
 # The rule sets are chosen for what each one catches, not for coverage:
@@ -103,7 +188,7 @@ warn_return_any = true
 warn_unused_ignores = true
 warn_redundant_casts = true
 show_error_codes = true
-files = ["moesh_proto.py", "moesh_tunnel.py", "moesh_shell.py", "moesh-bridge.py", "moecp.py", "tests"]
+files = ["moesh_proto.py", "moesh_tunnel.py", "moesh_shell.py", "moesh-bridge.py", "moesh_bridge.py", "moesh_relay.py", "moecp.py", "moesh", "tests"]
 
 # The Noise library ships no type information.  Its results are cast to the
 # types this project promises, at the four places they are used; the library

@@ -36,7 +36,7 @@ import os
 import select
 import shutil
 import socket
-import sqlite3
+import sqlite3 as sqlite3
 import stat
 import struct
 import sys

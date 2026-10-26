@@ -15,7 +15,7 @@ import stat
 import subprocess
 import time
 import zlib
-from typing import TYPE_CHECKING, TypedDict
+from typing import TYPE_CHECKING, Any, TypedDict
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -188,7 +188,7 @@ def test_precompressed_extensions_parity() -> None:
         assert not moecp.is_precompressed(f"source{ext}")
 
     # Worker code parity
-    ns: dict = {}
+    ns: dict[str, Any] = {}
     exec(compile(moecp._WORKER_CODE, "<test>", "exec"), ns)  # noqa: S102
     worker_exts = set(ns["PRECOMPRESSED_EXTS"])
     assert worker_exts == set(moecp.PRECOMPRESSED_EXTS)

@@ -983,7 +983,8 @@ def gpu_ports() -> tuple[int, ...]:
     return tuple(sorted(ports))
 
 
-if __name__ == "__main__":
+def main(argv: list[str] | None = None) -> int:
+    """Run the moesh-bridge server and block on active listeners."""
     threading.Thread(
         target=serve, args=(TUNNEL_LISTEN, tunnel_conn, "tunnel"), daemon=True
     ).start()
@@ -1031,5 +1032,10 @@ if __name__ == "__main__":
         up = _listeners_up
     if up == 0:
         log("no listener came up — exiting so systemd Restart=always can run")
-        sys.exit(1)
+        return 1
     threading.Event().wait()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
