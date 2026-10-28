@@ -121,25 +121,32 @@ closed. The record types and the exact field lists are in
 pre-installed daemons or modifying remote files.
 
 ```
-operator terminal (moecp)                      receiver (blind bridge)          target host (fresh session)
+operator terminal (moecp)                      receiver (blind bridge)          target host (moesh-tunnel)
 ┌───────────────────────────┐                 ┌──────────────────────┐         ┌───────────────────────────┐
-│ moecp client              │                 │ moesh-bridge.py      │         │ moesh_tunnel.py           │
-│ - Connects to 127.0.0.1   │  Noise_XX       │ - Pairs FIFO         │ Noise_XX│ - Accepts fresh_session   │
-│ - Sets fresh_session=True │────────────────▶│ - Opaque pump        │────────▶│ - Spawns clean bash PTY   │
-│ - Injects bootstrap worker│  encrypted      │                      │encrypted│ - Executes worker in RAM  │
-│ - Streams binary frames   │◀────────────────│                      │◀────────│ - Atomic staging & verify │
+│ moecp client              │  Noise_XX       │ moesh-bridge.py      │         │ moesh_tunnel.py           │
+│ - Connects to 127.0.0.1   │────────────────▶│ - Pairs FIFO         │────────▶ │ - Serves the transfer     │
+│ - session_type=transfer   │  encrypted      │ - Opaque pump        │         │   session in-process      │
+│ - Streams binary frames   │◀────────────────│                      │◀──────── │ - No PTY, no child        │
+│                           │                 │                      │         │ - Atomic staging & verify │
 └───────────────────────────┘                 └──────────────────────┘         └───────────────────────────┘
 ```
 
-1. **Session Isolation:** `moecp` initiates a Noise_XX session with `fresh_session=True`.
-   The agent allocates a dedicated, unshared PTY process, completely insulating active
-   interactive shell sessions from transfer traffic.
-2. **In-Memory Bootstrap:** The client pushes a compressed (base64 + zlib) Python worker script
-   directly into the PTY standard input. The worker executes strictly in memory without writing
-   temporary scripts to the remote filesystem.
+1. **Session Isolation:** `moecp` negotiates `session_type=transfer` on a Noise_XX
+   session.  A current agent serves that session **natively, in its own process**: the
+   transfer never borrows an operator's shell and never spawns a child, so it cannot
+   disturb an interactive session or its scrollback.
+2. **Compatibility Bootstrap (fallback only):** when an agent does not offer a transfer
+   session, the client pushes a compressed (base64 + zlib) Python worker script into a
+   dedicated fresh PTY's standard input and the worker runs in memory without writing a
+   script file remotely.  This path keeps mixed fleets working; it is not the path a
+   current agent uses.
 3. **Framed Streaming Protocol:** Communication switches to binary framing over the raw PTY:
    - Chunked streaming with 1 MiB transfer chunks and zlib compression.
    - Maximum frame header: 64 KiB; maximum payload: 10 MiB (defends against memory exhaustion).
+   - Decompressed output is bounded as well, and the decoded byte count cannot
+     exceed the size the manifest declared for that file.
+   - A recursive manifest is sent in bounded pages, so a tree of 100,000 files
+     fits the frame limit instead of overflowing it.
 4. **End-to-End Verification:** Source and destination compute streaming SHA-256 digests.
    If digests mismatch, the destination aborts without committing.
 5. **Atomic Staging:** Inbound files are written to `.part.<pid>` temporary files in the target

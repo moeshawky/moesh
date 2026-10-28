@@ -38,9 +38,13 @@ This repository contains **no keys**. Every key pair is generated locally, on
 the machine that will use it:
 
 ```sh
-python3 moesh_tunnel_v2.py --generate-key   # the agent
-python3 moesh_shell_v2.py --generate-key    # the operator
+moesh-tunnel --generate-key   # the agent
+moesh --generate-key          # the operator
 ```
+
+From a source checkout the same two commands are
+`python3 moesh_tunnel.py --generate-key` and
+`python3 moesh_shell.py --generate-key`.
 
 Private keys are written with mode `0600`, are never printed, and never
 leave the host that generated them. Only the public half is meant to travel,

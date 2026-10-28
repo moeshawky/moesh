@@ -135,16 +135,28 @@ Remote Target Host (VM / Container / Notebook)             Public Receiver Bridg
 
 ---
 
-## 5. Performance Characteristics (Measured)
+## 5. Performance Characteristics
 
-| Metric | Measured Value | Measurement Context |
+Measured per stage, on a stated machine, with the command that produced each
+number. See [**docs/performance.md**](docs/performance.md) for the full table,
+the methodology, and the reason the stages are reported separately:
+
+```sh
+python3 bench/moesh_bench.py
+```
+
+| stage | what the number is | what it is not |
 |---|---|---|
-| **Raw Network Splice Throughput** | 24.3 Gbps | Loopback raw TCP bridge pump |
-| **Noise_XX Encrypted Throughput** | 1.84 Gbps | ChaCha20-Poly1305 with BLAKE2s hashing |
-| **`moecp` Compressible Transfer** | 940.5 MiB/s | Zlib-1 streaming on code/text |
-| **`moecp` Precompressed Bypass** | Wire Speed (0 CPU) | Automatic raw streaming for `.safetensors`, `.gguf`, `.tar.gz` |
-| **Pairing Join Latency** | < 1 ms | FIFO unblocking on carrier arrival |
-| **Bridge Idle Footprint** | ~14 MiB RSS | Python 3 runtime with zero active connections |
+| raw socket pump | bytes copied between two sockets in one process | encryption, disk, or the network |
+| Noise_XX records | encryption + framing over loopback | compression or file I/O |
+| zlib level 1 | the codec alone, on transfer buffers | framing, crypto, disk, or the network |
+| end-to-end PUSH | the real receiver committing and verifying a file over loopback | the network |
+
+Effective throughput over a real link is bounded by the slowest stage plus the
+link. On the audit host the end-to-end PUSH stage was dominated not by the
+cipher or the codec but by the per-chunk ledger record — 43 % of the wall clock
+for an uncompressed 256 MiB push — which is documented with its measurement in
+[docs/performance.md](docs/performance.md).
 
 ---
 
@@ -158,6 +170,7 @@ Remote Target Host (VM / Container / Notebook)             Public Receiver Bridg
 | [**docs/keys.md**](docs/keys.md) | Fleet master keys, HKDF key derivation, pinning, and rotation procedures |
 | [**docs/operations.md**](docs/operations.md) | Running `moesh-bridge` in production, systemd services, and status monitoring |
 | [**docs/architecture.md**](docs/architecture.md) | RFC 4254 session model, pairing mechanics, and socket splicing |
+| [**docs/performance.md**](docs/performance.md) | Per-stage benchmark methodology, measured reference run, and known bottlenecks |
 | [**docs/security.md**](docs/security.md) | Cryptographic guarantees, threat model, and the blind receiver property |
 | [**PROTOCOL.md**](PROTOCOL.md) | Low-level wire protocol specification, framing constants, and state machine |
 

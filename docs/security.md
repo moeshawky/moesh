@@ -50,11 +50,23 @@ untrusted inputs and network tampering:
 
 ### Path Traversal Defenses
 - **`sanitize_relpath` Enforcement:** Strips leading path separators and verifies that relative paths contain no parent directory traversals (`..`), embedded null bytes (`\0`), or Windows/POSIX drive and root indicators (`/` and `\`).
-- **Filesystem Containment:** Uses `os.path.commonpath` to mathematically guarantee that all resolved target paths remain strictly inside the designated root directory, thwarting Zip Slip and traversal injection attacks.
+- **Filesystem Containment:** The destination root and the target are resolved
+  through the real filesystem (`os.path.realpath`), the real target's parent
+  must still be inside the real root, and the write is refused otherwise.  A
+  lexical check alone is not sufficient: a symlinked directory component or a
+  symlink at the final path name passes `abspath`/`commonpath` and then writes
+  outside the root.  Staging files are created inside the resolved parent, so
+  a parent-directory swap between the check and the write fails the write
+  instead of redirecting it.
 
 ### Frame Length Bounds & DoS Prevention
 - **Header Bounding:** Control headers are restricted to a maximum of 64 KiB (`MAX_FRAME_HDR`), preventing memory exhaustion during JSON payload decoding.
 - **Payload Bounding:** Inbound transfer chunks are capped at 10 MiB (`MAX_FRAME_PAYLOAD`), defending against integer overflow and unconstrained buffer allocations.
+- **Decompression Bounding:** A compressed frame is bounded *before* and
+  *after* decompression, and the cumulative decoded byte count is capped by the
+  file size the manifest declared.  A highly compressive payload or a
+  malformed zlib stream therefore fails the transfer instead of expanding into
+  unbounded memory or disk.
 
 ### Atomic Staging & Rollback
 - **Staging Files:** Inbound files are written to `.part.<pid>` temporary files in the destination directory.
@@ -62,7 +74,14 @@ untrusted inputs and network tampering:
 - **Atomic Commit:** Files are committed using `os.replace` only after digest verification succeeds. At no point is a partial or corrupt file visible under its target filename.
 
 ### Session Isolation
-- `moecp` connects with `fresh_session=True`, creating a dedicated, unshared bash PTY. File transfer traffic cannot leak into active interactive operator shells or interfere with terminal scrollback buffers.
+- `moecp` negotiates `session_type=transfer`, which the agent serves **natively
+  in-process**: no operator shell is borrowed and no child process is spawned,
+  so transfer traffic cannot leak into an interactive session or its
+  scrollback.  When an older agent does not offer a transfer session, `moecp`
+  falls back to the compatibility path (a compressed worker pushed into a
+  dedicated fresh PTY, executed in memory).  The native path is the one to
+  expect against a current agent; the fallback exists so mixed fleets keep
+  working.
 
 ---
 
@@ -70,6 +89,14 @@ untrusted inputs and network tampering:
 
 - **Outbound Egress Only:** Target accelerator nodes (GPUs/TPUs) make outbound TCP connections over HTTP port 80 to `/__relay/<service>`. No inbound listening ports are exposed on the compute nodes.
 - **Blind Queue Splicing:** The receiver pairs reverse relays strictly by service name (e.g. `gpu`, `vllm`, `embed`) on dedicated listening ports configured via `MOESH_RELAYS`. Sockets are spliced as raw TCP streams without inspection or caching.
+- **The relay is not encrypted by `moesh`, and the documentation says so:** the
+  shell tunnel is Noise-encrypted end to end, but relayed traffic is the
+  target service's own protocol, carried as raw TCP.  Whatever the exposed
+  service protects with (TLS, application auth) is the only protection on that
+  path.  Treat a relay port as a public port on the receiver: anyone who can
+  reach it reaches the target service, and `moesh` adds no authentication of
+  its own to the data plane.  Control-plane registration is what
+  `MOESH_BRIDGE_RELAY_TOKEN` gates.
 
 ---
 

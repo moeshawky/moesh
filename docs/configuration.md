@@ -167,7 +167,16 @@ moecp [-h] [-r] [-p] [-q] [-v] [--retry RETRY] [--compression {auto,zlib,raw}] [
 | `MOESH_BRIDGE_ALLOW_V1` | `1` — whether to allow legacy v1 connections | `moesh-bridge.py` |
 | `MOESH_RELAY_PORTS` | `26420-26430` — public TCP relay port pool (fallback: `MOESH_BRIDGE_GPU_PORTS`) | `moesh-bridge.py` |
 | `MOESH_RELAYS` | *none* — optional comma-separated `<label>:<port>` mappings | `moesh-bridge.py` |
-| `MOESH_BRIDGE_LEASE_GRACE` | `30` — seconds a host slot or relay port stays held after its carrier's last live tunnel | `moesh-bridge.py` |
+| `MOESH_BRIDGE_LEASE_GRACE` | `1.5` — seconds a relay port stays held after its carrier's last live tunnel | `moesh-bridge.py` |
+| `MOESH_BRIDGE_RELAY_TOKEN` | *unset* — when set, relay registration and `GET /__moesh/status` require `X-Moesh-Relay-Auth: <token>`; when unset the bridge logs that relay registration is open to anyone who can reach the tunnel listener | `moesh-bridge.py` |
+| `MOESH_BRIDGE_HALFCLOSE_LINGER` | `60` — seconds the surviving direction of a half-closed pair is drained before both legs are closed (bounds CLOSE-WAIT accumulation) | `moesh-bridge.py` |
+
+Two capacities are fixed constants rather than configuration, so that a
+sustained flood of registrations cannot grow the process without bound:
+`MAX_HOST_QUEUES = 256` routing labels and `MAX_RELAY_QUEUES = 128` relay
+labels. Past the cap the bridge refuses the new label with `503 Service
+Unavailable` instead of creating another queue. Each admitted host queue holds
+at most 8 tunnels.
 
 ---
 
