@@ -1274,8 +1274,10 @@ def tunnel_worker(host: str, port: int, path: str, name: str, pool: ShellPool) -
             time.sleep(AUTH_BACKOFF)
         except TransportEOF:
             log("transport ended without an authenticated close (abrupt EOF)")
-            time.sleep(backoff)
-            backoff = min(backoff * 2, NET_BACKOFF_MAX)
+            # The peer closed the transport; the bridge is still up, so re-dial
+            # immediately instead of waiting out the backoff.  The backoff is for
+            # a genuinely unreachable receiver, not for a client that went away.
+            backoff = 2.0
         except (ProtocolError, OSError) as exc:
             log(f"session failed: {exc!r}")
             time.sleep(backoff)
