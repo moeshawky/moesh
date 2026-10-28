@@ -5,23 +5,30 @@
 # here.  The environment is managed by uv (``uv sync``), and the lockfile
 # pins it.
 #
-# There is no console_scripts entry point on purpose: the operator client is
-# a thin wrapper around this file, and an installed entry point goes stale
-# after every source edit.  Run it from the checkout.
+# The source layout is flat: the programs are scripts at the top of the tree
+# — ``moesh-bridge.py``, ``moesh_tunnel.py`` and ``moesh_shell.py`` — and their
+# names and paths are the contract the deployments and the systemd unit use.
+# A package layout would rename them and break every receiver and agent host
+# installed from this tree, so the scripts stay where they are.
 #
-# The project is *virtual* (``package = false``): the three programs are
-# scripts at the top of the tree — ``moesh-bridge.py``, ``moesh_tunnel.py``
-# and ``moesh_shell.py`` — and their names and paths are the contract the
-# deployments and the systemd unit use.  A package layout would rename them
-# and break every receiver and agent host installed from this tree, so the
-# scripts stay where they are and the project manages only its environment.
+# Both surfaces are supported, and they are built from the same files:
+#
+#   * source checkout — ``python3 moesh_tunnel.py``, as the systemd units and
+#     the documentation invoke it, and as the test harness does;
+#   * installed wheel — the ``[project.scripts]`` entry points below, one per
+#     program.  ``scripts/smoke_wheel.sh`` runs every one of them from a clean
+#     install outside the checkout, and CI fails if any of them cannot start.
+#
+# The wheel ships the top-level modules directly (``force-include`` below),
+# including ``moesh-bridge.py``: ``moesh_bridge.py`` is the importable wrapper
+# that the ``moesh-bridge`` entry point resolves next to itself.
 [build-system]
 requires = ["hatchling>=1.21"]
 build-backend = "hatchling.build"
 
 [project]
 name = "moesh"
-version = "0.2.0a3"
+version = "0.2.0a4"
 description = "An SSH-like encrypted remote shell: Noise_XX over an HTTP/1.1 Upgrade, with a persistent shell"
 readme = "README.md"
 license = "Apache-2.0"
@@ -40,7 +47,10 @@ keywords = [
     "moecp",
 ]
 classifiers = [
-    "Development Status :: 4 - Beta",
+    # The version is 0.2.0a4, and the security policy calls the project
+    # pre-1.0 with no stable series.  The classifier says what the version
+    # says; it does not claim a beta.
+    "Development Status :: 3 - Alpha",
     "Environment :: Console",
     "Intended Audience :: Developers",
     "Intended Audience :: System Administrators",
@@ -88,7 +98,7 @@ Homepage = "https://github.com/moeshawky/moesh"
 Repository = "https://github.com/moeshawky/moesh"
 Documentation = "https://github.com/moeshawky/moesh#readme"
 Issues = "https://github.com/moeshawky/moesh/issues"
-Changelog = "https://github.com/moeshawky/moesh/blob/master/HANDOFF.md"
+Changelog = "https://github.com/moeshawky/moesh/blob/master/CHANGELOG.md"
 
 [project.scripts]
 moesh = "moesh_shell:main"
@@ -114,12 +124,19 @@ include = [
     "moesh-bridge.py",
     "moesh-bridge.service",
     "moesh/**",
+    "bench/**",
+    "scripts/**",
+    "tests/**",
     "README.md",
+    "CHANGELOG.md",
+    "HANDOFF.md",
     "LICENSE",
     "NOTICE",
     "PROTOCOL.md",
-    "HANDOFF.md",
+    "SECURITY.md",
+    "TEST-PROTOCOL.md",
     "pyproject.toml",
+    "uv.lock",
     "docs/**",
 ]
 
