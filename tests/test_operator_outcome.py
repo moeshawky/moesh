@@ -2,10 +2,11 @@
 """Operator-outcome cases for moesh v2.
 
 The catalog at ``/tmp/opencode/moesh-case-catalog.md`` is the authority for
-each case's input, expected output, oracle and cleanup.  Cases predicted red
-on this tree are strict xfails unless the measured race makes the prediction
-conditional; the guards are ordinary tests and are the calibration that the
-rig itself is sound.
+each case's input, expected output, oracle and cleanup.  Every case is an
+executable behaviour test: an oracle that inspected source text could pass or
+fail for reasons unrelated to the behaviour it named (two such oracles did),
+so cases that need an internal helper are rewritten to drive the real
+consumer and read its effect instead.
 """
 
 from __future__ import annotations
@@ -858,24 +859,94 @@ def _v2_request(host: str, *, connection: str | None = "Upgrade") -> bytes:
     return ("\r\n".join(lines) + "\r\n\r\n").encode()
 
 
-@pytest.mark.xfail(strict=True, reason="K11 the bridge queues a path/label mismatch instead of refusing it")
-def test_named_route_mismatch_is_refused_before_queueing() -> None:
-    """INT-001 — a path/label disagreement must not be queued as a live tunnel."""
-    source = _source("moesh-bridge.py")
-    tunnel_route = source.split("if token == UPGRADE_TOKEN_V2:", 1)[1].split(
-        "if token != \"websocket\":", 1
-    )[0]
-    assert "read_host_label" in tunnel_route
+def _v2_upgrade(path: str, extra: bytes = b"") -> bytes:
+    """Build a v2 host-tunnel upgrade whose identity headers are ``extra``."""
+    lines = [
+        f"GET {path} HTTP/1.1",
+        "Host: 127.0.0.1",
+        f"Upgrade: {proto.UPGRADE_TOKEN}",
+        "Connection: Upgrade",
+        f"X-Moesh-Tunnel-Version: {proto.PROTOCOL_VERSION}",
+    ]
+    return ("\r\n".join(lines) + "\r\n").encode() + extra + b"\r\n"
 
 
-@pytest.mark.xfail(strict=True, reason="K11 the bare route queues a named agent under default")
-def test_bare_route_does_not_strand_a_named_agent() -> None:
-    """INT-002 — the bare v2 path must not queue a non-default agent under `default`."""
-    source = _source("moesh-bridge.py")
-    route = source.split("if path == TUNNEL_PATH:", 1)[1].split(
-        "elif path.startswith(TUNNEL_PATH_PREFIX):", 1
-    )[0]
-    assert "read_host_label" in route
+def _read_head(sock: socket.socket, timeout: float = 10.0) -> bytes:
+    """Read one HTTP response head from an already-connected socket."""
+    sock.settimeout(timeout)
+    head = b""
+    while b"\r\n\r\n" not in head:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        head += chunk
+    return head
+
+
+def _status(tunnel_port: int) -> dict[str, Any]:
+    """Read the bridge's own JSON status probe."""
+    raw = _raw_request(
+        tunnel_port,
+        b"GET /__moesh/status HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+    )
+    assert b" 200 " in raw.split(b"\r\n", 1)[0], raw
+    return cast("dict[str, Any]", json.loads(raw.split(b"\r\n\r\n", 1)[1]))
+
+
+def test_named_route_wins_over_a_conflicting_claimed_identity(tmp_path: Path) -> None:
+    """INT-001 — routing identity comes from the path, not from a caller header.
+
+    The old oracle asserted a helper name lived inside a source slice, so it
+    failed for structural reasons rather than behaviour.  This measures the
+    invariant directly: a tunnel that *claims* `beta` on the request while the
+    path says `alpha` must be admitted once, under `alpha`, and no `beta` slot
+    may exist for an operator to pair with.
+    """
+    tunnel_port, operator_port, operator_v2_port = next_ports()
+    bridge = Bridge(tunnel_port, operator_port, operator_v2_port)
+    claimed = b"X-Moesh-Carrier-Id: beta\r\nX-Moesh-Relay-Id: beta\r\n"
+    try:
+        sock = socket.create_connection(("127.0.0.1", tunnel_port), timeout=10)
+        try:
+            sock.sendall(_v2_upgrade(f"{bridge_mod.TUNNEL_PATH}/alpha", claimed))
+            head = _read_head(sock)
+            assert b" 101 " in head.split(b"\r\n", 1)[0], head
+            assert b"X-Moesh-Tunnel-Name: alpha" in head, head
+            # Positive control for the probe: `alpha` is observable, so a
+            # missing `beta` is an absence, not a blind probe.
+            details = _status(tunnel_port)["hosts"]["details"]
+            assert details.get("alpha", {}).get("queued") == 1, details
+            assert "beta" not in details, details
+        finally:
+            sock.close()
+    finally:
+        bridge.stop()
+
+
+def test_bare_route_queues_under_default_not_the_claimed_name(tmp_path: Path) -> None:
+    """INT-002 — the bare v2 path queues under `default`, never under a claim.
+
+    A named agent that dials the bare path must land in the default slot: if
+    the header could rename it, an operator asking for that name would be
+    paired with an agent that never announced it.
+    """
+    tunnel_port, operator_port, operator_v2_port = next_ports()
+    bridge = Bridge(tunnel_port, operator_port, operator_v2_port)
+    claimed = b"X-Moesh-Carrier-Id: alpha\r\n"
+    try:
+        sock = socket.create_connection(("127.0.0.1", tunnel_port), timeout=10)
+        try:
+            sock.sendall(_v2_upgrade(bridge_mod.TUNNEL_PATH, claimed))
+            head = _read_head(sock)
+            assert b" 101 " in head.split(b"\r\n", 1)[0], head
+            assert b"X-Moesh-Tunnel-Name: default" in head, head
+            details = _status(tunnel_port)["hosts"]["details"]
+            assert details.get("default", {}).get("queued") == 1, details
+            assert "alpha" not in details, details
+        finally:
+            sock.close()
+    finally:
+        bridge.stop()
 
 
 def test_v1_route_is_refused_when_cutover_is_off(tmp_path: Path) -> None:

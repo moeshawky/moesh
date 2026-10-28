@@ -43,6 +43,7 @@ from __future__ import annotations
 import base64
 import contextlib
 import hashlib
+import hmac
 import json
 import os
 import queue
@@ -55,6 +56,8 @@ from typing import TYPE_CHECKING, Any
 from moesh_wire import (
     DEFAULT_HOST,
     PRELUDE_PREFIX,
+    RELAY_PAIR_MARKER,
+    RELAY_PAIRING_EVENT,
     TUNNEL_PATH,
     UPGRADE_TOKEN,
 )
@@ -117,22 +120,90 @@ def valid_host(name: str) -> bool:
     return all(ch.isalnum() or ch in "._-" for ch in name)
 
 
-_relays: dict[str, queue.Queue[socket.socket]] = {}
+class QueuedTunnel:
+    """One admitted tunnel waiting in a queue.
+
+    ``gen`` fences the entry to the lease generation that admitted it: a
+    socket left behind by an earlier owner is discarded at pairing instead of
+    being spliced into the new owner's traffic.  ``ready`` closes the window
+    between admission and the handshake response: the pairer will not use the
+    socket until the admitting thread has finished writing its 101.
+    """
+
+    def __init__(
+        self,
+        sock: socket.socket,
+        gen: int = 0,
+        carrier: str = "",
+        key: str = "",
+        response: bytes = b"",
+        pairing: str = "data",
+    ) -> None:
+        """Wrap an admitted socket with the lease and handshake state it owns."""
+        self.sock = sock
+        self.gen = gen
+        self.carrier = carrier
+        self.key = key
+        self.response = response
+        self.pairing = pairing
+        self.ready = threading.Event()
+
+
+def _sock_of(item: Any) -> socket.socket:
+    """Return the socket held by a queue entry (raw or wrapped)."""
+    return item.sock if isinstance(item, QueuedTunnel) else item
+
+
+_relays: dict[str, queue.Queue[Any]] = {}
 _relays_lock = threading.Lock()
 _bound_relay_ports: set[int] = set()
 _unavailable_ports: dict[int, str] = {}
 DEFAULT_RELAY_PORTS = "26420-26430"
 
+# A caller-controlled label must not be able to grow the registry without
+# bound.  Queues are only created for admitted carriers and the cap is enforced
+# before allocation, so a hostile loop gets a refusal, not memory.
+MAX_RELAY_QUEUES = 128
+# Longest a pairer waits for the admitting thread to finish its 101.
+ADMISSION_READY_TIMEOUT = 10.0
 
-def relay_queue(name: str) -> queue.Queue[socket.socket]:
-    """Return the queue for one relay key (port or service), creating it on first use."""
-    with _relays_lock:
-        item = _relays.get(name)
-        if item is not None:
-            return item
-        item = queue.Queue(maxsize=64)
-        _relays[name] = item
+
+def _relay_queue_locked(name: str) -> queue.Queue[Any] | None:
+    """Return the queue for ``name``, creating it under the registry cap."""
+    item = _relays.get(name)
+    if item is not None:
         return item
+    if len(_relays) >= MAX_RELAY_QUEUES:
+        return None
+    item = queue.Queue(maxsize=64)
+    _relays[name] = item
+    return item
+
+
+def relay_queue(name: str) -> queue.Queue[Any] | None:
+    """Return the queue for one relay key, or None when the registry is full."""
+    with _relays_lock:
+        return _relay_queue_locked(name)
+
+
+def relay_entry(
+    sock: socket.socket,
+    gen: int,
+    carrier: str,
+    *,
+    key: str = "",
+    response: bytes = b"",
+    pairing: str = "data",
+) -> QueuedTunnel:
+    """Build a queued relay entry carrying its lease generation and handshake."""
+    return QueuedTunnel(
+        sock=sock,
+        gen=gen,
+        carrier=carrier,
+        key=key,
+        response=response,
+        pairing=pairing,
+    )
 
 
 # One carrier owns one relay port/name and one shell host slot at a time, the
@@ -144,10 +215,32 @@ def relay_queue(name: str) -> queue.Queue[socket.socket]:
 RELAY_ID_HEADER = b"x-moesh-relay-id:"
 CARRIER_ID_HEADER = b"x-moesh-carrier-id:"
 RELAY_PORT_HEADER = b"x-moesh-relay-port:"
+RELAY_AUTH_HEADER = b"x-moesh-relay-auth:"
+RELAY_PAIRING_HEADER = b"x-moesh-relay-pairing:"
 RELAY_LEASE_GRACE = float(os.environ.get("MOESH_BRIDGE_LEASE_GRACE", "1.5"))
+
+# Relay carriers are admitted by name, and until now any client that could
+# reach the tunnel listener could claim one.  When this token is set, a relay
+# handshake must present it and status probes must present it too.  Leaving it
+# unset preserves the previous (unauthenticated) admission model, which the
+# bridge now states explicitly in its status payload and startup log.
+RELAY_TOKEN = os.environ.get("MOESH_BRIDGE_RELAY_TOKEN", "")
+"""Shared secret required from relay carriers and status probes (empty = open)."""
+
+PAIRING_EVENT = RELAY_PAIRING_EVENT
+"""Pairing mode where the 101 is deferred until a peer is actually paired."""
+
+PAIR_MARKER = RELAY_PAIR_MARKER
+"""Marker the bridge writes before peer bytes in event-pairing mode."""
+
+HALFCLOSE_LINGER = float(os.environ.get("MOESH_BRIDGE_HALFCLOSE_LINGER", "60"))
+"""Seconds to keep one direction open after the other reaches EOF."""
 _leases: dict[str, dict[str, Any]] = {}
 _port_leases: dict[int, dict[str, Any]] = {}
 _host_leases: dict[str, dict[str, Any]] = {}
+# Monotonic per-key generations.  They survive lease release, so a socket
+# queued by an earlier owner can never match a later owner's generation.
+_lease_gens: dict[str, int] = {}
 _leases_lock = threading.Lock()
 _relay_active: dict[str, int] = {}
 _host_active: dict[str, int] = {}
@@ -177,80 +270,163 @@ def extract_carrier(hdrs: bytes, addr: tuple[str, int]) -> str:
     return "addr:" + (fwd or addr[0])
 
 
-def live_queued(q: queue.Queue[socket.socket]) -> int:
+def relay_authorized(hdrs: bytes) -> bool:
+    """Return True when the carrier presented the configured relay token."""
+    if not RELAY_TOKEN:
+        return True
+    for line in hdrs.split(b"\r\n")[1:]:
+        if line.lower().startswith(RELAY_AUTH_HEADER):
+            presented = line.split(b":", 1)[1].strip().decode("latin-1", "replace")
+            return hmac.compare_digest(presented, RELAY_TOKEN)
+    return False
+
+
+def live_queued(q: queue.Queue[Any]) -> int:
     """Purge closed sockets from ``q`` and return the count of live queued tunnels."""
     with q.mutex:
-        kept: list[socket.socket] = []
-        dead: list[socket.socket] = []
-        for s in list(q.queue):
-            if alive(s):
-                kept.append(s)
+        kept: list[Any] = []
+        dead: list[Any] = []
+        for item in list(q.queue):
+            if alive(_sock_of(item)):
+                kept.append(item)
             else:
-                dead.append(s)
+                dead.append(item)
         if dead:
             q.queue.clear()
             q.queue.extend(kept)
-    for s in dead:
+    for item in dead:
         with contextlib.suppress(OSError):
-            s.close()
+            _sock_of(item).close()
     return len(kept)
 
 
-def _queue_busy(key: str, q: queue.Queue[socket.socket], lease: dict[str, Any] | None) -> bool:
-    """Return True while ``key`` still has a live queued tunnel, active pairing, or grace."""
+def _lease_gen_locked(key: str) -> int:
+    """Return the current lease generation for ``key``; caller holds the lock."""
+    return _lease_gens.get(key, 0)
+
+
+def _next_gen_locked(key: str) -> int:
+    """Advance and return the generation for ``key``; caller holds the lock."""
+    _lease_gens[key] = _lease_gens.get(key, 0) + 1
+    return _lease_gens[key]
+
+
+def lease_generation(key: str) -> int:
+    """Return the generation that a new owner of ``key`` would receive."""
+    with _leases_lock:
+        return _lease_gen_locked(key)
+
+
+def entry_is_current(entry: Any) -> bool:
+    """Return True when a queued entry belongs to the current lease holder."""
+    if not isinstance(entry, QueuedTunnel) or not entry.key:
+        return True
+    with _leases_lock:
+        return entry.gen == _lease_gen_locked(entry.key)
+
+
+def _busy_locked(
+    key: str, q: queue.Queue[Any] | None, lease: dict[str, Any] | None
+) -> bool:
+    """Return True while ``key`` still has a live tunnel, pairing, or grace.
+
+    The caller holds ``_leases_lock``: the liveness test and the lease
+    decision must observe the same registry state.
+    """
     if lease is None:
         return False
-    with _leases_lock:
-        active = _relay_active.get(key, 0)
-    if active > 0 or live_queued(q) > 0:
+    if _relay_active.get(key, 0) > 0:
+        return True
+    if q is not None and live_queued(q) > 0:
         return True
     return time.time() - float(lease["seen"]) < RELAY_LEASE_GRACE
+
+
+def _free_ports_locked(bound: list[int]) -> list[int]:
+    """Return bound ports with no live owner; caller holds the lock."""
+    free: list[int] = []
+    for port in bound:
+        key = str(port)
+        if not _busy_locked(key, _relays.get(key), _port_leases.get(port)):
+            free.append(port)
+    return free
 
 
 def free_relay_ports() -> list[int]:
     """Return sorted list of bound relay ports not currently held by any live carrier."""
     with _leases_lock:
-        bound = sorted(_bound_relay_ports)
-        port_leases_snap = {p: dict(v) for p, v in _port_leases.items()}
-    free: list[int] = []
-    for p in bound:
-        q = relay_queue(str(p))
-        if not _queue_busy(str(p), q, port_leases_snap.get(p)):
-            free.append(p)
-    return free
+        return _free_ports_locked(sorted(_bound_relay_ports))
 
 
-def _free_ports_summary() -> str:
-    """Format free relay ports for conflict error messages."""
-    free = free_relay_ports()
+def _free_ports_summary_locked(bound: list[int]) -> str:
+    """Format free relay ports; caller holds the lease lock."""
+    free = _free_ports_locked(bound)
     if not free:
         return "none"
     return ", ".join(str(p) for p in free)
 
 
-def claim_host(
-    host: str, carrier: str, q: queue.Queue[socket.socket]
-) -> str | None:
-    """Grant or refuse v2 shell ``host`` to ``carrier``; return None on grant, else reason."""
-    queued = live_queued(q)
+def _free_ports_summary() -> str:
+    """Format free relay ports for conflict error messages."""
     with _leases_lock:
+        return _free_ports_summary_locked(sorted(_bound_relay_ports))
+
+
+def admit_host(
+    host: str, carrier: str, q: queue.Queue[Any], sock: socket.socket
+) -> tuple[str | None, QueuedTunnel | None]:
+    """Admit one v2 shell tunnel and enqueue it in the same critical section.
+
+    The lease check, the grant, and the queue insertion observe one registry
+    state, so two carriers cannot both be told they own ``host``.  The entry
+    is returned un-ready: the caller sends its 101 and then marks it ready, and
+    the pairer waits for that before using the socket.
+
+    Returns:
+        ``(reason, entry)``; ``reason`` is None on admission.
+    """
+    with _leases_lock:
+        queued = live_queued(q)
         active = _host_active.get(host, 0)
         lease = _host_leases.get(host)
         if lease is not None and lease["id"] != carrier and (queued > 0 or active > 0):
             held = int(time.time() - float(lease["since"]))
             active_hosts = [
-                h for h, hq in _shell_v2.items() if live_queued(hq) > 0 or _host_active.get(h, 0) > 0
+                h
+                for h, hq in _shell_v2.items()
+                if live_queued(hq) > 0 or _host_active.get(h, 0) > 0
             ]
             active_str = ", ".join(sorted(active_hosts)) or host
             return (
                 f"host {host!r} is already in use by another tunnel "
-                f"(held for {held}s, {queued} queued, {active} active); active hosts: {active_str}"
-            )
-        if lease is None or lease["id"] != carrier:
-            _host_leases[host] = {"id": carrier, "since": time.time(), "seen": time.time()}
-        else:
-            lease["seen"] = time.time()
-    return None
+                f"(held for {held}s, {queued} queued, {active} active); "
+                f"active hosts: {active_str}"
+            ), None
+        new_owner = lease is None or lease["id"] != carrier
+        entry = QueuedTunnel(
+            sock=sock,
+            gen=_next_gen_locked(host) if new_owner else _lease_gen_locked(host),
+            carrier=carrier,
+            # The key fences this entry to the host lease, so a socket queued
+            # by an earlier owner is discarded instead of being paired with
+            # the new owner's operator.
+            key=host,
+        )
+        try:
+            q.put_nowait(entry)
+        except queue.Full:
+            return "tunnel queue full", None
+        now = time.time()
+        if new_owner:
+            _host_leases[host] = {
+                "id": carrier,
+                "since": now,
+                "seen": now,
+                "gen": entry.gen,
+            }
+        elif lease is not None:
+            lease["seen"] = now
+        return None, entry
 
 
 def touch_host(host: str, delta: int = 0) -> None:
@@ -262,44 +438,38 @@ def touch_host(host: str, delta: int = 0) -> None:
             lease["seen"] = time.time()
 
 
-def resolve_and_claim_relay(
+def _resolve_relay_locked(
     svc: str,
     carrier: str,
     requested_port: int,
-) -> tuple[queue.Queue[socket.socket], int, str | None]:
-    """Resolve relay target ``svc`` to a queue and port, checking carrier leases.
-
-    Returns ``(queue, assigned_port, error_reason)``.
-    """
-    static_map = relay_services()
-    with _leases_lock:
-        bound = sorted(_bound_relay_ports)
-        unavail = dict(_unavailable_ports)
-
-    # Unit-test or unbound mode: no public relay listeners were bound.
+    bound: list[int],
+    unavail: dict[int, str],
+    static_map: dict[str, int],
+) -> tuple[int, str, str | None]:
+    """Resolve a relay request to ``(port, lease_name, reason)`` under the lock."""
     if not bound and not unavail:
-        q = relay_queue(svc)
-        reason = claim_relay(svc, carrier, q, port=0)
-        return q, 0, reason
+        # Unit-test or unbound mode: no public relay listeners were bound.
+        return 0, svc, None
 
     port = 0
+    lease_name = svc
     if svc == "auto":
-        with _leases_lock:
-            for p in bound:
-                pl = _port_leases.get(p)
-                if pl is not None and pl["id"] == carrier:
-                    port = p
-                    break
+        for candidate in bound:
+            port_lease = _port_leases.get(candidate)
+            if port_lease is not None and port_lease["id"] == carrier:
+                port = candidate
+                break
         if port == 0:
-            free = free_relay_ports()
+            free = _free_ports_locked(bound)
             if not free:
                 return (
-                    relay_queue("auto"),
                     0,
-                    f"no free relay ports available; open ports: {', '.join(str(p) for p in bound)}",
+                    svc,
+                    f"no free relay ports available; open ports: "
+                    f"{', '.join(str(p) for p in bound)}",
                 )
             port = free[0]
-        svc = str(port)
+        lease_name = str(port)
     elif svc.isdigit():
         port = int(svc)
     elif requested_port > 0:
@@ -307,96 +477,191 @@ def resolve_and_claim_relay(
     elif svc in static_map:
         port = static_map[svc]
     else:
-        with _leases_lock:
-            existing = _leases.get(svc)
-            if existing is not None and int(existing.get("port", 0)) in bound:
-                port = int(existing["port"])
+        existing = _leases.get(svc)
+        if existing is not None and int(existing.get("port", 0)) in bound:
+            port = int(existing["port"])
         if port == 0:
-            free = free_relay_ports()
+            free = _free_ports_locked(bound)
             if not free:
                 return (
-                    relay_queue(svc),
                     0,
-                    f"no free relay ports available for {svc!r}; open ports: {', '.join(str(p) for p in bound)}",
+                    svc,
+                    f"no free relay ports available for {svc!r}; open ports: "
+                    f"{', '.join(str(p) for p in bound)}",
                 )
             port = free[0]
 
+    summary = _free_ports_summary_locked(bound)
     if port in unavail:
         return (
-            relay_queue(str(port)),
             port,
+            lease_name,
             f"relay port {port} is unavailable on receiver ({unavail[port]}); "
-            f"free ports: {_free_ports_summary()}",
+            f"free ports: {summary}",
         )
     if bound and port not in bound:
         return (
-            relay_queue(str(port)),
             port,
+            lease_name,
             f"relay port {port} is not in the open relay port pool; "
-            f"free ports: {_free_ports_summary()}",
+            f"free ports: {summary}",
         )
-
-    q = relay_queue(str(port))
-    reason = claim_relay(svc, carrier, q, port=port)
-    return q, port, reason
+    return port, lease_name, None
 
 
-def claim_relay(
-    svc: str,
-    carrier: str,
-    q: queue.Queue[socket.socket],
-    port: int = 0,
+def _claim_relay_locked(
+    svc: str, carrier: str, q: queue.Queue[Any], port: int, bound: list[int]
 ) -> str | None:
-    """Grant or refuse ``svc`` (and ``port``) to ``carrier``; return None on grant, else reason."""
+    """Grant ``svc``/``port`` to ``carrier`` under the lease lock, or refuse it."""
     key = str(port) if port > 0 else svc
-    with _leases_lock:
-        name_lease = _leases.get(svc)
-        port_lease = _port_leases.get(port) if port > 0 else None
+    name_lease = _leases.get(svc)
+    port_lease = _port_leases.get(port) if port > 0 else None
 
     if name_lease is not None and name_lease["id"] != carrier:
         prev_port = int(name_lease.get("port", 0))
         prev_key = str(prev_port) if prev_port > 0 else svc
-        prev_q = relay_queue(prev_key)
-        if _queue_busy(prev_key, prev_q, name_lease):
+        if _busy_locked(prev_key, _relays.get(prev_key), name_lease):
             held = int(time.time() - float(name_lease["since"]))
             port_note = f" on port {prev_port}" if prev_port > 0 else ""
             return (
                 f"relay service {svc!r} is already held by another carrier"
-                f"{port_note} (for {held}s); free ports: {_free_ports_summary()}"
+                f"{port_note} (for {held}s); free ports: "
+                f"{_free_ports_summary_locked(bound)}"
             )
 
     if (
         port > 0
         and port_lease is not None
         and port_lease["id"] != carrier
-        and _queue_busy(key, q, port_lease)
+        and _busy_locked(key, q, port_lease)
     ):
         held = int(time.time() - float(port_lease["since"]))
         owner_name = str(port_lease.get("name", port))
         return (
             f"relay port {port} is already in use by another carrier "
-            f"(service {owner_name!r}, for {held}s); free ports: {_free_ports_summary()}"
+            f"(service {owner_name!r}, for {held}s); free ports: "
+            f"{_free_ports_summary_locked(bound)}"
         )
 
+    if name_lease is None and len(_leases) >= MAX_RELAY_QUEUES:
+        return "relay registry is full; release a service before claiming a new one"
     now = time.time()
-    with _leases_lock:
-        if name_lease is None or name_lease["id"] != carrier:
-            _leases[svc] = {"id": carrier, "port": port, "since": now, "seen": now}
+    if name_lease is None or name_lease["id"] != carrier:
+        _leases[svc] = {
+            "id": carrier,
+            "port": port,
+            "since": now,
+            "seen": now,
+            "gen": _next_gen_locked(svc),
+        }
+    else:
+        name_lease["seen"] = now
+        name_lease["port"] = port
+    if port > 0:
+        if port_lease is None or port_lease["id"] != carrier:
+            _port_leases[port] = {
+                "id": carrier,
+                "name": svc,
+                "since": now,
+                "seen": now,
+                "gen": _next_gen_locked(str(port)),
+            }
         else:
-            name_lease["seen"] = now
-            name_lease["port"] = port
-        if port > 0:
-            if port_lease is None or port_lease["id"] != carrier:
-                _port_leases[port] = {
-                    "id": carrier,
-                    "name": svc,
-                    "since": now,
-                    "seen": now,
-                }
-            else:
-                port_lease["seen"] = now
-                port_lease["name"] = svc
+            port_lease["seen"] = now
+            port_lease["name"] = svc
     return None
+
+
+def resolve_and_claim_relay(
+    svc: str,
+    carrier: str,
+    requested_port: int,
+) -> tuple[queue.Queue[Any] | None, int, str | None]:
+    """Resolve relay target ``svc`` to a queue and port, checking carrier leases.
+
+    Resolution, admission, and queue allocation run in one critical section so
+    two carriers cannot both be told the same free port.
+
+    Returns ``(queue, assigned_port, error_reason)``.
+    """
+    static_map = relay_services()
+    with _leases_lock:
+        bound = sorted(_bound_relay_ports)
+        unavail = dict(_unavailable_ports)
+        port, lease_name, reason = _resolve_relay_locked(
+            svc, carrier, requested_port, bound, unavail, static_map
+        )
+        key = str(port) if port > 0 else svc
+        q = _relay_queue_locked(key)
+        if q is None:
+            return None, port, (
+                f"relay registry is full ({MAX_RELAY_QUEUES} labels); "
+                "release a service before claiming a new one"
+            )
+        if reason is not None:
+            return q, port, reason
+        reason = _claim_relay_locked(lease_name, carrier, q, port, bound)
+        return q, port, reason
+
+
+def admit_relay(
+    svc: str,
+    carrier: str,
+    requested_port: int,
+    sock: socket.socket,
+    *,
+    response: bytes = b"",
+    pairing: str = "data",
+) -> tuple[int, str | None, QueuedTunnel | None]:
+    """Admit one relay carrier and enqueue its socket atomically.
+
+    A failed insertion rolls the lease back, so a refused carrier cannot leave
+    the port looking owned.  For ``pairing="event"`` the 101 is deferred and
+    carried in ``response``: the pairer sends it (then the pairing marker) when
+    a peer actually arrives, which is what lets a server-first backend greet
+    the peer before the carrier has seen any data.
+
+    Returns:
+        ``(assigned_port, reason, entry)``; ``reason`` is None on admission.
+    """
+    static_map = relay_services()
+    with _leases_lock:
+        bound = sorted(_bound_relay_ports)
+        unavail = dict(_unavailable_ports)
+        port, lease_name, reason = _resolve_relay_locked(
+            svc, carrier, requested_port, bound, unavail, static_map
+        )
+        key = str(port) if port > 0 else svc
+        q = _relay_queue_locked(key)
+        if q is None:
+            return port, (
+                f"relay registry is full ({MAX_RELAY_QUEUES} labels); "
+                "release a service before claiming a new one"
+            ), None
+        if reason is None:
+            reason = _claim_relay_locked(lease_name, carrier, q, port, bound)
+        if reason is not None:
+            return port, reason, None
+        entry = QueuedTunnel(
+            sock=sock,
+            gen=_lease_gen_locked(key),
+            carrier=carrier,
+            key=key,
+            response=response,
+            pairing=pairing,
+        )
+        try:
+            q.put_nowait(entry)
+        except queue.Full:
+            # No tunnel exists for this carrier: do not leave a lease behind.
+            if port > 0 and _port_leases.get(port, {}).get("id") == carrier:
+                _port_leases.pop(port, None)
+            if _leases.get(lease_name, {}).get("id") == carrier:
+                _leases.pop(lease_name, None)
+            return port, f"relay queue for {key} is full; retry shortly", None
+        # The admitting thread sets ready only after its handshake write is
+        # complete; the pairer waits on it before touching the socket.
+        return port, None, entry
 
 
 def touch_relay(svc: str, delta: int = 0) -> None:
@@ -428,33 +693,33 @@ def bridge_status() -> dict[str, Any]:
             hosts_in_use.append(h_name)
             host_details[h_name] = {"queued": q_count, "active": a_count}
 
-    with _leases_lock:
-        bound = sorted(_bound_relay_ports)
-        unavail = {str(k): v for k, v in sorted(_unavailable_ports.items())}
-        port_leases_snap = {p: dict(v) for p, v in _port_leases.items()}
-
     ports_free: list[int] = []
     ports_in_use: dict[str, dict[str, Any]] = {}
     names_in_use: dict[str, int] = {}
-    for p in bound:
-        q = relay_queue(str(p))
-        pl = port_leases_snap.get(p)
-        if _queue_busy(str(p), q, pl):
-            q_cnt = live_queued(q)
-            a_cnt = _relay_active.get(str(p), 0)
-            svc_name = str(pl.get("name", p)) if pl else str(p)
-            ports_in_use[str(p)] = {
-                "name": svc_name,
-                "queued": q_cnt,
-                "active": a_cnt,
-                "since": int(pl["since"]) if pl else 0,
-            }
-            names_in_use[svc_name] = p
-        else:
-            ports_free.append(p)
+    with _leases_lock:
+        bound = sorted(_bound_relay_ports)
+        unavail = {str(k): v for k, v in sorted(_unavailable_ports.items())}
+        for port in bound:
+            key = str(port)
+            port_lease = _port_leases.get(port)
+            if _busy_locked(key, _relays.get(key), port_lease):
+                queue_ref = _relays.get(key)
+                q_cnt = live_queued(queue_ref) if queue_ref is not None else 0
+                a_cnt = _relay_active.get(key, 0)
+                svc_name = str(port_lease.get("name", port)) if port_lease else key
+                ports_in_use[key] = {
+                    "name": svc_name,
+                    "queued": q_cnt,
+                    "active": a_cnt,
+                    "since": int(port_lease["since"]) if port_lease else 0,
+                }
+                names_in_use[svc_name] = port
+            else:
+                ports_free.append(port)
 
     return {
         "ok": True,
+        "relay_auth": "token" if RELAY_TOKEN else "none",
         "hosts": {
             "in_use": hosts_in_use,
             "details": host_details,
@@ -588,6 +853,18 @@ def tunnel_conn(conn: socket.socket, addr: tuple[str, int]) -> None:
         path = request_path(hdrs)
         clean_path = path.split("?", 1)[0]
         if clean_path in ("/__moesh/status", "/__relay/status"):
+            if not relay_authorized(hdrs):
+                body = b"status requires the relay token"
+                with contextlib.suppress(OSError):
+                    conn.sendall(
+                        b"HTTP/1.1 401 Unauthorized\r\nContent-Type: text/plain\r\n"
+                        b"Content-Length: " + str(len(body)).encode() + b"\r\n"
+                        b"Connection: close\r\n\r\n" + body
+                    )
+                with contextlib.suppress(OSError):
+                    conn.close()
+                log("refused status probe without relay token")
+                return
             status_payload = bridge_status()
             body = json.dumps(status_payload, indent=2).encode("utf-8")
             with contextlib.suppress(OSError):
@@ -631,24 +908,23 @@ def tunnel_conn(conn: socket.socket, addr: tuple[str, int]) -> None:
                 refuse(conn, "503 Service Unavailable", "host queue full")
                 return
             carrier = extract_carrier(hdrs, addr)
-            reason = claim_host(host, carrier, q)
+            reason, admitted_v2 = admit_host(host, carrier, q, conn)
             if reason is not None:
-                refuse(conn, "409 Conflict", reason, detail=reason)
+                status = "503 Service Unavailable" if "queue full" in reason else "409 Conflict"
+                refuse(conn, status, reason, detail=reason)
                 return
             try:
-                q.put_nowait(conn)
-            except queue.Full:
-                log(f"tunnel queue full — dropping {addr}")
-                with contextlib.suppress(OSError):
-                    conn.close()
-                return
-            conn.sendall(
-                b"HTTP/1.1 101 Switching Protocols\r\n"
-                b"Upgrade: " + UPGRADE_TOKEN.encode() + b"\r\n"
-                b"Connection: Upgrade\r\n"
-                b"X-Moesh-Tunnel-Version: 2\r\n"
-                b"X-Moesh-Tunnel-Name: " + host.encode() + b"\r\n\r\n"
-            )
+                conn.sendall(
+                    b"HTTP/1.1 101 Switching Protocols\r\n"
+                    b"Upgrade: " + UPGRADE_TOKEN.encode() + b"\r\n"
+                    b"Connection: Upgrade\r\n"
+                    b"X-Moesh-Tunnel-Version: 2\r\n"
+                    b"X-Moesh-Tunnel-Name: " + host.encode() + b"\r\n\r\n"
+                )
+            finally:
+                # Only now may a pairer use the socket: the 101 is on the wire.
+                if admitted_v2 is not None:
+                    admitted_v2.ready.set()
             conn.settimeout(None)
             log(f"host tunnel v2 attached from {addr} host {host}")
             return
@@ -659,29 +935,41 @@ def tunnel_conn(conn: socket.socket, addr: tuple[str, int]) -> None:
         # paths; only the v2 path is moesh's.
         assigned_port = 0
         svc = ""
+        relay_carrier = ""
+        relay_pairing = "data"
+        req_port = 0
+        queue_ref: queue.Queue[Any] | None = None
         if path == V1_TUNNEL_PATH:
             if not ALLOW_V1:
                 refuse(
                     conn, "426 Upgrade Required", "v1 shell tunnel disabled by cutover"
                 )
                 return
-            q = _shell
+            queue_ref = _shell
         elif path.startswith(RELAY_PATH_PREFIX):
             svc = path[len(RELAY_PATH_PREFIX) :]
             if not valid_host(svc):
                 refuse(conn, "400 Bad Request", f"invalid relay service {svc!r}")
                 return
-            carrier = extract_carrier(hdrs, addr)
-            req_port = 0
+            if not relay_authorized(hdrs):
+                refuse(
+                    conn,
+                    "401 Unauthorized",
+                    "relay carrier authentication required",
+                    detail="present X-Moesh-Relay-Auth with the bridge relay token",
+                )
+                return
+            relay_carrier = extract_carrier(hdrs, addr)
             for line in hdrs.split(b"\r\n")[1:]:
-                if line.lower().startswith(RELAY_PORT_HEADER):
+                low = line.lower()
+                if low.startswith(RELAY_PORT_HEADER):
                     port_txt = line.split(b":", 1)[1].strip().decode("latin-1", "replace")
                     if port_txt.isdigit():
                         req_port = int(port_txt)
-            q, assigned_port, reason = resolve_and_claim_relay(svc, carrier, req_port)
-            if reason is not None:
-                refuse(conn, "409 Conflict", reason, detail=reason)
-                return
+                elif low.startswith(RELAY_PAIRING_HEADER):
+                    mode = line.split(b":", 1)[1].strip().decode("latin-1", "replace")
+                    if mode == PAIRING_EVENT:
+                        relay_pairing = PAIRING_EVENT
         else:
             refuse(conn, "400 Bad Request", f"unknown v1 path {path}")
             return
@@ -695,12 +983,26 @@ def tunnel_conn(conn: socket.socket, addr: tuple[str, int]) -> None:
         # SHA-1 is not a choice here: RFC 6455 specifies it for the
         # Sec-WebSocket-Accept value, and this path carries no secret.
         accept = base64.b64encode(hashlib.sha1(key + GUID).digest())  # noqa: S324
+
+        admitted: QueuedTunnel | None = None
+        if svc:
+            assigned_port, reason, admitted = admit_relay(
+                svc, relay_carrier, req_port, conn, pairing=relay_pairing
+            )
+            if reason is not None:
+                status = "503 Service Unavailable" if "full" in reason else "409 Conflict"
+                refuse(conn, status, reason, detail=reason)
+                return
+
         extra_hdrs = b""
         if svc:
             extra_hdrs += b"X-Moesh-Relay-Name: " + svc.encode("latin-1", "replace") + b"\r\n"
-        if assigned_port > 0:
-            extra_hdrs += f"X-Moesh-Relay-Port: {assigned_port}\r\n".encode("latin-1")
-        conn.sendall(
+        announced_port = assigned_port or req_port
+        if announced_port > 0:
+            extra_hdrs += f"X-Moesh-Relay-Port: {announced_port}\r\n".encode("latin-1")
+        if relay_pairing == PAIRING_EVENT:
+            extra_hdrs += b"X-Moesh-Relay-Pairing: event\r\n"
+        response_bytes = (
             b"HTTP/1.1 101 Switching Protocols\r\n"
             b"Upgrade: websocket\r\n"
             b"Connection: Upgrade\r\n"
@@ -708,10 +1010,26 @@ def tunnel_conn(conn: socket.socket, addr: tuple[str, int]) -> None:
             + extra_hdrs
             + b"\r\n"
         )
-        conn.settimeout(None)
         port_log = f" port {assigned_port}" if assigned_port > 0 else ""
+        if svc and relay_pairing == PAIRING_EVENT:
+            # The 101 travels with the queue entry: it is written when a peer
+            # is actually paired, so the carrier can connect its backend
+            # before any peer byte exists (server-first protocols).
+            if admitted is not None:
+                admitted.response = response_bytes
+                admitted.ready.set()
+            conn.settimeout(None)
+            log(f"relay carrier queued from {addr} path {path}{port_log} (deferred 101)")
+            return
+        conn.sendall(response_bytes)
+        if admitted is not None:
+            admitted.ready.set()
+        conn.settimeout(None)
         log(f"host tunnel attached from {addr} path {path}{port_log}")
-        q.put(conn, timeout=120)
+        if svc:
+            return
+        if queue_ref is not None:
+            queue_ref.put(conn, timeout=120)
     except queue.Full:
         log(f"tunnel queue full — dropping {addr}")
         with contextlib.suppress(OSError):
@@ -743,8 +1061,42 @@ def alive(sock: socket.socket) -> bool:
         return False
 
 
-def pump(a: socket.socket, b: socket.socket) -> None:
-    """Relay bytes both ways until either side closes."""
+def pump(
+    a: socket.socket,
+    b: socket.socket,
+    linger: float | None = None,
+    on_half_close: Callable[[], None] | None = None,
+) -> None:
+    """Relay bytes both ways, honouring TCP half-close semantics.
+
+    A direction that reaches EOF forwards it as ``SHUT_WR`` and leaves the
+    reverse direction alone: that is how a client says "request complete" and
+    still reads the response (an SMTP/HTTP style exchange).  Closing both legs
+    immediately, or shutting down the *read* side of the surviving direction,
+    destroys the response, which is what the previous implementation did.
+
+    The other direction is allowed ``linger`` seconds to finish.  A peer that
+    never closes would otherwise leave this pair blocked in ``recv`` forever
+    (CLOSE-WAIT accumulation), so after the linger both sockets are shut down
+    and closed.
+
+    ``on_half_close`` runs once, when the first direction ends.  Callers use it
+    to retire the pairing from admission accounting immediately: the drained
+    direction may legitimately outlive the attached peer by the whole linger,
+    and holding the lease for that long would refuse a replacement carrier long
+    after the peer that justified the lease is gone.
+
+    Args:
+        a: First leg (the queued host/tunnel side).
+        b: Second leg (the peer/operator side).
+        linger: Seconds to wait for the second direction; defaults to
+            ``MOESH_BRIDGE_HALFCLOSE_LINGER``.
+        on_half_close: Called once when either direction reaches EOF.
+    """
+    if linger is None:
+        linger = HALFCLOSE_LINGER
+    done = threading.Event()
+    half_closed = threading.Lock()
 
     def copy(src: socket.socket, dst: socket.socket, name: str) -> None:
         try:
@@ -758,58 +1110,97 @@ def pump(a: socket.socket, b: socket.socket) -> None:
         finally:
             with contextlib.suppress(OSError):
                 dst.shutdown(socket.SHUT_WR)
-            # Symmetric read shutdown (measured 2026-10-26: when host->peer
-            # ended first, peer->host stayed blocked in b.recv() on keep-alive
-            # peers and leaked CLOSE-WAIT sockets forever because SHUT_RD only
-            # ran after peer->host returned).
-            with contextlib.suppress(OSError):
-                dst.shutdown(socket.SHUT_RD)
             log(f"pump {name} ended")
+            done.set()
+            if on_half_close is not None and half_closed.acquire(blocking=False):
+                try:
+                    on_half_close()
+                except Exception as exc:  # must not kill the pump
+                    log(f"half-close bookkeeping failed: {exc!r}")
 
-    t = threading.Thread(target=copy, args=(a, b, "host->peer"), daemon=True)
-    t.start()
-    copy(b, a, "peer->host")
-    # One direction EOF'd: force the surviving copy thread to EOF too so it
-    # returns instead of blocking on recv() from a half-open peer.
-    # shutdown(SHUT_RD) makes recv() return b'' on both sockets, so both
-    # copy threads exit their loops and the join is unbounded — no 5s
-    # deadline that can drop LATE/in-flight bytes (measured 2026-10-24:
-    # t.join(timeout=5) dropped bytes on slow surviving directions;
-    # shutdown + unbounded join returns promptly with bytes already
-    # received preserved).
-    for s in (a, b):
+    workers = [
+        threading.Thread(target=copy, args=(a, b, "host->peer"), daemon=True),
+        threading.Thread(target=copy, args=(b, a, "peer->host"), daemon=True),
+    ]
+    for worker in workers:
+        worker.start()
+    done.wait()
+    deadline = time.time() + linger
+    for worker in workers:
+        worker.join(max(0.0, deadline - time.time()))
+    if any(worker.is_alive() for worker in workers):
+        log(f"half-closed pair exceeded {linger}s linger; forcing close")
+    for sock in (a, b):
         with contextlib.suppress(OSError):
-            s.shutdown(socket.SHUT_RD)
-    t.join()
-    for s in (a, b):
+            sock.shutdown(socket.SHUT_RDWR)
+    for worker in workers:
+        worker.join(1.0)
+    for sock in (a, b):
         with contextlib.suppress(OSError):
-            s.close()
+            sock.close()
     log("pair closed")
 
 
 def pair(
     conn: socket.socket,
-    q: queue.Queue[socket.socket],
+    q: queue.Queue[Any],
     label: str,
     wait: int,
+    on_detach: Callable[[], None] | None = None,
 ) -> None:
-    """Pair one incoming connection with the oldest live tunnel in ``q``."""
+    """Pair one incoming connection with the oldest live tunnel in ``q``.
+
+    A queued entry is only usable when it belongs to the current lease
+    generation and its admitting thread has finished writing the handshake
+    response.  Stale entries are discarded instead of being spliced into the
+    new owner's traffic.
+
+    ``on_detach`` runs once when one direction ends, so the caller can retire
+    its active-pairing count without waiting out the drain.
+    """
     try:
         log(f"{label} attached from {conn.getpeername()}")
+        item: Any = None
         while True:
-            nb = q.get(timeout=wait)
+            item = q.get(timeout=wait)
+            nb = _sock_of(item)
+            if isinstance(item, QueuedTunnel):
+                if not entry_is_current(item):
+                    log(f"discarding stale {label} tunnel from a superseded lease")
+                    with contextlib.suppress(OSError):
+                        nb.close()
+                    continue
+                if not item.ready.wait(ADMISSION_READY_TIMEOUT):
+                    log(f"discarding {label} tunnel whose handshake never completed")
+                    with contextlib.suppress(OSError):
+                        nb.close()
+                    continue
             if alive(nb):
                 break
             log(f"discarding stale {label} tunnel")
             with contextlib.suppress(OSError):
                 nb.close()
+        nb = _sock_of(item)
         log(f"pairing {label} with a host")
         # Both legs are unbounded once paired: a session may sit idle for
         # hours, and a socket timeout left armed on either side would tear
         # the pair down without anyone noticing.
         conn.settimeout(None)
         nb.settimeout(None)
-        pump(nb, conn)
+        if isinstance(item, QueuedTunnel) and item.response:
+            # Deferred handshake: the carrier has been waiting for this 101 so
+            # it can open its backend connection before any peer byte exists.
+            try:
+                nb.sendall(item.response)
+                if item.pairing == PAIRING_EVENT:
+                    nb.sendall(PAIR_MARKER)
+            except OSError:
+                with contextlib.suppress(OSError):
+                    nb.close()
+                with contextlib.suppress(OSError):
+                    conn.close()
+                return
+        pump(nb, conn, on_half_close=on_detach)
     except queue.Empty:
         log(f"{label} connected but no {label} tunnel within {wait}s")
         with contextlib.suppress(OSError):
@@ -889,11 +1280,18 @@ def operator_v2_conn(conn: socket.socket, addr: tuple[str, int]) -> None:
         with contextlib.suppress(OSError):
             conn.close()
         return
+    detached = threading.Lock()
+
+    def detach() -> None:
+        """Stop counting this pairing as attached; safe to call twice."""
+        if detached.acquire(blocking=False):
+            touch_host(host, -1)
+
     touch_host(host, 1)
     try:
-        pair(conn, q, f"operator-v2[{host}]", 120)
+        pair(conn, q, f"operator-v2[{host}]", 120, on_detach=detach)
     finally:
-        touch_host(host, -1)
+        detach()
 
 
 def serve(
@@ -985,6 +1383,25 @@ def gpu_ports() -> tuple[int, ...]:
 
 def main(argv: list[str] | None = None) -> int:
     """Run the moesh-bridge server and block on active listeners."""
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="moesh-bridge",
+        description=(
+            "Blind pairing broker: terminates the HTTP/1.1 Upgrade and relays "
+            "opaque bytes.  Configuration is environment-only; --help documents "
+            "the entry point for packaging smoke tests."
+        ),
+    )
+    parser.parse_args(argv)
+    if RELAY_TOKEN:
+        log("relay carrier authentication enabled (shared token)")
+    else:
+        log(
+            "relay carrier authentication is DISABLED: any client that can reach "
+            "the tunnel listener may claim a relay port; set "
+            "MOESH_BRIDGE_RELAY_TOKEN to require a shared secret"
+        )
     threading.Thread(
         target=serve, args=(TUNNEL_LISTEN, tunnel_conn, "tunnel"), daemon=True
     ).start()
@@ -1000,6 +1417,9 @@ def main(argv: list[str] | None = None) -> int:
         if port <= 0:
             continue
         q = relay_queue(str(port))
+        if q is None:
+            log(f"relay port {port} skipped: relay registry is full")
+            continue
 
         def make_relay_handler(
             queue_ref: queue.Queue[socket.socket], port_num: int
@@ -1007,11 +1427,17 @@ def main(argv: list[str] | None = None) -> int:
             label = str(port_num)
 
             def handler(conn: socket.socket, addr: tuple[str, int]) -> None:
+                detached = threading.Lock()
+
+                def detach() -> None:
+                    if detached.acquire(blocking=False):
+                        touch_relay(label, -1)
+
                 touch_relay(label, 1)
                 try:
-                    pair(conn, queue_ref, f"relay:{port_num}", 20)
+                    pair(conn, queue_ref, f"relay:{port_num}", 20, on_detach=detach)
                 finally:
-                    touch_relay(label, -1)
+                    detach()
 
             return handler
 

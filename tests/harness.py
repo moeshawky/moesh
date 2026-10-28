@@ -54,6 +54,22 @@ EVIDENCE_DIR = "/tmp/opencode"  # noqa: S108 - the operator reads these paths
 _PORT_BASE = [19470]
 """First tunnel port handed out.  The suite uses one allocator, so the
 numbers never repeat inside a run and two test files cannot collide."""
+_PORT_CEILING = 26400
+"""Maximum port handed out to avoid colliding with live relay ports (26500-26700)."""
+
+
+def _can_bind_triple(base: int) -> bool:
+    """Verify that all three ports in the triple can be bound on 127.0.0.1."""
+    import socket
+
+    for port in (base, base + 1, base + 2):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s.bind(("127.0.0.1", port))
+        except OSError:
+            return False
+    return True
 
 
 def next_ports() -> tuple[int, int, int]:
@@ -66,6 +82,12 @@ def next_ports() -> tuple[int, int, int]:
             f.seek(0)
             content = f.read().strip()
             base = int(content) if content.isdigit() else _PORT_BASE[0]
+            while True:
+                if base >= _PORT_CEILING:
+                    base = 19470
+                if _can_bind_triple(base):
+                    break
+                base += 10
             _PORT_BASE[0] = base + 10
             f.seek(0)
             f.truncate()
@@ -75,7 +97,13 @@ def next_ports() -> tuple[int, int, int]:
             return base, base + 1, base + 2
     except OSError:
         base = _PORT_BASE[0]
-        _PORT_BASE[0] += 10
+        while True:
+            if base >= _PORT_CEILING:
+                base = 19470
+            if _can_bind_triple(base):
+                break
+            base += 10
+        _PORT_BASE[0] = base + 10
         return base, base + 1, base + 2
 
 
@@ -93,6 +121,7 @@ class Bridge:
         operator_port: int,
         operator_v2_port: int,
         allow_v1: bool = True,
+        env_extra: dict[str, str] | None = None,
     ) -> None:
         env = dict(os.environ)
         env.update(
@@ -104,6 +133,8 @@ class Bridge:
                 "MOESH_BRIDGE_ALLOW_V1": "1" if allow_v1 else "0",
             }
         )
+        if env_extra:
+            env.update(env_extra)
         self.log_path = f"{EVIDENCE_DIR}/bridge-test-{tunnel_port}.log"
         # The bridge keeps writing to it for as long as it runs, so it
         # cannot be a context manager here.

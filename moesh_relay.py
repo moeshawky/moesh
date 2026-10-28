@@ -32,6 +32,8 @@ import time
 from typing import Any
 from urllib.parse import urlsplit
 
+from moesh_wire import RELAY_PAIR_MARKER, RELAY_PAIRING_EVENT
+
 # Reads MOESH_RELAY_RECEIVER from the environment and defaults to an empty string; supplies the default --receiver host for the relay CLI.
 DEFAULT_RECEIVER = os.environ.get(
     "MOESH_RELAY_RECEIVER", os.environ.get("MOESH_TUNNEL_RECEIVER", "")
@@ -75,10 +77,20 @@ def read_headers(sock: socket.socket) -> bytes:
 
 
 def splice(a: socket.socket, b: socket.socket, idle_timeout: int = 0) -> None:
-    """Pump bytes bidirectionally between sockets a and b until EOF or idle timeout."""
+    """Pump bytes bidirectionally, preserving TCP half-close semantics.
+
+    A direction that reaches EOF forwards it as ``SHUT_WR`` and leaves the
+    reverse direction open long enough to deliver its response.  The previous
+    implementation shut the *read* side of the surviving direction, so a client
+    that half-closed after its request never saw the reply.
+
+    ``idle_timeout`` bounds an otherwise idle session; when either direction
+    times out the session is torn down rather than parked in CLOSE_WAIT.
+    """
     if idle_timeout > 0:
         a.settimeout(idle_timeout)
         b.settimeout(idle_timeout)
+    done = threading.Event()
 
     def copy(src: socket.socket, dst: socket.socket) -> None:
         try:
@@ -92,16 +104,24 @@ def splice(a: socket.socket, b: socket.socket, idle_timeout: int = 0) -> None:
         finally:
             with contextlib.suppress(OSError):
                 dst.shutdown(socket.SHUT_WR)
-            with contextlib.suppress(OSError):
-                dst.shutdown(socket.SHUT_RD)
+            done.set()
 
-    t = threading.Thread(target=copy, args=(a, b), daemon=True)
-    t.start()
-    copy(b, a)
+    workers = [
+        threading.Thread(target=copy, args=(a, b), daemon=True),
+        threading.Thread(target=copy, args=(b, a), daemon=True),
+    ]
+    for worker_thread in workers:
+        worker_thread.start()
+    done.wait()
+    linger = float(max(idle_timeout, 30))
+    deadline = time.time() + linger
+    for worker_thread in workers:
+        worker_thread.join(max(0.0, deadline - time.time()))
     for s in (a, b):
         with contextlib.suppress(OSError):
-            s.shutdown(socket.SHUT_RD)
-    t.join(timeout=5)
+            s.shutdown(socket.SHUT_RDWR)
+    for worker_thread in workers:
+        worker_thread.join(1.0)
     for s in (a, b):
         with contextlib.suppress(OSError):
             s.close()
@@ -111,12 +131,14 @@ class RelayRefused(Exception):
     """The receiver refused this carrier (e.g. 409: another carrier holds the port or name)."""
 
 
-def fetch_status(host: str, port: int) -> dict[str, Any]:
+def fetch_status(host: str, port: int, auth_token: str = "") -> dict[str, Any]:
     """Query ``GET /__moesh/status`` on the receiver and return the parsed JSON."""
+    auth = f"X-Moesh-Relay-Auth: {auth_token}\r\n" if auth_token else ""
     with socket.create_connection((host, port), timeout=10) as sock:
         req = (
             f"GET /__moesh/status HTTP/1.1\r\n"
             f"Host: {host}\r\n"
+            f"{auth}"
             "Connection: close\r\n\r\n"
         ).encode()
         sock.sendall(req)
@@ -136,10 +158,10 @@ def fetch_status(host: str, port: int) -> dict[str, Any]:
     return result
 
 
-def print_probe(host: str, port: int) -> int:
+def print_probe(host: str, port: int, auth_token: str = "") -> int:
     """Fetch and print receiver port and host status."""
     try:
-        data = fetch_status(host, port)
+        data = fetch_status(host, port, auth_token)
     except Exception as exc:
         log(f"probe failed against {host}:{port}: {exc}")
         return 1
@@ -153,14 +175,28 @@ def connect_tunnel(
     path: str,
     carrier_id: str = "",
     remote_port: int = 0,
-) -> tuple[socket.socket, int, bytes]:
+    *,
+    auth_token: str = "",
+    pairing_event: bool = True,
+    header_timeout: float = 20.0,
+) -> tuple[socket.socket, int, bytes, bool]:
     """Dial receiver and perform HTTP/1.1 Upgrade to enter raw pipe mode.
 
-    Returns ``(sock, assigned_remote_port, leftover_bytes)``.
+    With ``pairing_event`` the carrier asks the bridge to defer the 101 until a
+    peer is paired and to announce the pairing with a marker.  That lets the
+    backend connection be opened on pairing instead of on first peer byte,
+    which server-first protocols (SMTP, MySQL, some TLS servers) require.
+
+    Returns ``(sock, assigned_remote_port, leftover_bytes, event_mode)``.
+    ``event_mode`` is True only when the receiver acknowledged the mode; an
+    older receiver keeps the legacy data-driven pairing.
     """
     sock = socket.create_connection((host, port), timeout=20)
+    sock.settimeout(header_timeout)
     key = base64.b64encode(os.urandom(16)).decode()
     port_hdr = f"X-Moesh-Relay-Port: {remote_port}\r\n" if remote_port > 0 else ""
+    pairing_hdr = "X-Moesh-Relay-Pairing: event\r\n" if pairing_event else ""
+    auth_hdr = f"X-Moesh-Relay-Auth: {auth_token}\r\n" if auth_token else ""
     req = (
         f"GET {path} HTTP/1.1\r\n"
         f"Host: {host}\r\n"
@@ -169,7 +205,7 @@ def connect_tunnel(
         f"Sec-WebSocket-Key: {key}\r\n"
         "Sec-WebSocket-Version: 13\r\n"
         f"X-Moesh-Relay-Id: {carrier_id}\r\n"
-        f"{port_hdr}\r\n"
+        f"{port_hdr}{pairing_hdr}{auth_hdr}\r\n"
     ).encode()
     sock.sendall(req)
     headers = read_headers(sock)
@@ -187,12 +223,17 @@ def connect_tunnel(
             raise RelayRefused(body or first_line)
         raise ConnectionError(f"upgrade refused by receiver: {body or first_line}")
     assigned = remote_port
+    event_mode = False
     for line in head.split(b"\r\n")[1:]:
-        if line.lower().startswith(b"x-moesh-relay-port:"):
+        low = line.lower()
+        if low.startswith(b"x-moesh-relay-port:"):
             val = line.split(b":", 1)[1].strip().decode("latin-1", "replace")
             if val.isdigit():
                 assigned = int(val)
-    return sock, assigned, leftover
+        elif low.startswith(b"x-moesh-relay-pairing:"):
+            value = line.split(b":", 1)[1].strip().decode("latin-1", "replace")
+            event_mode = value == RELAY_PAIRING_EVENT
+    return sock, assigned, leftover, event_mode
 
 
 def _serve_session(
@@ -234,6 +275,7 @@ def worker(
     claim_deadline: float = 0.0,
     remote_port: int = 0,
     session_idle: int = DEFAULT_SESSION_IDLE,
+    token: str = "",
 ) -> None:
     """Worker maintaining one queued standby tunnel at a time.
 
@@ -247,8 +289,14 @@ def worker(
     while True:
         sock = None
         try:
-            sock, assigned_port, leftover = connect_tunnel(
-                host, port, path, carrier_id, remote_port=remote_port
+            sock, assigned_port, leftover, event_mode = connect_tunnel(
+                host,
+                port,
+                path,
+                carrier_id,
+                remote_port=remote_port,
+                auth_token=token,
+                header_timeout=float(max(idle, 20)),
             )
             if not _port_logged and assigned_port > 0:
                 _port_logged = True
@@ -257,9 +305,23 @@ def worker(
                     f"local {target_host}:{target_port}"
                 )
             sock.settimeout(idle)
-            first = leftover or sock.recv(65536)
-            if not first:
-                raise ConnectionError("paired then immediately closed before data")
+            if event_mode:
+                # The bridge sends the 101 only when a peer is paired, then a
+                # fixed marker.  On that signal the backend is connected before
+                # any peer byte exists, so greeting-first services work.
+                preamble = leftover
+                while len(preamble) < len(RELAY_PAIR_MARKER):
+                    chunk = sock.recv(65536)
+                    if not chunk:
+                        raise ConnectionError("receiver closed before pairing")
+                    preamble += chunk
+                if not preamble.startswith(RELAY_PAIR_MARKER):
+                    raise ConnectionError("unexpected pairing preamble from receiver")
+                first = preamble[len(RELAY_PAIR_MARKER) :]
+            else:
+                first = leftover or sock.recv(65536)
+                if not first:
+                    raise ConnectionError("paired then immediately closed before data")
             sock.settimeout(None)
             threading.Thread(
                 target=_serve_session,
@@ -335,6 +397,14 @@ def main(argv: list[str] | None = None) -> int:
         help="Carrier identity (default: random per process)",
     )
     ap.add_argument(
+        "--token",
+        default=os.environ.get("MOESH_RELAY_TOKEN", ""),
+        help=(
+            "Shared relay token required by the receiver when "
+            "MOESH_BRIDGE_RELAY_TOKEN is set (or set MOESH_RELAY_TOKEN)"
+        ),
+    )
+    ap.add_argument(
         "--claim-wait",
         type=float,
         default=2.0,
@@ -369,7 +439,7 @@ def main(argv: list[str] | None = None) -> int:
             port = parts.port or port
         if not host:
             ap.error("no receiver specified: provide --receiver or set MOESH_RELAY_RECEIVER")
-        return print_probe(host, port)
+        return print_probe(host, port, args.token)
 
     req_remote_port = 0
     if args.url:
@@ -431,6 +501,7 @@ def main(argv: list[str] | None = None) -> int:
                 claim_deadline,
                 req_remote_port,
                 args.session_idle,
+                args.token,
             ),
             daemon=True,
         ).start()

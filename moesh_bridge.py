@@ -5,16 +5,17 @@ import importlib.util
 import sys
 from pathlib import Path
 
-_candidates = [
-    Path(__file__).resolve().parent / "moesh-bridge.py",
-    Path.cwd() / "moesh-bridge.py",
-    Path("/usr/local/bin/moesh-bridge.py"),
-]
-_script_path: Path | None = next((p for p in _candidates if p.is_file()), None)
-if _script_path is None:
+# Exactly one location: the directory this module was imported from.  The
+# wheel force-includes moesh-bridge.py beside this wrapper, and in a source
+# checkout the two files sit together as well.  Searching the working
+# directory or /usr/local/bin instead would let a stale copy elsewhere on the
+# box answer for this install, which is undeclared filesystem state.
+_script_path = Path(__file__).resolve().parent / "moesh-bridge.py"
+if not _script_path.is_file():
     raise ImportError(
-        f"Cannot locate 'moesh-bridge.py' in any expected location: "
-        f"{[str(p) for p in _candidates]}"
+        f"Cannot locate 'moesh-bridge.py' next to {__file__}: {_script_path} "
+        "does not exist.  Reinstall the package (the file must ship beside "
+        "moesh_bridge.py) or run moesh-bridge.py from the source checkout."
     )
 
 _spec = importlib.util.spec_from_file_location("moesh_bridge_impl", _script_path)

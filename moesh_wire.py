@@ -39,3 +39,14 @@ MAX_DATA_PAYLOAD: int = 32768
 # Maximum plaintext payload in bytes for one control record.
 MAX_CONTROL_PAYLOAD: int = 4096
 """Maximum plaintext payload in bytes for a control record."""
+
+# Relay pairing mode where the bridge withholds the 101 until a peer is
+# actually paired.  The carrier can then open its backend connection before
+# any peer byte exists, which is what server-first protocols require.
+RELAY_PAIRING_EVENT: str = "event"
+"""Relay pairing mode: deferred 101 plus an explicit pairing marker."""
+
+# Written by the bridge immediately before peer bytes in event-pairing mode.
+# The carrier consumes exactly these bytes; everything after them is payload.
+RELAY_PAIR_MARKER: bytes = b"MOESH_PAIRED_V1\n"
+"""Preamble written by the bridge when a relay carrier is paired."""
