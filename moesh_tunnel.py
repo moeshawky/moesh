@@ -1022,7 +1022,14 @@ def run_session(
         # report.  Ask the transport first, the socket second.
         records = secure.buffered()
         if sock in ready:
-            records += secure.drain()
+            try:
+                records += secure.drain()
+            except proto.TransportEOF:
+                log(
+                    "run_session: transport EOF while draining "
+                    "(peer closed) at %s" % time.strftime("%H:%M:%S")
+                )
+                raise
         for msg_type, payload in records:
             last_rx = time.time()
             if msg_type == Msg.DATA:
@@ -1273,7 +1280,10 @@ def tunnel_worker(host: str, port: int, path: str, name: str, pool: ShellPool) -
             )
             time.sleep(AUTH_BACKOFF)
         except TransportEOF:
-            log("transport ended without an authenticated close (abrupt EOF)")
+            log(
+                "transport ended without an authenticated close (abrupt EOF) at %s; re-dialing"
+                % time.strftime("%H:%M:%S")
+            )
             # The peer closed the transport; the bridge is still up, so re-dial
             # immediately instead of waiting out the backoff.  The backoff is for
             # a genuinely unreachable receiver, not for a client that went away.
