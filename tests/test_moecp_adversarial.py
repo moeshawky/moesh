@@ -240,7 +240,9 @@ def test_worker_handles_tampered_payload_rollback(tmp_path: Path) -> None:
             {
                 "op": "FILE_START",
                 "rel_path": "tampered.bin",
-                "size": 11,
+                # The declared size matches the payload so this fixture exercises
+                # the digest path; the size bound has its own regression.
+                "size": len(b"tampered content"),
                 "mode": 0o644,
                 "mtime": 100,
                 "sha256": "expected_valid_sha256_that_does_not_match",

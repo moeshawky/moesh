@@ -30,6 +30,7 @@ import argparse
 import base64
 import contextlib
 import dataclasses
+import fcntl
 import hashlib
 import json
 import os
@@ -45,7 +46,7 @@ import zlib
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterator
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -84,6 +85,26 @@ MAX_FRAME_HDR: int = 65536
 MAX_FRAME_PAYLOAD: int = 10485760
 """Maximum allowed chunk payload size in bytes (10 MiB)."""
 
+# Maximum bytes one compressed frame may decode to.  The sender slices files at
+# CHUNK_SIZE, so a conforming peer never exceeds this; anything larger is a
+# decompression bomb and is refused before the bytes are materialised.
+MAX_DECOMPRESSED_CHUNK: int = CHUNK_SIZE
+"""Upper bound on the decoded size of a single compressed frame."""
+
+# A manifest that fits in this many JSON bytes is sent inline (one frame), which
+# keeps an older peer working on ordinary trees.  Anything larger is paginated so
+# no frame approaches MAX_FRAME_HDR.
+MANIFEST_INLINE_LIMIT: int = 32768
+"""Largest manifest JSON sent as a single inline frame."""
+
+# Entries per paginated manifest frame; 256 long paths stay far below 64 KiB.
+MANIFEST_PAGE_SIZE: int = 256
+"""Number of manifest entries per paginated frame."""
+
+# Suffix used for the advisory lock taken while a destination is being written.
+DESTINATION_LOCK_SUFFIX = ".moecp-lock"
+"""Suffix of the per-destination advisory lock file."""
+
 # Handshake token bytes emitted by the remote bootstrap worker after switching to raw framed mode.
 MAGIC_READY: bytes = b"MOECP_READY_V1\n"
 """Handshake token emitted by the remote bootstrap worker once in raw mode."""
@@ -108,6 +129,233 @@ def is_precompressed(path: str) -> bool:
     """Return True if the given file path has an extension indicating pre-compressed data."""
     _, ext = os.path.splitext(path)
     return ext.lower() in PRECOMPRESSED_EXTS
+
+
+class PathEscapeError(ValueError):
+    """A transfer path would resolve outside its designated destination root."""
+
+
+class TransferBusyError(RuntimeError):
+    """Another writer currently holds the lease on the destination."""
+
+
+def decompress_chunk(data: bytes, limit: int = MAX_DECOMPRESSED_CHUNK) -> bytes:
+    """Decode one zlib frame with a hard output bound.
+
+    ``zlib.decompress`` validates the stream but allocates however much the
+    stream expands to, so a small frame can demand arbitrary memory.  The
+    decoder is therefore driven with an explicit ``max_length`` and refuses a
+    frame that would decode past ``limit`` instead of growing to fit it.
+
+    Args:
+        data: Compressed frame bytes from the peer.
+        limit: Maximum accepted decoded size in bytes.
+
+    Returns:
+        The decoded bytes (never longer than ``limit``).
+
+    Raises:
+        ProtocolError: On a malformed stream, trailing bytes, truncation, or
+            decoded output beyond ``limit``.
+    """
+    decoder = zlib.decompressobj()
+    try:
+        out = decoder.decompress(data, limit + 1)
+    except zlib.error as err:
+        raise ProtocolError(f"malformed compressed chunk: {err}") from err
+    if len(out) > limit:
+        raise ProtocolError(
+            f"compressed frame decodes to more than {limit} bytes (bound refused)"
+        )
+    if decoder.unconsumed_tail:
+        raise ProtocolError(
+            f"compressed frame expands beyond the {limit}-byte chunk bound"
+        )
+    if not decoder.eof:
+        raise ProtocolError("truncated compressed stream")
+    if decoder.unused_data:
+        raise ProtocolError("trailing bytes after the compressed stream")
+    return out
+
+
+def pull_transfer_id(dest_file: str, size: int, mtime: float, content_sha: str) -> str:
+    """Return the ledger identity of one PULL destination.
+
+    The identity includes the *current remote content digest*, so a source that
+    changed while keeping its size and mtime cannot inherit an older commit.
+    """
+    return hashlib.sha256(
+        f"pull:{dest_file}:{size}:{mtime!r}:{content_sha}".encode()
+    ).hexdigest()[:16]
+
+
+def _lock_directory() -> str:
+    """Return the directory holding destination leases.
+
+    Leases live outside the transferred tree: a destination directory is user
+    data, and a transfer must not leave bookkeeping files in it (nor require it
+    to be writable just to take the lease).
+    """
+    override = os.environ.get("MOECP_LOCK_DIR")
+    if override:
+        return override
+    ledger = os.environ.get("MOECP_CLIENT_LEDGER_PATH") or os.environ.get(
+        "MOECP_LEDGER_PATH"
+    )
+    if ledger:
+        return os.path.join(os.path.dirname(os.path.abspath(ledger)), "locks")
+    return os.path.expanduser("~/.local/state/moesh/locks")
+
+
+@contextlib.contextmanager
+def destination_lock(dest_file: str) -> Any:
+    """Hold an exclusive advisory lease on one destination file.
+
+    Staging files are keyed by destination and content, so two clients writing
+    the same destination would otherwise interleave in the same staging file.
+    The second writer is refused instead of corrupting the first transfer.
+
+    Raises:
+        TransferBusyError: When another process (or file description) holds it.
+    """
+    lock_dir = _lock_directory()
+    os.makedirs(lock_dir, exist_ok=True)
+    key = hashlib.sha256(os.path.abspath(dest_file).encode()).hexdigest()[:32]
+    lock_fd = os.open(
+        os.path.join(lock_dir, key + ".lock"),
+        os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW,
+        0o600,
+    )
+    try:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as err:
+            raise TransferBusyError(
+                f"destination {dest_file} is busy with another transfer"
+            ) from err
+        yield
+    finally:
+        os.close(lock_fd)
+
+
+def _open_dir_chain(root: str, parts: list[str]) -> tuple[int, str]:
+    """Open the parent directory of ``parts`` under ``root`` without following symlinks.
+
+    Lexical containment (``abspath``/``commonpath``) does not establish
+    containment: an intermediate component that is a symlink carries every
+    later write outside the root.  Each component is therefore opened with
+    ``O_NOFOLLOW`` relative to its parent descriptor, which both refuses a
+    symlinked component and closes the check-then-create race.
+
+    Args:
+        root: Destination root; it is resolved once and is the trust anchor.
+        parts: Relative path components below ``root``.
+
+    Returns:
+        ``(dir_fd, final_name)`` where ``dir_fd`` is an open directory
+        descriptor for the parent and the caller owns it.
+
+    Raises:
+        PathEscapeError: If a component is a symlink, not a directory, or the
+            path is malformed.
+    """
+    if not parts:
+        raise PathEscapeError("empty destination path")
+    for part in parts:
+        if part in ("", ".", "..") or "/" in part or "\\" in part or "\0" in part:
+            raise PathEscapeError(f"unsafe path component: {part!r}")
+    root_real = os.path.realpath(root)
+    try:
+        fd = os.open(root_real, os.O_RDONLY | os.O_DIRECTORY)
+    except OSError as err:
+        raise PathEscapeError(f"destination root {root!r} is not a directory: {err}") from err
+    try:
+        for part in parts[:-1]:
+            try:
+                child = os.open(
+                    part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd
+                )
+            except FileNotFoundError:
+                os.mkdir(part, 0o755, dir_fd=fd)
+                child = os.open(
+                    part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd
+                )
+            except OSError as err:
+                raise PathEscapeError(
+                    f"path component {part!r} is not a real directory: {err}"
+                ) from err
+            os.close(fd)
+            fd = child
+        return fd, parts[-1]
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+class StagedFile:
+    """A destination file written through a verified staging file.
+
+    Bytes are only ever written to ``<name>.part.<id>`` inside a directory
+    descriptor that was opened without following symlinks.  ``commit`` renames
+    inside that descriptor and fsyncs it, so neither a symlinked component nor
+    a crash exposes a partial file under the final name.
+    """
+
+    def __init__(self, root: str, rel_parts: list[str], transfer_id: str) -> None:
+        """Resolve the destination directory and staging name."""
+        self.dir_fd, self.name = _open_dir_chain(root, rel_parts)
+        self.tmp_name = f"{self.name}.part.{transfer_id}"
+        self.root = root
+
+    def open(self, resume: bool = False) -> Any:
+        """Open the staging file, never following a symlink at its name."""
+        fd = os.open(
+            self.tmp_name,
+            os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=self.dir_fd,
+        )
+        if not resume:
+            os.ftruncate(fd, 0)
+        return os.fdopen(fd, "r+b")
+
+    def lock(self) -> Any:
+        """Return the exclusive destination lease for this staged file."""
+        return destination_lock(
+            os.path.join(os.path.realpath(self.root), self.name)
+        )
+
+    def commit(self) -> None:
+        """Atomically move staging to the final name and persist the directory entry."""
+        os.replace(
+            self.tmp_name, self.name, src_dir_fd=self.dir_fd, dst_dir_fd=self.dir_fd
+        )
+        os.fsync(self.dir_fd)
+
+    def discard(self) -> None:
+        """Remove the staging file, if any, without touching the final name."""
+        with contextlib.suppress(OSError):
+            os.unlink(self.tmp_name, dir_fd=self.dir_fd)
+
+    def close(self) -> None:
+        """Release the directory descriptor."""
+        with contextlib.suppress(OSError):
+            os.close(self.dir_fd)
+
+
+@contextlib.contextmanager
+def _discard_on_error(
+    staged: StagedFile, ledger: TransferLedger, transfer_id: str
+) -> Any:
+    """Discard staging on a contract failure while keeping it on a transport drop."""
+    try:
+        yield
+    except (TransportEOF, TimeoutError, OSError):
+        raise
+    except BaseException:
+        staged.discard()
+        ledger.clear_ranges(transfer_id)
+        raise
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Remote Bootstrap Worker Code
@@ -167,6 +415,13 @@ def recv_frame():
     payload = read_exact(dlen) if dlen > 0 else b""
     return meta, payload
 
+def decode_chunk(cdata, limit=32768):
+    dec = zlib.decompressobj()
+    out = dec.decompress(cdata, limit + 1)
+    if len(out) > limit or dec.unconsumed_tail or not dec.eof or dec.unused_data:
+        raise ValueError("compressed chunk exceeds the decoded chunk bound")
+    return out
+
 def sanitize_relpath(path):
     if not path or "\\0" in path:
         raise ValueError(f"invalid path: {path!r}")
@@ -212,20 +467,28 @@ def run():
                 send_frame({"status": "ERROR", "message": str(e)})
                 return 1
 
-            target_abs = os.path.abspath(target)
+            target_abs = os.path.realpath(os.path.abspath(target))
             if is_dir_upload:
-                dest_file = os.path.abspath(os.path.join(target, rel))
+                dest_file = os.path.join(target_abs, rel)
             elif dest_is_dir:
-                dest_file = os.path.abspath(os.path.join(target, os.path.basename(rel)))
+                dest_file = os.path.join(target_abs, os.path.basename(rel))
             else:
                 dest_file = target_abs
 
+            # Containment through the resolved filesystem, not lexically: an
+            # intermediate symlink must not carry the write outside the root.
+            dest_dir = os.path.dirname(dest_file) or "."
             try:
-                if os.path.commonpath([target_abs, dest_file]) != target_abs and dest_file != target_abs:
-                    send_frame({"status": "ERROR", "message": f"path escapes target directory: {dest_file}"})
-                    return 1
-            except ValueError:
-                send_frame({"status": "ERROR", "message": f"invalid target path: {dest_file}"})
+                os.makedirs(dest_dir, exist_ok=True)
+                parent_real = os.path.realpath(dest_dir)
+            except OSError as exc:
+                send_frame({"status": "ERROR", "message": f"invalid target path: {exc}"})
+                return 1
+            if parent_real != target_abs and not parent_real.startswith(target_abs + os.sep):
+                send_frame({"status": "ERROR", "message": f"path escapes target directory: {dest_file}"})
+                return 1
+            if os.path.islink(dest_file):
+                send_frame({"status": "ERROR", "message": f"refusing to replace symlink: {dest_file}"})
                 return 1
 
             size = msg.get("size", 0)
@@ -233,10 +496,9 @@ def run():
             mtime = msg.get("mtime", time.time())
             expected_sha = msg.get("sha256", "")
 
-            dest_dir = os.path.dirname(dest_file) or "."
-            os.makedirs(dest_dir, exist_ok=True)
             tmp_file = dest_file + ".part." + str(os.getpid())
             hasher = hashlib.sha256()
+            written = 0
 
             try:
                 with open(tmp_file, "wb") as f:
@@ -247,13 +509,16 @@ def run():
                         if cop == "CHUNK":
                             enc = cmsg.get("encoding", "zlib")
                             if enc == "zlib":
-                                raw = zlib.decompress(cdata)
+                                raw = decode_chunk(cdata)
                             elif enc == "raw":
                                 raw = cdata
                             else:
                                 raise ValueError(f"unsupported chunk encoding: {enc}")
+                            if written + len(raw) > size:
+                                raise ValueError("received more than the declared file size")
                             f.write(raw)
                             hasher.update(raw)
+                            written += len(raw)
                         elif cop == "FILE_END":
                             break
                         else:
@@ -613,6 +878,53 @@ class FramedStreamClient:
         payload = self._read_exact(dlen, deadline=deadline) if dlen > 0 else b""
         return meta, payload
 
+    def iter_manifest(self, manifest: dict[str, Any]) -> Any:
+        """Yield manifest entries from an inline or paginated PULL response.
+
+        A tree whose metadata does not fit one 64 KiB frame is paged by the
+        sender; the receiver asks for one page at a time so its memory is
+        bounded by a page rather than by the whole tree.
+
+        Args:
+            manifest: The ``OK`` frame that opened the PULL session.
+
+        Yields:
+            One entry dict per file (``rel``, ``size``, ``mode``, ``mtime``,
+            ``sha256``).
+        """
+        if not manifest.get("paginated"):
+            for item in manifest.get("files", []):
+                yield item
+            return
+        count = int(manifest.get("count", 0))
+        page_size = int(manifest.get("page_size", MANIFEST_PAGE_SIZE))
+        if page_size <= 0:
+            raise ProtocolError("manifest page_size must be positive")
+        page = 0
+        seen = 0
+        max_pages = (count // page_size) + 2
+        while True:
+            if page > max_pages:
+                raise ProtocolError(
+                    "manifest pagination ran past the declared entry count"
+                )
+            self.send_frame({"op": "LIST", "page": page})
+            reply, _ = self.recv_frame()
+            if reply.get("op") != "MANIFEST":
+                raise ProtocolError(
+                    f"expected MANIFEST, got {reply.get('op')!r}"
+                )
+            for item in reply.get("files", []):
+                seen += 1
+                yield item
+            if not reply.get("more"):
+                break
+            page += 1
+        if seen != count:
+            raise ProtocolError(
+                f"manifest declared {count} entries but delivered {seen}"
+            )
+
     def wait_for_ready(self, timeout: float = 15.0) -> None:
         """Wait for the remote worker ready banner, discarding initial shell output.
 
@@ -855,6 +1167,179 @@ def upload_files(
     return 0 if done_ack.get("status") == "DONE" else 1
 
 
+def _verified_prefix(
+    ledger: TransferLedger, staged: StagedFile, transfer_id: str
+) -> tuple[int, Any]:
+    """Re-hash the staged prefix and return ``(resume_offset, hasher)``.
+
+    Recorded progress is never trusted on its own: each ledger range is
+    re-hashed against the bytes actually on disk, and the first mismatch
+    truncates the range list at that offset.
+    """
+    hasher = hashlib.sha256()
+    try:
+        os.stat(staged.tmp_name, dir_fd=staged.dir_fd)
+    except OSError:
+        ledger.truncate_ranges_after(transfer_id, 0)
+        return 0, hasher
+    resume = 0
+    rows = ledger.get_verified_range_hashes(transfer_id)
+    if rows:
+        try:
+            read_fd = os.open(
+                staged.tmp_name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=staged.dir_fd
+            )
+            with os.fdopen(read_fd, "rb") as staged_reader:
+                for start_off, end_off, expected_chunk_sha in rows:
+                    if start_off != resume or end_off < start_off:
+                        break
+                    chunk_len = end_off - start_off
+                    disk_bytes = staged_reader.read(chunk_len)
+                    if (
+                        len(disk_bytes) != chunk_len
+                        or hashlib.sha256(disk_bytes).hexdigest() != expected_chunk_sha
+                    ):
+                        break
+                    hasher.update(disk_bytes)
+                    resume = end_off
+        except OSError:
+            ledger.truncate_ranges_after(transfer_id, 0)
+            return 0, hashlib.sha256()
+    ledger.truncate_ranges_after(transfer_id, resume)
+    return resume, hasher
+
+
+def _receive_pull_file(
+    client: FramedStreamClient,
+    ledger: TransferLedger,
+    item: dict[str, Any],
+    *,
+    root: str,
+    rel_parts: list[str],
+    dest_file: str,
+    preserve: bool,
+    quiet: bool,
+) -> str:
+    """Receive one PULL entry into its destination root.
+
+    Returns:
+        ``"skipped"`` when the destination already holds the *current* remote
+        content digest, or ``"committed"`` after a verified commit.
+
+    Raises:
+        TransferBusyError: Another writer holds the destination lease.
+        ProtocolError: Bounds, digest, or frame contract violated.
+        TransportEOF/TimeoutError/OSError: Keep staging for a later resume.
+    """
+    size = int(item["size"])
+    mode = int(item["mode"])
+    mtime = float(item["mtime"])
+    content_sha = str(item.get("sha256", ""))
+
+    if content_sha:
+        committed_id = pull_transfer_id(dest_file, size, mtime, content_sha)
+        if ledger.is_committed(committed_id) and os.path.exists(dest_file):
+            try:
+                if (
+                    os.path.getsize(dest_file) == size
+                    and compute_file_sha256(dest_file) == content_sha
+                ):
+                    return "skipped"
+            except OSError:
+                pass
+
+    pull_id = pull_transfer_id(dest_file, size, mtime, content_sha)
+    staged = StagedFile(root, rel_parts, pull_id)
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(staged.lock())
+        stack.callback(staged.close)
+        ledger.record_transfer(pull_id, dest_file, size, content_sha)
+        try:
+            resume_offset, hasher = _verified_prefix(ledger, staged, pull_id)
+            client.send_frame(
+                {"op": "PULL_FILE", "rel": item["rel"], "offset": resume_offset}
+            )
+            meter = ProgressMeter(item["rel"], size, quiet=quiet)
+            if resume_offset > 0:
+                meter.update(resume_offset)
+            offset = resume_offset
+            try:
+                with staged.open(resume=resume_offset > 0) as handle:
+                    if resume_offset > 0:
+                        handle.seek(resume_offset)
+                        handle.truncate(resume_offset)
+                    while True:
+                        cmsg, cdata = client.recv_frame()
+                        cop = cmsg.get("op")
+                        if cop == "CHUNK":
+                            enc = cmsg.get("encoding", "zlib")
+                            if enc == "zlib":
+                                raw = decompress_chunk(cdata)
+                            elif enc == "raw":
+                                raw = cdata
+                            else:
+                                raise ProtocolError(
+                                    f"unsupported chunk encoding: {enc}"
+                                )
+                            if offset + len(raw) > size:
+                                raise ProtocolError(
+                                    f"received more than the declared {size} bytes"
+                                )
+                            handle.write(raw)
+                            handle.flush()
+                            hasher.update(raw)
+                            chunk_sha = hashlib.sha256(raw).hexdigest()
+                            ledger.record_range(
+                                pull_id, offset, offset + len(raw), chunk_sha
+                            )
+                            offset += len(raw)
+                            meter.update(len(raw))
+                        elif cop == "FILE_END":
+                            expected_sha = str(cmsg.get("sha256", ""))
+                            meter.finish()
+                            break
+                        else:
+                            raise ProtocolError(f"unexpected chunk op: {cop}")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+
+                actual_sha = hasher.hexdigest()
+                if not expected_sha or actual_sha != expected_sha:
+                    raise ProtocolError(
+                        f"integrity failure on {item['rel']}: "
+                        f"{actual_sha} vs {expected_sha}"
+                    )
+                if content_sha and actual_sha != content_sha:
+                    raise ProtocolError(
+                        f"remote content for {item['rel']} changed during the transfer"
+                    )
+                if offset != size:
+                    raise ProtocolError(
+                        f"received {offset} bytes, expected {size} for {item['rel']}"
+                    )
+
+                staged.commit()
+                ledger.mark_committed(pull_id, actual_sha)
+                ledger.purge_committed_ranges(pull_id)
+
+                if preserve:
+                    with contextlib.suppress(Exception):
+                        os.chmod(dest_file, stat.S_IMODE(mode))
+                        os.utime(dest_file, (mtime, mtime))
+
+                client.send_frame({"status": "OK"})
+            except (TransportEOF, TimeoutError, OSError):
+                # Staging and verified ranges survive for the next attempt.
+                raise
+        except (TransportEOF, TimeoutError, OSError):
+            raise
+        except BaseException:
+            staged.discard()
+            ledger.clear_ranges(pull_id)
+            raise
+    return "committed"
+
+
 def download_files(
     client: FramedStreamClient,
     source_spec: PathSpec,
@@ -909,181 +1394,71 @@ def download_files(
         return 1
 
     is_dir = manifest.get("is_dir", False)
-    files = manifest.get("files", [])
-    summary.total = len(files)
-    target_is_dir = os.path.isdir(local_target)
-
-    target_abs = os.path.abspath(local_target)
+    summary.total = int(
+        manifest.get("count", 0)
+        if manifest.get("paginated")
+        else len(manifest.get("files", []))
+    )
+    target_abs = os.path.realpath(os.path.abspath(local_target))
     if is_dir:
         os.makedirs(target_abs, exist_ok=True)
+    target_is_dir = os.path.isdir(target_abs)
 
-    for item in files:
+    for item in client.iter_manifest(manifest):
         try:
-            rel = sanitize_relpath(item["rel"])
-        except ValueError as err:
+            rel = sanitize_relpath(str(item["rel"]))
+            root, rel_parts = _pull_destination_layout(
+                target_abs, rel, is_dir=is_dir, target_is_dir=target_is_dir
+            )
+            dest_file = os.path.join(root, *rel_parts)
+        except (KeyError, TypeError, ValueError) as err:
             sys.stderr.write(f"moecp: remote path rejected: {err}\n")
             client.send_frame({"status": "ERROR"})
             summary.failed += 1
             summary.print_summary()
             return 1
 
-        size = item["size"]
-        mode = item["mode"]
-        mtime = item["mtime"]
-
-        if is_dir:
-            dest_file = os.path.abspath(os.path.join(local_target, rel))
-        elif target_is_dir:
-            dest_file = os.path.abspath(os.path.join(local_target, os.path.basename(rel)))
-        else:
-            dest_file = target_abs
-
         try:
-            if os.path.commonpath([target_abs, dest_file]) != target_abs and dest_file != target_abs:
-                sys.stderr.write(f"moecp: remote path escapes local target: {dest_file}\n")
-                client.send_frame({"status": "ERROR"})
-                summary.failed += 1
-                summary.print_summary()
-                return 1
-        except ValueError:
-            sys.stderr.write(f"moecp: invalid target path: {dest_file}\n")
+            outcome = _receive_pull_file(
+                client,
+                ledger,
+                item,
+                root=root,
+                rel_parts=rel_parts,
+                dest_file=dest_file,
+                preserve=preserve,
+                quiet=quiet,
+            )
+        except TransferBusyError as err:
+            sys.stderr.write(f"moecp: {err}\n")
             client.send_frame({"status": "ERROR"})
             summary.failed += 1
             summary.print_summary()
             return 1
-
-        dest_dir = os.path.dirname(dest_file) or "."
-        os.makedirs(dest_dir, exist_ok=True)
-        pull_id = hashlib.sha256(f"pull:{dest_file}:{size}:{mtime!r}".encode()).hexdigest()[:16]
-        tmp_file = dest_file + f".part.{pull_id}"
-
-        if ledger.is_committed(pull_id) and os.path.exists(dest_file):
-            try:
-                if os.path.getsize(dest_file) == size:
-                    expected_sha = ledger.get_expected_sha256(pull_id)
-                    disk_sha = compute_file_sha256(dest_file)
-                    if not expected_sha or disk_sha == expected_sha:
-                        if not expected_sha:
-                            ledger.record_transfer(pull_id, dest_file, size, disk_sha)
-                            ledger.mark_committed(pull_id, disk_sha)
-                        meter = ProgressMeter(rel, size, quiet=quiet)
-                        meter.finish()
-                        summary.skipped += 1
-                        continue
-            except OSError:
-                pass
-
-        ledger.record_transfer(pull_id, dest_file, size, "")
-
-        resume_offset = 0
-        hasher = hashlib.sha256()
-        if os.path.exists(tmp_file):
-            range_rows = ledger.get_verified_range_hashes(pull_id)
-            if range_rows:
-                try:
-                    with open(tmp_file, "rb") as rf:
-                        for start_off, end_off, expected_chunk_sha in range_rows:
-                            if start_off != resume_offset or end_off < start_off:
-                                break
-                            chunk_len = end_off - start_off
-                            disk_bytes = rf.read(chunk_len)
-                            if (
-                                len(disk_bytes) != chunk_len
-                                or hashlib.sha256(disk_bytes).hexdigest() != expected_chunk_sha
-                            ):
-                                break
-                            hasher.update(disk_bytes)
-                            resume_offset = end_off
-                except OSError:
-                    resume_offset = 0
-                    hasher = hashlib.sha256()
-            ledger.truncate_ranges_after(pull_id, resume_offset)
-        else:
-            ledger.truncate_ranges_after(pull_id, 0)
-
-        offset = resume_offset
-        client.send_frame({"op": "PULL_FILE", "rel": item["rel"], "offset": offset})
-
-        meter = ProgressMeter(rel, size, quiet=quiet)
-        if offset > 0:
-            meter.update(offset)
-
-        open_mode = "r+b" if offset > 0 else "wb"
-        try:
-            with open(tmp_file, open_mode) as f:
-                if offset > 0:
-                    f.seek(offset)
-                    f.truncate(offset)
-                while True:
-                    cmsg, cdata = client.recv_frame()
-                    cop = cmsg.get("op")
-                    if cop == "CHUNK":
-                        enc = cmsg.get("encoding", "zlib")
-                        if enc == "zlib":
-                            raw = zlib.decompress(cdata)
-                        elif enc == "raw":
-                            raw = cdata
-                        else:
-                            raise ValueError(f"unsupported chunk encoding: {enc}")
-                        f.write(raw)
-                        f.flush()
-                        hasher.update(raw)
-                        chunk_sha = hashlib.sha256(raw).hexdigest()
-                        ledger.record_range(pull_id, offset, offset + len(raw), chunk_sha)
-                        offset += len(raw)
-                        meter.update(len(raw))
-                    elif cop == "FILE_END":
-                        expected_sha = cmsg.get("sha256", "")
-                        meter.finish()
-                        break
-                    else:
-                        sys.stderr.write(f"moecp: unexpected chunk op: {cop}\n")
-                        if os.path.exists(tmp_file):
-                            os.remove(tmp_file)
-                        ledger.clear_ranges(pull_id)
-                        summary.failed += 1
-                        summary.print_summary()
-                        return 1
-
-                f.flush()
-                os.fsync(f.fileno())
-
-            actual_sha = hasher.hexdigest()
-            if not expected_sha or actual_sha != expected_sha:
-                if os.path.exists(tmp_file):
-                    os.remove(tmp_file)
-                ledger.clear_ranges(pull_id)
-                sys.stderr.write(f"moecp: integrity failure on {rel}: {actual_sha} vs {expected_sha}\n")
-                client.send_frame({"status": "ERROR"})
-                summary.failed += 1
-                summary.print_summary()
-                return 1
-
-            os.replace(tmp_file, dest_file)
-            ledger.mark_committed(pull_id, actual_sha)
-            ledger.purge_committed_ranges(pull_id)
-
-            if preserve:
-                with contextlib.suppress(Exception):
-                    os.chmod(dest_file, stat.S_IMODE(mode))
-                    os.utime(dest_file, (mtime, mtime))
-
-            client.send_frame({"status": "OK"})
-            summary.succeeded += 1
-        except (TransportEOF, TimeoutError, OSError):
-            # Preserve staging file for resumption on reconnect
+        except (TransportEOF, TimeoutError):
             summary.failed += 1
             summary.print_summary()
             raise
-        except Exception as e:
-            if os.path.exists(tmp_file):
-                with contextlib.suppress(Exception):
-                    os.remove(tmp_file)
-            sys.stderr.write(f"moecp: download failed for {rel}: {e}\n")
+        except OSError as err:
+            # A socket-level failure is recoverable by reconnecting.  A local
+            # filesystem failure is not, but it must not be mistaken for a
+            # successful transfer either; connect_and_run retries and the
+            # next attempt reports the same error rather than claiming success.
+            sys.stderr.write(f"moecp: download interrupted for {rel}: {err}\n")
+            summary.failed += 1
+            summary.print_summary()
+            raise
+        except Exception as err:
+            sys.stderr.write(f"moecp: download failed for {rel}: {err}\n")
             client.send_frame({"status": "ERROR"})
             summary.failed += 1
             summary.print_summary()
             return 1
+
+        if outcome == "skipped":
+            summary.skipped += 1
+        else:
+            summary.succeeded += 1
 
     client.send_frame({"op": "DONE"})
     done_ack, _ = client.recv_frame()
@@ -1127,11 +1502,21 @@ class TransferLedger:
         self.db_path = db_path
         self._init_db()
 
+    @contextlib.contextmanager
+    def _conn(self) -> Iterator[sqlite3.Connection]:
+        """Yield a database connection wrapped in a transaction, ensuring it is closed."""
+        conn = sqlite3.connect(self.db_path, timeout=10.0)
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
+
     def _init_db(self) -> None:
         parent = os.path.dirname(os.path.abspath(self.db_path))
         if parent:
             os.makedirs(parent, exist_ok=True)
-        with sqlite3.connect(self.db_path, timeout=10.0) as conn:
+        with self._conn() as conn:
             conn.execute("PRAGMA journal_mode=WAL;")
             conn.execute("PRAGMA auto_vacuum = INCREMENTAL;")
             conn.execute("""
@@ -1166,7 +1551,7 @@ class TransferLedger:
     ) -> None:
         """Inserts or replaces a transfer row with committed=0, total size, expected SHA-256, relative path, and timestamp (current time or updated_at)."""
         ts = time.time() if updated_at is None else updated_at
-        with sqlite3.connect(self.db_path, timeout=10.0) as conn:
+        with self._conn() as conn:
             conn.execute(
                 "INSERT OR REPLACE INTO transfers (transfer_id, rel_path, total_size, expected_sha256, committed, updated_at) VALUES (?, ?, ?, ?, 0, ?)",
                 (transfer_id, rel_path, total_size, expected_sha256, ts),
@@ -1180,7 +1565,7 @@ class TransferLedger:
         sha256: str,
     ) -> None:
         """Inserts or replaces a verified range row for transfer_id and updates that transfer's updated_at timestamp."""
-        with sqlite3.connect(self.db_path, timeout=10.0) as conn:
+        with self._conn() as conn:
             conn.execute(
                 "INSERT OR REPLACE INTO verified_ranges (transfer_id, start_offset, end_offset, sha256) VALUES (?, ?, ?, ?)",
                 (transfer_id, start, end, sha256),
@@ -1192,7 +1577,7 @@ class TransferLedger:
 
     def mark_committed(self, transfer_id: str, sha256: str | None = None) -> None:
         """Sets committed=1 and updated_at to the current time for transfer_id; when sha256 is provided it also updates expected_sha256."""
-        with sqlite3.connect(self.db_path, timeout=10.0) as conn:
+        with self._conn() as conn:
             if sha256:
                 conn.execute(
                     "UPDATE transfers SET committed=1, expected_sha256=?, updated_at=? WHERE transfer_id=?",
@@ -1206,7 +1591,7 @@ class TransferLedger:
 
     def get_expected_sha256(self, transfer_id: str) -> str:
         """Returns the stored expected SHA-256 string for transfer_id, or an empty string when the row or value is missing."""
-        with sqlite3.connect(self.db_path, timeout=10.0) as conn:
+        with self._conn() as conn:
             cur = conn.execute(
                 "SELECT expected_sha256 FROM transfers WHERE transfer_id=?",
                 (transfer_id,),
@@ -1216,7 +1601,7 @@ class TransferLedger:
 
     def get_verified_ranges(self, transfer_id: str) -> list[tuple[int, int]]:
         """Returns verified (start_offset, end_offset) tuples for transfer_id ordered by start_offset."""
-        with sqlite3.connect(self.db_path, timeout=10.0) as conn:
+        with self._conn() as conn:
             cur = conn.execute(
                 "SELECT start_offset, end_offset FROM verified_ranges WHERE transfer_id=? ORDER BY start_offset",
                 (transfer_id,),
@@ -1225,7 +1610,7 @@ class TransferLedger:
 
     def get_verified_range_hashes(self, transfer_id: str) -> list[tuple[int, int, str]]:
         """Returns verified (start_offset, end_offset, sha256) tuples for transfer_id ordered by start_offset."""
-        with sqlite3.connect(self.db_path, timeout=10.0) as conn:
+        with self._conn() as conn:
             cur = conn.execute(
                 "SELECT start_offset, end_offset, sha256 FROM verified_ranges WHERE transfer_id=? ORDER BY start_offset",
                 (transfer_id,),
@@ -1234,7 +1619,7 @@ class TransferLedger:
 
     def clear_ranges(self, transfer_id: str) -> None:
         """Deletes all verified_ranges rows associated with transfer_id."""
-        with sqlite3.connect(self.db_path, timeout=10.0) as conn:
+        with self._conn() as conn:
             conn.execute(
                 "DELETE FROM verified_ranges WHERE transfer_id=?",
                 (transfer_id,),
@@ -1242,7 +1627,7 @@ class TransferLedger:
 
     def truncate_ranges_after(self, transfer_id: str, offset: int) -> None:
         """Purge chunk ranges starting at or after offset upon verification fault."""
-        with sqlite3.connect(self.db_path, timeout=10.0) as conn:
+        with self._conn() as conn:
             conn.execute(
                 "DELETE FROM verified_ranges WHERE transfer_id=? AND start_offset >= ?",
                 (transfer_id, offset),
@@ -1250,7 +1635,7 @@ class TransferLedger:
 
     def purge_committed_ranges(self, transfer_id: str) -> None:
         """Purge chunk ranges for a committed transfer to prevent unbounded ledger growth."""
-        with sqlite3.connect(self.db_path, timeout=10.0) as conn:
+        with self._conn() as conn:
             conn.execute(
                 "DELETE FROM verified_ranges WHERE transfer_id=?",
                 (transfer_id,),
@@ -1261,7 +1646,7 @@ class TransferLedger:
     def prune_stale_transfers(self, days: int = 7) -> int:
         """Purge uncommitted transfers and orphaned chunk ranges older than TTL days."""
         cutoff = time.time() - (days * 86400.0)
-        with sqlite3.connect(self.db_path, timeout=10.0) as conn:
+        with self._conn() as conn:
             cur = conn.execute(
                 "SELECT transfer_id, rel_path FROM transfers WHERE committed=0 AND updated_at < ?",
                 (cutoff,),
@@ -1283,13 +1668,136 @@ class TransferLedger:
 
     def is_committed(self, transfer_id: str) -> bool:
         """Returns True only when a transfers row exists for transfer_id with committed equal to 1."""
-        with sqlite3.connect(self.db_path, timeout=10.0) as conn:
+        with self._conn() as conn:
             cur = conn.execute(
                 "SELECT committed FROM transfers WHERE transfer_id=?",
                 (transfer_id,),
             )
             row = cur.fetchone()
             return bool(row and row[0] == 1)
+
+
+def _pull_destination_layout(
+    target_abs: str, rel: str, *, is_dir: bool, target_is_dir: bool
+) -> tuple[str, list[str]]:
+    """Return the containment root and relative components for one PULL entry."""
+    parts = rel.split("/")
+    if is_dir:
+        return target_abs, parts
+    if target_is_dir:
+        return target_abs, [parts[-1]]
+    return os.path.dirname(target_abs) or os.sep, [os.path.basename(target_abs)]
+
+
+def _receive_push_file(
+    client: FramedStreamClient,
+    ledger: TransferLedger,
+    *,
+    root: str,
+    rel_parts: list[str],
+    dest_file: str,
+    size: int,
+    mode: int,
+    mtime: float,
+    expected_sha: str,
+    preserve: bool,
+) -> str:
+    """Receive one PUSH file into a verified staging file and commit it.
+
+    Returns:
+        ``"committed"`` after a verified commit, or ``"skipped"`` when the
+        destination already holds the exact expected digest.
+
+    Raises:
+        TransferBusyError: Another writer holds the destination lease.
+        ProtocolError: Bounds, digest, or frame contract violated.
+        TransportEOF/TimeoutError/OSError: Keep staging for a later resume.
+    """
+    transfer_id = hashlib.sha256(
+        f"{dest_file}:{size}:{expected_sha}".encode()
+    ).hexdigest()[:16]
+
+    staged = StagedFile(root, rel_parts, transfer_id)
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(staged.lock())
+        stack.callback(staged.close)
+        stack.enter_context(_discard_on_error(staged, ledger, transfer_id))
+        if expected_sha and ledger.is_committed(transfer_id) and os.path.exists(dest_file):
+            try:
+                if (
+                    os.path.getsize(dest_file) == size
+                    and compute_file_sha256(dest_file) == expected_sha
+                ):
+                    client.send_frame({"status": "COMMITTED", "sha256": expected_sha})
+                    return "skipped"
+            except OSError:
+                pass
+
+        ledger.record_transfer(transfer_id, dest_file, size, expected_sha)
+        resume_offset, hasher = _verified_prefix(ledger, staged, transfer_id)
+        received = resume_offset
+        with staged.open(resume=resume_offset > 0) as handle:
+            if resume_offset > 0:
+                handle.seek(resume_offset)
+                handle.truncate(resume_offset)
+            client.send_frame(
+                {
+                    "status": "READY",
+                    "transfer_id": transfer_id,
+                    "offset": resume_offset,
+                }
+            )
+            while True:
+                cmsg, cdata = client.recv_frame()
+                cop = cmsg.get("op")
+                if cop == "CHUNK":
+                    encoding = cmsg.get("encoding", "zlib")
+                    if encoding == "zlib":
+                        raw = decompress_chunk(cdata)
+                    elif encoding == "raw":
+                        raw = cdata
+                    else:
+                        raise ProtocolError(
+                            f"unsupported chunk encoding: {encoding}"
+                        )
+                    if received + len(raw) > size:
+                        raise ProtocolError(
+                            f"received more than the declared {size} bytes"
+                        )
+                    handle.write(raw)
+                    handle.flush()
+                    hasher.update(raw)
+                    chunk_sha = hashlib.sha256(raw).hexdigest()
+                    ledger.record_range(
+                        transfer_id, received, received + len(raw), chunk_sha
+                    )
+                    received += len(raw)
+                elif cop == "FILE_END":
+                    break
+                else:
+                    raise ProtocolError(f"unexpected chunk op: {cop}")
+            handle.flush()
+            os.fsync(handle.fileno())
+
+        actual_sha = hasher.hexdigest()
+        if not expected_sha or actual_sha != expected_sha:
+            raise ProtocolError(
+                f"checksum mismatch: {actual_sha} vs {expected_sha}"
+            )
+        if received != size:
+            raise ProtocolError(f"received {received} bytes, expected {size}")
+
+        staged.commit()
+        ledger.mark_committed(transfer_id, actual_sha)
+        ledger.purge_committed_ranges(transfer_id)
+
+        if preserve:
+            with contextlib.suppress(Exception):
+                os.chmod(dest_file, stat.S_IMODE(mode))
+                os.utime(dest_file, (mtime, mtime))
+
+        client.send_frame({"status": "OK", "sha256": actual_sha})
+        return "committed"
 
 
 def run_native_agent_transfer(
@@ -1336,138 +1844,51 @@ def run_native_agent_transfer(
                 client.send_frame({"status": "ERROR", "message": str(e)})
                 return
 
-            target_abs = os.path.abspath(target)
+            size = int(msg.get("size", 0))
+            mode = int(msg.get("mode", 0o644))
+            mtime = float(msg.get("mtime", time.time()))
+            expected_sha = str(msg.get("sha256", ""))
+            if size < 0:
+                client.send_frame({"status": "ERROR", "message": "negative size"})
+                return
+
+            target_abs = os.path.realpath(os.path.abspath(target))
             if is_dir_upload:
-                dest_file = os.path.abspath(os.path.join(target, rel))
+                root = target_abs
+                rel_parts = rel.split("/")
             elif dest_is_dir:
-                dest_file = os.path.abspath(os.path.join(target, os.path.basename(rel)))
+                root = target_abs
+                rel_parts = [os.path.basename(rel)]
             else:
-                dest_file = target_abs
+                root = os.path.dirname(target_abs) or os.sep
+                rel_parts = [os.path.basename(target_abs)]
+            dest_file = os.path.join(root, *rel_parts)
 
             try:
-                if os.path.commonpath([target_abs, dest_file]) != target_abs and dest_file != target_abs:
-                    client.send_frame({"status": "ERROR", "message": f"path escapes target directory: {dest_file}"})
-                    return
-            except ValueError:
-                client.send_frame({"status": "ERROR", "message": f"invalid target path: {dest_file}"})
+                _receive_push_file(
+                    client,
+                    ledger,
+                    root=root,
+                    rel_parts=rel_parts,
+                    dest_file=dest_file,
+                    size=size,
+                    mode=mode,
+                    mtime=mtime,
+                    expected_sha=expected_sha,
+                    preserve=preserve,
+                )
+            except TransferBusyError as err:
+                client.send_frame({"status": "ERROR", "message": str(err)})
                 return
-
-            size = msg.get("size", 0)
-            mode = msg.get("mode", 0o644)
-            mtime = msg.get("mtime", time.time())
-            expected_sha = msg.get("sha256", "")
-            transfer_id = hashlib.sha256(f"{dest_file}:{size}:{expected_sha}".encode()).hexdigest()[:16]
-
-            if ledger.is_committed(transfer_id) and os.path.exists(dest_file):
-                try:
-                    if (
-                        os.path.getsize(dest_file) == size
-                        and compute_file_sha256(dest_file) == expected_sha
-                    ):
-                        client.send_frame({"status": "COMMITTED", "sha256": expected_sha})
-                        continue
-                except OSError:
-                    pass
-
-            ledger.record_transfer(transfer_id, dest_file, size, expected_sha)
-
-            dest_dir = os.path.dirname(dest_file) or "."
-            os.makedirs(dest_dir, exist_ok=True)
-            tmp_file = dest_file + f".part.{transfer_id}"
-            hasher = hashlib.sha256()
-
-            resume_offset = 0
-            if os.path.exists(tmp_file):
-                range_rows = ledger.get_verified_range_hashes(transfer_id)
-                if range_rows:
-                    try:
-                        with open(tmp_file, "rb") as rf:
-                            for start_off, end_off, expected_chunk_sha in range_rows:
-                                if start_off != resume_offset or end_off < start_off:
-                                    break
-                                chunk_len = end_off - start_off
-                                disk_bytes = rf.read(chunk_len)
-                                if (
-                                    len(disk_bytes) != chunk_len
-                                    or hashlib.sha256(disk_bytes).hexdigest() != expected_chunk_sha
-                                ):
-                                    break
-                                hasher.update(disk_bytes)
-                                resume_offset = end_off
-                    except OSError:
-                        resume_offset = 0
-                        hasher = hashlib.sha256()
-                ledger.truncate_ranges_after(transfer_id, resume_offset)
-            else:
-                ledger.truncate_ranges_after(transfer_id, 0)
-
-            open_mode = "r+b" if resume_offset > 0 else "wb"
-            try:
-                with open(tmp_file, open_mode) as f:
-                    if resume_offset > 0:
-                        f.seek(resume_offset)
-                        f.truncate(resume_offset)
-                    client.send_frame(
-                        {"status": "READY", "transfer_id": transfer_id, "offset": resume_offset}
-                    )
-                    offset = resume_offset
-                    while True:
-                        cmsg, cdata = client.recv_frame()
-                        cop = cmsg.get("op")
-                        if cop == "CHUNK":
-                            encoding = cmsg.get("encoding", "zlib")
-                            if encoding == "zlib":
-                                raw = zlib.decompress(cdata)
-                            elif encoding == "raw":
-                                raw = cdata
-                            else:
-                                raise ValueError(f"unsupported chunk encoding: {encoding}")
-                            f.write(raw)
-                            f.flush()
-                            hasher.update(raw)
-                            chunk_sha = hashlib.sha256(raw).hexdigest()
-                            ledger.record_range(transfer_id, offset, offset + len(raw), chunk_sha)
-                            offset += len(raw)
-                        elif cop == "FILE_END":
-                            break
-                        else:
-                            client.send_frame({"status": "ERROR", "message": f"unexpected chunk op: {cop}"})
-                            if os.path.exists(tmp_file):
-                                os.remove(tmp_file)
-                            ledger.clear_ranges(transfer_id)
-                            return
-
-                    f.flush()
-                    os.fsync(f.fileno())
-
-                actual_sha = hasher.hexdigest()
-                if not expected_sha or actual_sha != expected_sha:
-                    if os.path.exists(tmp_file):
-                        os.remove(tmp_file)
-                    ledger.clear_ranges(transfer_id)
-                    client.send_frame({"status": "ERROR", "message": f"checksum mismatch: {actual_sha} vs {expected_sha}"})
-                    return
-
-                os.replace(tmp_file, dest_file)
-                ledger.mark_committed(transfer_id, actual_sha)
-                ledger.purge_committed_ranges(transfer_id)
-
-                if preserve:
-                    with contextlib.suppress(Exception):
-                        os.chmod(dest_file, stat.S_IMODE(mode))
-                        os.utime(dest_file, (mtime, mtime))
-
-                client.send_frame({"status": "OK", "sha256": actual_sha})
             except (TransportEOF, TimeoutError, ConnectionError):
-                # Preserve staging file and verified ranges on network drop for resumption
+                # Preserve staging file and verified ranges for resumption.
                 return
-            except Exception as e:
-                if os.path.exists(tmp_file):
-                    with contextlib.suppress(Exception):
-                        os.remove(tmp_file)
+            except OSError as err:
                 with contextlib.suppress(Exception):
-                    ledger.clear_ranges(transfer_id)
-                client.send_frame({"status": "ERROR", "message": str(e)})
+                    client.send_frame({"status": "ERROR", "message": str(err)})
+                return
+            except Exception as err:
+                client.send_frame({"status": "ERROR", "message": str(err)})
                 return
 
     elif direction == "PULL":
@@ -1503,11 +1924,33 @@ def run_native_agent_transfer(
                 client.send_frame({"status": "ERROR", "message": str(e)})
                 return
 
-        client.send_frame({
-            "status": "OK",
-            "is_dir": is_dir,
-            "files": [{"rel": f["rel"], "size": f["size"], "mode": f["mode"], "mtime": f["mtime"]} for f in file_list],
-        })
+        entries = [
+            {"rel": f["rel"], "size": f["size"], "mode": f["mode"], "mtime": f["mtime"]}
+            for f in file_list
+        ]
+        # Decide inline vs paged before hashing: a placeholder digest has the
+        # same width as the real one, so the size decision is exact.
+        probe = [{**entry, "sha256": "0" * 64} for entry in entries]
+        inline = (
+            len(json.dumps({"is_dir": is_dir, "files": probe}))
+            <= MANIFEST_INLINE_LIMIT
+        )
+        if inline:
+            for entry, source_entry in zip(entries, file_list, strict=True):
+                digest = compute_file_sha256(source_entry["full"])
+                entry["sha256"] = digest
+                source_entry["sha256"] = digest
+            client.send_frame({"status": "OK", "is_dir": is_dir, "files": entries})
+        else:
+            client.send_frame(
+                {
+                    "status": "OK",
+                    "is_dir": is_dir,
+                    "paginated": True,
+                    "count": len(entries),
+                    "page_size": MANIFEST_PAGE_SIZE,
+                }
+            )
 
         file_map = {f["rel"]: f for f in file_list}
         file_iter = iter(file_list)
@@ -1517,6 +1960,26 @@ def run_native_agent_transfer(
             if op == "DONE":
                 client.send_frame({"status": "DONE"})
                 break
+            if op == "LIST":
+                page = max(0, int(req.get("page", 0)))
+                start = page * MANIFEST_PAGE_SIZE
+                page_entries = entries[start : start + MANIFEST_PAGE_SIZE]
+                page_sources = file_list[start : start + MANIFEST_PAGE_SIZE]
+                for entry, source_entry in zip(
+                    page_entries, page_sources, strict=True
+                ):
+                    digest = compute_file_sha256(source_entry["full"])
+                    entry["sha256"] = digest
+                    source_entry["sha256"] = digest
+                client.send_frame(
+                    {
+                        "op": "MANIFEST",
+                        "page": page,
+                        "files": page_entries,
+                        "more": start + len(page_entries) < len(entries),
+                    }
+                )
+                continue
             if op != "PULL_FILE":
                 client.send_frame({"status": "ERROR", "message": f"expected PULL_FILE, got {op}"})
                 return
@@ -1535,6 +1998,20 @@ def run_native_agent_transfer(
             offset = int(req.get("offset", 0))
             if offset < 0 or offset > item["size"]:
                 offset = 0
+
+            try:
+                current = os.stat(full_path)
+            except OSError as err:
+                client.send_frame({"status": "ERROR", "message": str(err)})
+                return
+            if current.st_size != item["size"] or current.st_mtime != item["mtime"]:
+                client.send_frame(
+                    {
+                        "status": "ERROR",
+                        "message": f"{full_path}: source changed since the manifest",
+                    }
+                )
+                return
 
             skip_comp = is_precompressed(full_path)
             hasher = hashlib.sha256()
@@ -1568,6 +2045,15 @@ def run_native_agent_transfer(
                             else:
                                 client.send_frame({"op": "CHUNK", "encoding": "raw"}, buf)
                 sha = hasher.hexdigest()
+                expected_sha = str(item.get("sha256", ""))
+                if expected_sha and sha != expected_sha:
+                    client.send_frame(
+                        {
+                            "status": "ERROR",
+                            "message": f"{full_path}: content changed during the transfer",
+                        }
+                    )
+                    return
                 client.send_frame({"op": "FILE_END", "sha256": sha})
                 ack, _ = client.recv_frame()
                 if ack.get("status") != "OK":

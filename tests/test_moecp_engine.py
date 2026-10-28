@@ -415,7 +415,9 @@ def test_native_agent_transfer_pull_byte_offset_resumption(
     dest_file = local_dest_dir / "bigfile.dat"
 
     st = os.stat(source_file)
-    pull_id = hashlib.sha256(f"pull:{dest_file}:{st.st_size}:{st.st_mtime!r}".encode()).hexdigest()[:16]
+    source_sha = hashlib.sha256(source_file.read_bytes()).hexdigest()
+    # The ledger identity now includes the source content digest (MOESH-001).
+    pull_id = moecp.pull_transfer_id(str(dest_file), st.st_size, st.st_mtime, source_sha)
 
     client_ledger_path = tmp_path / "client_ledger.db"
     monkeypatch.setenv("MOECP_CLIENT_LEDGER_PATH", str(client_ledger_path))
@@ -427,7 +429,7 @@ def test_native_agent_transfer_pull_byte_offset_resumption(
     with open(tmp_file, "wb") as f:
         f.write(content[:offset])
 
-    ledger.record_transfer(pull_id, str(dest_file), st.st_size, "")
+    ledger.record_transfer(pull_id, str(dest_file), st.st_size, source_sha)
     ledger.record_range(pull_id, 0, offset, hashlib.sha256(content[:offset]).hexdigest())
 
     s_agent, s_client = socket.socketpair()
@@ -951,12 +953,14 @@ def test_pull_cross_invocation_resumption_with_verified_ranges(
     # Client began downloading, wrote chunk 1 to dest_file.part.<pull_id>, recorded verified range,
     # then network disconnected before chunk 2 arrived.
     st = os.stat(source_file)
-    pull_id = hashlib.sha256(f"pull:{dest_file}:{st.st_size}:{st.st_mtime!r}".encode()).hexdigest()[:16]
+    source_sha = hashlib.sha256(source_file.read_bytes()).hexdigest()
+    # The ledger identity now includes the source content digest (MOESH-001).
+    pull_id = moecp.pull_transfer_id(str(dest_file), st.st_size, st.st_mtime, source_sha)
     part_file = local_dest_dir / f"resumable_pull.bin.part.{pull_id}"
     part_file.write_bytes(chunk1)
 
     ledger = moecp.TransferLedger(str(client_ledger_path))
-    ledger.record_transfer(pull_id, str(dest_file), st.st_size, "")
+    ledger.record_transfer(pull_id, str(dest_file), st.st_size, source_sha)
     chunk1_sha = hashlib.sha256(chunk1).hexdigest()
     ledger.record_range(pull_id, 0, len(chunk1), chunk1_sha)
 
@@ -1025,7 +1029,9 @@ def test_pull_committed_deduplication_and_rollback_detection(
 
     st = os.stat(source_file)
     content_sha = hashlib.sha256(content).hexdigest()
-    pull_id = hashlib.sha256(f"pull:{dest_file}:{st.st_size}:{st.st_mtime!r}".encode()).hexdigest()[:16]
+    source_sha = hashlib.sha256(source_file.read_bytes()).hexdigest()
+    # The ledger identity now includes the source content digest (MOESH-001).
+    pull_id = moecp.pull_transfer_id(str(dest_file), st.st_size, st.st_mtime, source_sha)
 
     # Pre-populate dest_file and mark as committed with expected SHA
     dest_file.write_bytes(content)
@@ -1138,7 +1144,9 @@ def test_partial_range_rollback_on_chunk_verification_fault(
     ledger = moecp.TransferLedger(str(client_ledger_path))
 
     st = os.stat(source_file)
-    pull_id = hashlib.sha256(f"pull:{dest_file}:{st.st_size}:{st.st_mtime!r}".encode()).hexdigest()[:16]
+    source_sha = hashlib.sha256(source_file.read_bytes()).hexdigest()
+    # The ledger identity now includes the source content digest (MOESH-001).
+    pull_id = moecp.pull_transfer_id(str(dest_file), st.st_size, st.st_mtime, source_sha)
 
     # Pre-simulate an interrupted download where chunk1 was valid, chunk2 was corrupted on disk,
     # and chunk3 had also been pre-recorded.
@@ -1146,7 +1154,7 @@ def test_partial_range_rollback_on_chunk_verification_fault(
     corrupted_chunk2 = b"X" * 32768
     part_file.write_bytes(chunk1 + corrupted_chunk2 + chunk3)
 
-    ledger.record_transfer(pull_id, str(dest_file), st.st_size, "")
+    ledger.record_transfer(pull_id, str(dest_file), st.st_size, source_sha)
     ledger.record_range(pull_id, 0, 32768, hashlib.sha256(chunk1).hexdigest())
     ledger.record_range(pull_id, 32768, 65536, hashlib.sha256(chunk2).hexdigest())
     ledger.record_range(pull_id, 65536, 98304, hashlib.sha256(chunk3).hexdigest())
