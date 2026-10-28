@@ -6,8 +6,56 @@ on:
   workflow_dispatch:
 
 jobs:
+  # Tag-triggered publishing must run the same gates CI runs.  Failure here
+  # blocks the publish job below: a release cannot ship a tree that fails its
+  # own tests, types, lint or packaging smoke test.
+  release-gate:
+    name: Release acceptance gate
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Sync dependencies
+        run: uv sync
+
+      - name: Lint
+        run: uv run ruff check .
+
+      - name: Type check
+        run: uv run mypy
+
+      - name: Test suite
+        run: uv run pytest -q
+
+      - name: Build sdist and wheel
+        run: uv build
+
+      - name: Check distributions
+        run: uv run twine check dist/*
+
+      - name: Clean wheel install and entry-point smoke test
+        run: bash scripts/smoke_wheel.sh dist
+
+      - name: Upload distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*
+
   pypi-publish:
     name: Build and publish Python distribution to PyPI
+    needs: release-gate
     runs-on: ubuntu-latest
     environment:
       name: pypi
@@ -28,20 +76,11 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Sync dependencies
-        run: uv sync
-
-      - name: Verify package quality gates
-        run: |
-          uv run ruff check .
-          uv run mypy
-          uv run pytest tests/test_protocol_core.py
-
-      - name: Build sdist and wheel
-        run: uv build
-
-      - name: Check distributions
-        run: uv run twine check dist/*
+      - name: Download distributions built by the gate
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
 
       - name: Publish package distributions to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
