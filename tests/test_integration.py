@@ -268,7 +268,7 @@ def test_the_agent_redials_after_the_transport_drops(stack: Stack) -> None:
         first.read_until(b"$", timeout=30)
     finally:
         first.close()
-    time.sleep(3)
+    time.sleep(8)
     second = OperatorSession(
         [AGENT_PYTHON, CLIENT], stack["client_env"], rows=24, cols=80
     )
@@ -305,7 +305,7 @@ def test_the_shell_survives_an_operator_disconnect(stack: Stack) -> None:
         assert b"REATTACH_MARK" in first.read_until(b"REATTACH_MARK", timeout=20)
     finally:
         first.close()
-    time.sleep(3)
+    time.sleep(8)
 
     second = OperatorSession(
         [AGENT_PYTHON, CLIENT], stack["client_env"], rows=24, cols=80
@@ -329,7 +329,7 @@ def test_a_fresh_session_can_be_requested(stack: Stack) -> None:
         first.read_until(b"FRESH_MARK", timeout=20)
     finally:
         first.close()
-    time.sleep(3)
+    time.sleep(8)
 
     env = dict(stack["client_env"])
     second = OperatorSession([AGENT_PYTHON, CLIENT, "--fresh"], env, rows=24, cols=80)

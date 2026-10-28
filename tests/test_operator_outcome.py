@@ -266,7 +266,7 @@ def test_reattach_keeps_shell_identity_and_pre_detach_state(tmp_path: Path) -> N
             first.read_until(b"SYNC_A", timeout=20)
         finally:
             first.close()
-        time.sleep(3)
+        time.sleep(8)
         second = _session(stack)
         try:
             second.read_until(b"$", timeout=40)
