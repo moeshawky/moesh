@@ -50,3 +50,15 @@ RELAY_PAIRING_EVENT: str = "event"
 # The carrier consumes exactly these bytes; everything after them is payload.
 RELAY_PAIR_MARKER: bytes = b"MOESH_PAIRED_V1\n"
 """Preamble written by the bridge when a relay carrier is paired."""
+
+
+# Written by the bridge to an operator socket when the tunnel it paired with is
+# dead (the agent-side worker walked away before or during the Noise handshake).
+# It must NOT start with a zero byte: a Noise frame starts with a 4-byte
+# big-endian length, whose first byte is zero for every frame this protocol
+# produces (max frame 65535 fits in two bytes), so a leading non-zero byte is
+# unambiguous against a frame.  The client reads it after sending its own first
+# handshake frame, never before (peeking first deadlocks: the receiver has
+# nothing to reply to until the client speaks).
+PAIR_DEAD_MARKER: bytes = b"\x01MOESH_DEAD_TUNNEL\n"
+"""Preamble the bridge writes when a paired tunnel is dead, so the client retries immediately."""

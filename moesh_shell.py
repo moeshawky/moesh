@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import fcntl
 import hashlib
 import json
@@ -50,10 +51,9 @@ if TYPE_CHECKING:
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import contextlib
-
 import moesh_proto as proto
 from moesh_proto import (
+    PAIR_DEAD_MARKER,
     AuthenticationError,
     Msg,
     NegotiationError,
@@ -459,8 +459,54 @@ def handshake(session: proto.NoiseSession, channel: proto.Channel) -> None:
     Raises:
         ProtocolError: the handshake failed.
         AuthenticationError: the agent's static key did not match the pin.
+        TransportEOF: the receiver reported a dead tunnel (retry immediately).
     """
     channel.send_frame(session.write_handshake())
+    # The receiver may report that the tunnel it paired with is dead (the
+    # agent-side worker walked away) by writing PAIR_DEAD_MARKER instead of a
+    # handshake frame.  Detect it before interpreting bytes as a frame: a frame
+    # starts with a 4-byte length whose first byte is zero, while the marker
+    # starts with a non-zero byte, so peeking the first byte is unambiguous.
+    # This check happens AFTER sending our first frame: peeking first would
+    # deadlock, because the receiver has nothing to reply to until we speak.
+    sock = channel.socket
+    orig_timeout = sock.gettimeout()
+    marker_deadline = time.time() + 1.0
+    while True:
+        try:
+            sock.setblocking(False)
+            peek = sock.recv(len(PAIR_DEAD_MARKER), socket.MSG_PEEK)
+            sock.setblocking(True)
+            sock.settimeout(orig_timeout)
+        except BlockingIOError:
+            sock.setblocking(True)
+            sock.settimeout(orig_timeout)
+            if time.time() >= marker_deadline:
+                break
+            time.sleep(0.01)
+            continue
+        except OSError:
+            sock.setblocking(True)
+            sock.settimeout(orig_timeout)
+            break
+        if not peek:
+            # EOF: the tunnel is gone.
+            sock.settimeout(orig_timeout)
+            raise TransportEOF("transport closed by peer during handshake")
+        if peek.startswith(PAIR_DEAD_MARKER):
+            # Consume the marker so it does not leak into the next attempt.
+            sock.setblocking(True)
+            sock.settimeout(orig_timeout)
+            with contextlib.suppress(OSError):
+                sock.recv(len(PAIR_DEAD_MARKER))
+            raise TransportEOF("dead tunnel marker received from receiver")
+        # A real frame (or partial) is present: stop peeking and let
+        # recv_frame do its job.
+        sock.setblocking(True)
+        sock.settimeout(orig_timeout)
+        break
+    sock.setblocking(True)
+    sock.settimeout(orig_timeout)
     session.read_handshake(channel.recv_frame())
     channel.send_frame(session.write_handshake())
     if not session.handshake_finished:
@@ -980,12 +1026,20 @@ def main(argv: list[str] | None = None) -> int:
             # the pool always allocated a new shell (B12 / G-SEM-1, measured
             # 2026-10-23).
             args.fresh = False
-            delay = min(2**attempt, 30)
-            log(
-                f"connection lost ({exc}); re-attaching in {delay}s — the remote shell "
-                f"keeps running"
-            )
-            time.sleep(delay)
+            # A dead tunnel fails fast (the receiver's PAIR_DEAD_MARKER or an
+            # immediate EOF during the handshake); retrying immediately clears it
+            # instead of making the operator wait out the backoff.  Later attempts
+            # keep the growing backoff so a genuinely down host is not hammered.
+            if isinstance(exc, TransportEOF) and attempt == 1:
+                delay = 0
+            else:
+                delay = 2 if attempt == 1 else min(2 ** (attempt - 1), 30)
+            if delay:
+                log(
+                    f"connection lost ({exc}); re-attaching in {delay}s — the remote shell "
+                    f"keeps running"
+                )
+                time.sleep(delay)
 
 
 def run_one_session(

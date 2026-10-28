@@ -55,6 +55,7 @@ from typing import TYPE_CHECKING, Any
 
 from moesh_wire import (
     DEFAULT_HOST,
+    PAIR_DEAD_MARKER,
     PRELUDE_PREFIX,
     RELAY_PAIR_MARKER,
     RELAY_PAIRING_EVENT,
@@ -1158,11 +1159,23 @@ def pair(
     ``on_detach`` runs once when one direction ends, so the caller can retire
     its active-pairing count without waiting out the drain.
     """
+    saw_dead = False
     try:
         log(f"{label} attached from {conn.getpeername()}")
         item: Any = None
-        while True:
-            item = q.get(timeout=wait)
+        nb: socket.socket | None = None
+        paired = False
+        while not paired:
+            try:
+                item = q.get(timeout=wait)
+            except queue.Empty:
+                # No tunnel arrived in time.  If we discarded a dead one along
+                # the way, tell the operator so it can retry immediately instead
+                # of waiting out its backoff (the dead-tunnel race).
+                if saw_dead:
+                    with contextlib.suppress(OSError):
+                        conn.sendall(PAIR_DEAD_MARKER)
+                raise
             nb = _sock_of(item)
             if isinstance(item, QueuedTunnel):
                 if not entry_is_current(item):
@@ -1175,11 +1188,40 @@ def pair(
                     with contextlib.suppress(OSError):
                         nb.close()
                     continue
-            if alive(nb):
-                break
-            log(f"discarding stale {label} tunnel")
-            with contextlib.suppress(OSError):
-                nb.close()
+            if not alive(nb):
+                # Dead tunnel (or TOCTOU close): discard and retry.
+                saw_dead = True
+                log(f"discarding stale {label} tunnel")
+                with contextlib.suppress(OSError):
+                    nb.close()
+                # If the agent died, no live tunnel will arrive from it; tell
+                # the operator to retry now instead of waiting out the queue
+                # timeout (the dead-tunnel race).
+                if live_queued(q) == 0:
+                    log(f"sending PAIR_DEAD_MARKER to {label} operator")
+                    with contextlib.suppress(OSError):
+                        conn.sendall(PAIR_DEAD_MARKER)
+                    with contextlib.suppress(OSError):
+                        conn.close()
+                    return
+                continue
+            # Final re-check right before pairing: closes the window between
+            # the peek above and the pump below as much as TCP allows.
+            if not alive(nb):
+                saw_dead = True
+                log(f"discarding stale {label} tunnel")
+                with contextlib.suppress(OSError):
+                    nb.close()
+                if live_queued(q) == 0:
+                    log(f"sending PAIR_DEAD_MARKER to {label} operator")
+                    with contextlib.suppress(OSError):
+                        conn.sendall(PAIR_DEAD_MARKER)
+                    with contextlib.suppress(OSError):
+                        conn.close()
+                    return
+                continue
+            paired = True
+        assert nb is not None and item is not None
         nb = _sock_of(item)
         log(f"pairing {label} with a host")
         # Both legs are unbounded once paired: a session may sit idle for
@@ -1203,6 +1245,12 @@ def pair(
         pump(nb, conn, on_half_close=on_detach)
     except queue.Empty:
         log(f"{label} connected but no {label} tunnel within {wait}s")
+        # If a dead tunnel was discarded along the way, signal the operator so
+        # it retries immediately instead of waiting out its backoff.
+        if saw_dead:
+            log(f"sending PAIR_DEAD_MARKER to {label} operator")
+            with contextlib.suppress(OSError):
+                conn.sendall(PAIR_DEAD_MARKER)
         with contextlib.suppress(OSError):
             conn.close()
 
