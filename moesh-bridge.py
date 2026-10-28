@@ -1229,6 +1229,22 @@ def pair(
         # the pair down without anyone noticing.
         conn.settimeout(None)
         nb.settimeout(None)
+        # Half-open peers (a client process that died without a clean FIN)
+        # would otherwise leave the pump blocked in recv() for minutes.  TCP
+        # keepalive makes the kernel probe and tear down such a leg promptly
+        # (the cause of the 3s-reconnect race in CI).  The bridge stays blind:
+        # socket options are transport-level, not decrypting.
+        for _sock in (conn, nb):
+            with contextlib.suppress(OSError):
+                _sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            for _opt, _val in (
+                (getattr(socket, "TCP_KEEPIDLE", None), 5),
+                (getattr(socket, "TCP_KEEPINTVL", None), 2),
+                (getattr(socket, "TCP_KEEPCNT", None), 3),
+            ):
+                if _opt is not None:
+                    with contextlib.suppress(OSError):
+                        _sock.setsockopt(socket.IPPROTO_TCP, _opt, _val)
         if isinstance(item, QueuedTunnel) and item.response:
             # Deferred handshake: the carrier has been waiting for this 101 so
             # it can open its backend connection before any peer byte exists.

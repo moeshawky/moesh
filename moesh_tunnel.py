@@ -1027,7 +1027,7 @@ def run_session(
             except proto.TransportEOF:
                 log(
                     "run_session: transport EOF while draining "
-                    "(peer closed) at %s" % time.strftime("%H:%M:%S")
+                    "(peer closed) at " + time.strftime("%H:%M:%S")
                 )
                 raise
         for msg_type, payload in records:
@@ -1100,6 +1100,18 @@ def serve_once(host: str, port: int, path: str, name: str, pool: ShellPool) -> s
     try:
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         leftover = http_upgrade(sock, host, port, path, name)
+        # Detect a dead peer (the bridge or the operator) without waiting for
+        # the application-level dead_after timeout.  Transport-level only.
+        with contextlib.suppress(OSError):
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        for _opt, _val in (
+            (getattr(socket, "TCP_KEEPIDLE", None), 5),
+            (getattr(socket, "TCP_KEEPINTVL", None), 2),
+            (getattr(socket, "TCP_KEEPCNT", None), 3),
+        ):
+            if _opt is not None:
+                with contextlib.suppress(OSError):
+                    sock.setsockopt(socket.IPPROTO_TCP, _opt, _val)
         log(
             f"upgraded (HTTP/1.1 101 Switching Protocols, token {proto.UPGRADE_TOKEN}, host {name})"
         )
@@ -1281,8 +1293,9 @@ def tunnel_worker(host: str, port: int, path: str, name: str, pool: ShellPool) -
             time.sleep(AUTH_BACKOFF)
         except TransportEOF:
             log(
-                "transport ended without an authenticated close (abrupt EOF) at %s; re-dialing"
-                % time.strftime("%H:%M:%S")
+                "transport ended without an authenticated close (abrupt EOF) at "
+                + time.strftime("%H:%M:%S")
+                + "; re-dialing"
             )
             # The peer closed the transport; the bridge is still up, so re-dial
             # immediately instead of waiting out the backoff.  The backoff is for
