@@ -61,6 +61,7 @@ import select
 import signal
 import socket
 import struct
+import subprocess
 import sys
 import termios
 import threading
@@ -893,6 +894,141 @@ def run_native_transfer(
     return "closed"
 
 
+def run_exec_session(
+    sock: socket.socket,
+    secure: proto.SecureChannel,
+    accepted: dict[str, Any],
+) -> str:
+    """Execute a non-interactive command or pipeline and relay stdin/stdout.
+
+    Preconditions:
+        Noise handshake is complete; accepted dictionary carries optional "command".
+    Postconditions:
+        Child process terminates; all stdout is sent as Msg.DATA;
+        Msg.EXIT is transmitted with child exit code; returns "closed".
+    Failure Modes:
+        Catches BrokenPipeError/OSError on child writes and handles child timeout.
+    """
+    command = accepted.get("command")
+    log(f"exec session active: command={command!r}")
+    shell_bin = "/bin/bash" if os.path.exists("/bin/bash") else "/bin/sh"
+    shell_cmd = [shell_bin, "-c", command] if command else [shell_bin]
+
+    child_env = os.environ.copy()
+    child_env["LANG"] = "C.UTF-8"
+    child_env["LC_ALL"] = "C.UTF-8"
+    for secret_var in (
+        "MOESH_TUNNEL_AGENT_KEY",
+        "MOESH_TUNNEL_AGENT_KEYFILE",
+        "MOESH_TUNNEL_MASTER",
+        "MOESH_TUNNEL_AGENT_MASTER_SECRET",
+        "MOESH_SHELL_OPERATOR_KEY",
+        "MOESH_TUNNEL_CHILD_PIDFILE",
+    ):
+        child_env.pop(secret_var, None)
+
+    proc = subprocess.Popen(  # noqa: S603 - authenticated remote shell command execution
+        shell_cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        bufsize=0,
+        env=child_env,
+    )
+    assert proc.stdout is not None
+    assert proc.stdin is not None
+
+    stdout_fd = proc.stdout.fileno()
+    os.set_blocking(stdout_fd, False)
+
+    max_record = int(accepted.get("max_record", proto.MAX_DATA_PAYLOAD))
+    stdin_closed = False
+    stdout_eof = False
+
+    while True:
+        watched: list[int | socket.socket] = [sock]
+        if not stdout_eof:
+            watched.append(stdout_fd)
+
+        try:
+            ready, _, _ = select.select(watched, [], [], 0.5)
+        except (ValueError, OSError):
+            break
+
+        # Read output from child
+        if stdout_fd in ready:
+            try:
+                data = os.read(stdout_fd, 16384)
+            except (BlockingIOError, OSError):
+                data = b""
+            if not data:
+                stdout_eof = True
+            else:
+                for piece in chunks(data, max_record):
+                    try:
+                        secure.send(Msg.DATA, piece)
+                    except (OSError, ProtocolError):
+                        stdout_eof = True
+                        break
+
+        # Check records from operator
+        records = secure.buffered()
+        if sock in ready:
+            try:
+                records += secure.drain()
+            except proto.TransportEOF:
+                break
+
+        for msg_type, payload in records:
+            if msg_type == Msg.DATA:
+                if not payload:
+                    # EOF from operator on stdin
+                    if not stdin_closed:
+                        stdin_closed = True
+                        with contextlib.suppress(OSError):
+                            proc.stdin.close()
+                elif not stdin_closed:
+                    try:
+                        proc.stdin.write(payload)
+                        proc.stdin.flush()
+                    except (BrokenPipeError, OSError):
+                        stdin_closed = True
+            elif msg_type == Msg.CLOSE:
+                stdout_eof = True
+                break
+
+        if stdout_eof:
+            break
+
+        if proc.poll() is not None:
+            # Drain any remaining bytes from child stdout
+            while True:
+                try:
+                    data = os.read(stdout_fd, 16384)
+                except (BlockingIOError, OSError):
+                    break
+                if not data:
+                    break
+                for piece in chunks(data, max_record):
+                    with contextlib.suppress(Exception):
+                        secure.send(Msg.DATA, piece)
+            break
+
+    with contextlib.suppress(OSError):
+        proc.stdin.close()
+    try:
+        status = proc.wait(timeout=5.0)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        status = proc.wait()
+
+    log(f"exec session finished: exit_code={status}")
+    with contextlib.suppress(Exception):
+        secure.send_control(Msg.EXIT, {"status": status, "signal": None})
+        secure.send_control(Msg.CLOSE, {"reason": "exec finished"})
+    return "closed"
+
+
 def negotiate(
     secure: proto.SecureChannel,
     machine: proto.SessionState,
@@ -916,7 +1052,7 @@ def negotiate(
         raise AuthenticationError("operator handshake hash does not match this session")
 
     session_type = accepted.get("session_type", "shell")
-    if session_type == "transfer":
+    if session_type in ("transfer", "exec"):
         accepted["resumed"] = False
         secure.send_control(Msg.ACCEPT, accepted)
         machine.to(State.READY)
@@ -1191,6 +1327,8 @@ def serve_once(host: str, port: int, path: str, name: str, pool: ShellPool) -> s
         sock.settimeout(None)
         if accepted.get("session_type") == "transfer":
             return run_native_transfer(sock, secure, accepted)
+        if accepted.get("session_type") == "exec":
+            return run_exec_session(sock, secure, accepted)
         shell = accepted.pop("_shell")
         try:
             return run_session(sock, secure, shell, accepted)

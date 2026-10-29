@@ -79,8 +79,13 @@ DEFAULT_PEER_PUBFILE = os.path.expanduser("~/.config/moesh/agent.pub")
 CAPABILITIES = ("resize", "ping")
 
 
+_QUIET: bool = False
+
+
 def log(message: str) -> None:
     """Write one flushed log line to stderr (stdout carries the terminal)."""
+    if _QUIET:
+        return
     print(
         "[moesh {}] {}".format(time.strftime("%H:%M:%S"), message),
         file=sys.stderr,
@@ -524,6 +529,7 @@ def negotiate(
     rows: int | None = None,
     cols: int | None = None,
     session_type: str = "shell",
+    command: str | None = None,
 ) -> dict[str, Any]:
     """Send HELLO, exchange ACCEPT/READY and return the accepted configuration.
 
@@ -535,28 +541,28 @@ def negotiate(
             r, c = terminal_size(sys.stdin.fileno())
             rows = r if rows is None else rows
             cols = c if cols is None else cols
-        except ProtocolError:
-            # Non-interactive callers (e.g. moecp, pipelines) do not attach a
-            # terminal to stdin; fall back to the protocol defaults rather than
-            # failing on ioctl (measured 2026-10-24).
+        except (ProtocolError, OSError, ValueError, AttributeError):
+            # Non-interactive callers (e.g. moecp, pipelines, test runners) do not
+            # attach a terminal to stdin; fall back to the protocol defaults rather
+            # than failing on ioctl or pseudofile fileno() (measured 2026-10-24).
             rows = rows if rows is not None else proto.DEFAULT_ROWS
             cols = cols if cols is not None else proto.DEFAULT_COLS
     machine.to(State.NEGOTIATING)
-    secure.send_control(
-        Msg.HELLO,
-        {
-            "version": proto.PROTOCOL_VERSION,
-            "term": term,
-            "encoding": proto.DEFAULT_ENCODING,
-            "rows": rows,
-            "cols": cols,
-            "capabilities": list(CAPABILITIES),
-            "max_record": proto.MAX_DATA_PAYLOAD,
-            "handshake_hash": secure.session.handshake_hash().hex(),
-            "fresh_session": fresh,
-            "session_type": session_type,
-        },
-    )
+    hello_body: dict[str, Any] = {
+        "version": proto.PROTOCOL_VERSION,
+        "term": term,
+        "encoding": proto.DEFAULT_ENCODING,
+        "rows": rows,
+        "cols": cols,
+        "capabilities": list(CAPABILITIES),
+        "max_record": proto.MAX_DATA_PAYLOAD,
+        "handshake_hash": secure.session.handshake_hash().hex(),
+        "fresh_session": fresh,
+        "session_type": session_type,
+    }
+    if command is not None:
+        hello_body["command"] = command
+    secure.send_control(Msg.HELLO, hello_body)
     msg_type, accept = secure.recv_control()
     if msg_type != Msg.ACCEPT:
         raise NegotiationError(f"expected ACCEPT, got message type {msg_type}")
@@ -565,6 +571,8 @@ def negotiate(
         log("re-attached to the running shell: the previous session continues")
     elif accept.get("session_type") == "transfer":
         log("native transfer session established")
+    elif accept.get("session_type") == "exec":
+        log("command execution session established")
     else:
         log("a new shell was started")
     secure.send_control(Msg.READY, {})
@@ -910,6 +918,108 @@ def run_session(
                 signal.signal(signal.SIGWINCH, old_winch)
 
 
+def run_exec_session(
+    sock: socket.socket,
+    secure: proto.SecureChannel,
+    agreed: dict[str, Any],
+    stdin_fd: int | None = None,
+    stdout_fd: int | None = None,
+) -> int:
+    """Relay stdin and stdout for non-interactive command execution.
+
+    Preconditions:
+        Noise handshake and HELLO/ACCEPT/READY exchange are complete.
+    Postconditions:
+        Local stdin is forwarded as Msg.DATA records to the remote command;
+        Remote stdout/stderr arriving as Msg.DATA is written to local stdout;
+        Returns the command exit status code.
+    Failure Modes:
+        Surfaces TransportEOF if connection drops unexpectedly, and catches
+        local pipe errors on stdin/stdout writes.
+    """
+    if stdin_fd is None:
+        try:
+            stdin_fd = sys.stdin.fileno()
+        except (AttributeError, OSError, ValueError):
+            stdin_fd = 0
+    if stdout_fd is None:
+        try:
+            stdout_fd = sys.stdout.fileno()
+        except (AttributeError, OSError, ValueError):
+            stdout_fd = 1
+
+    max_record = int(agreed.get("max_record", proto.MAX_DATA_PAYLOAD))
+    stdin_eof = False
+    cmd_exited = False
+    status = 0
+
+    try:
+        fcntl.fcntl(stdin_fd, fcntl.F_GETFL)
+    except OSError:
+        stdin_eof = True
+
+    while True:
+        watched: list[int | socket.socket] = [sock]
+        if not stdin_eof:
+            watched.append(stdin_fd)
+
+        try:
+            ready, _, _ = select.select(watched, [], [], 0.5)
+        except (ValueError, OSError):
+            break
+
+        records = secure.buffered()
+        if sock in ready:
+            try:
+                records += secure.drain()
+            except TransportEOF:
+                if cmd_exited:
+                    return status
+                log("the connection dropped; remote command exited or network broke")
+                raise
+
+        for msg_type, payload in records:
+            if msg_type == Msg.DATA:
+                _write_all(stdout_fd, payload)
+            elif msg_type == Msg.PING:
+                secure.send(Msg.PONG, payload)
+            elif msg_type == Msg.PONG:
+                pass
+            elif msg_type == Msg.EXIT:
+                cmd_exited = True
+                try:
+                    decoded = json.loads(payload)
+                    if isinstance(decoded, dict):
+                        status = int(decoded.get("status", 0))
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    status = 0
+                log(f"remote command finished (status {status})")
+            elif msg_type == Msg.CLOSE:
+                return status
+            elif msg_type == Msg.ERROR:
+                log(f"agent reported an error: {payload[:200]!r}")
+                return status or 1
+
+        if not stdin_eof and stdin_fd in ready:
+            try:
+                data = os.read(stdin_fd, 65536)
+            except OSError:
+                data = b""
+            if not data:
+                stdin_eof = True
+                with contextlib.suppress(Exception):
+                    secure.send(Msg.DATA, b"")
+            else:
+                for index in range(0, len(data), max_record):
+                    try:
+                        secure.send(Msg.DATA, data[index : index + max_record])
+                    except (OSError, ProtocolError):
+                        stdin_eof = True
+                        break
+
+    return status
+
+
 def main(argv: list[str] | None = None) -> int:
     """Attach to the remote shell and relay the local terminal.
 
@@ -961,7 +1071,22 @@ def main(argv: list[str] | None = None) -> int:
         action="store_false",
         help="exit on a lost connection instead of re-attaching",
     )
+    parser.add_argument(
+        "-q",
+        "--quiet",
+        action="store_true",
+        help="suppress informational messages on stderr",
+    )
+    parser.add_argument(
+        "command",
+        nargs="*",
+        help="command to execute on the remote host (e.g. 'ls -la' or 'cat')",
+    )
     args = parser.parse_args(argv)
+
+    global _QUIET
+    if args.quiet:
+        _QUIET = True
 
     if args.generate_key:
         return generate_key(args.keyfile, args.force)
@@ -997,11 +1122,17 @@ def main(argv: list[str] | None = None) -> int:
             f"section, or run 'moesh --new-master -n {host}' to create one"
         )
 
-    if not os.isatty(sys.stdin.fileno()):
+    is_exec = bool(args.command) or not os.isatty(sys.stdin.fileno())
+    if not is_exec and not os.isatty(sys.stdin.fileno()):
         raise ProtocolError(
             "standard input is not a terminal: moesh needs a real terminal "
             "to advertise its size and to restore it afterwards"
         )
+    cmd_str = " ".join(args.command) if args.command else None
+    session_type = "exec" if is_exec else "shell"
+    if is_exec:
+        args.reconnect = False
+
     term = os.environ.get("TERM", proto.DEFAULT_TERM)
 
     attempt = 0
@@ -1009,7 +1140,15 @@ def main(argv: list[str] | None = None) -> int:
     while True:
         private = op_keys[key_idx % len(op_keys)]
         try:
-            return run_one_session(args, host, private, peer, term)
+            return run_one_session(
+                args,
+                host,
+                private,
+                peer,
+                term,
+                session_type=session_type,
+                command=cmd_str,
+            )
         except AuthenticationError:
             # An identity failure is not a network failure: never retry it.
             raise
@@ -1048,6 +1187,8 @@ def run_one_session(
     private: bytes,
     peer: bytes | tuple[bytes, ...],
     term: str,
+    session_type: str = "shell",
+    command: str | None = None,
 ) -> int:
     """Run one session: connect, authenticate, negotiate, relay the terminal.
 
@@ -1101,8 +1242,17 @@ def run_one_session(
         machine.to(State.AUTHENTICATED)
         secure = proto.SecureChannel(channel, session)
         sock.settimeout(proto.NEGOTIATION_TIMEOUT)
-        agreed = negotiate(secure, machine, term, fresh=args.fresh)
+        agreed = negotiate(
+            secure,
+            machine,
+            term,
+            fresh=args.fresh,
+            session_type=session_type,
+            command=command,
+        )
         sock.settimeout(None)
+        if session_type == "exec":
+            return run_exec_session(sock, secure, agreed)
         with terminal:
             return run_session(
                 sock,
