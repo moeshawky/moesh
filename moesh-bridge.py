@@ -312,6 +312,34 @@ def _next_gen_locked(key: str) -> int:
     return _lease_gens[key]
 
 
+def set_tcp_keepalive(sock: socket.socket) -> None:
+    """Enable TCP keepalive and low-latency probing on a transport socket.
+
+    Configures SO_KEEPALIVE along with aggressive probe intervals (5s idle,
+    2s interval, 3 probes) where supported by the operating system, ensuring
+    that dead or ungracefully severed peers (without TCP FIN/RST) are detected
+    and torn down promptly rather than lingering as ghost sockets.
+
+    Preconditions:
+        ``sock`` is an initialized or connected ``socket.socket`` instance.
+    Postconditions:
+        TCP keepalive socket options are applied. Any unsupported platform options
+        or socket errors are suppressed without raising exceptions.
+    Failure Modes:
+        Non-fatal OSError is caught and suppressed via ``contextlib.suppress``.
+    """
+    with contextlib.suppress(OSError):
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    for _opt, _val in (
+        (getattr(socket, "TCP_KEEPIDLE", None), 5),
+        (getattr(socket, "TCP_KEEPINTVL", None), 2),
+        (getattr(socket, "TCP_KEEPCNT", None), 3),
+    ):
+        if _opt is not None:
+            with contextlib.suppress(OSError):
+                sock.setsockopt(socket.IPPROTO_TCP, _opt, _val)
+
+
 def lease_generation(key: str) -> int:
     """Return the generation that a new owner of ``key`` would receive."""
     with _leases_lock:
@@ -381,10 +409,22 @@ def admit_host(
     The lease check, the grant, and the queue insertion observe one registry
     state, so two carriers cannot both be told they own ``host``.  The entry
     is returned un-ready: the caller sends its 101 and then marks it ready, and
-    the pairer waits for that before using the socket.
+    the pairer waits for that before using the socket. Enables TCP keepalive
+    on the standby socket so half-open failures are reaped.
 
-    Returns:
-        ``(reason, entry)``; ``reason`` is None on admission.
+    Preconditions:
+        ``host`` is a validated host label string.
+        ``carrier`` is the non-empty carrier identifier string.
+        ``q`` is the host's tunnel queue.
+        ``sock`` is the connected carrier transport socket.
+    Postconditions:
+        Returns ``(None, entry)`` on successful admission with ``q`` receiving
+        the entry and lease generation safely committed without drift.
+        Returns ``(reason, None)`` when refused or queue is full.
+    Failure Modes:
+        Returns conflict reason if host is already leased to another carrier with
+        queued tunnels or active pairings. Returns queue full reason without
+        advancing the host generation counter if queue.Full is encountered.
     """
     with _leases_lock:
         queued = live_queued(q)
@@ -404,9 +444,11 @@ def admit_host(
                 f"active hosts: {active_str}"
             ), None
         new_owner = lease is None or lease["id"] != carrier
+        target_gen = _lease_gen_locked(host) + 1 if new_owner else _lease_gen_locked(host)
+        set_tcp_keepalive(sock)
         entry = QueuedTunnel(
             sock=sock,
-            gen=_next_gen_locked(host) if new_owner else _lease_gen_locked(host),
+            gen=target_gen,
             carrier=carrier,
             # The key fences this entry to the host lease, so a socket queued
             # by an earlier owner is discarded instead of being paired with
@@ -419,6 +461,7 @@ def admit_host(
             return "tunnel queue full", None
         now = time.time()
         if new_owner:
+            _lease_gens[host] = target_gen
             _host_leases[host] = {
                 "id": carrier,
                 "since": now,
@@ -620,10 +663,20 @@ def admit_relay(
     the port looking owned.  For ``pairing="event"`` the 101 is deferred and
     carried in ``response``: the pairer sends it (then the pairing marker) when
     a peer actually arrives, which is what lets a server-first backend greet
-    the peer before the carrier has seen any data.
+    the peer before the carrier has seen any data. Enables TCP keepalive on
+    the standby relay socket to prevent ghost sockets from persisting.
 
-    Returns:
-        ``(assigned_port, reason, entry)``; ``reason`` is None on admission.
+    Preconditions:
+        ``svc`` is the relay service name or port string.
+        ``carrier`` is the non-empty carrier identifier string.
+        ``requested_port`` is an integer port or 0 for auto.
+        ``sock`` is the connected carrier transport socket.
+    Postconditions:
+        Returns ``(assigned_port, None, entry)`` on success with ``sock`` enqueued
+        and TCP keepalive options set. Returns ``(port, reason, None)`` on refusal.
+    Failure Modes:
+        Returns error reason if relay registry is full, port/service is in use by
+        another carrier, or the relay queue is full.
     """
     static_map = relay_services()
     with _leases_lock:
@@ -643,6 +696,7 @@ def admit_relay(
             reason = _claim_relay_locked(lease_name, carrier, q, port, bound)
         if reason is not None:
             return port, reason, None
+        set_tcp_keepalive(sock)
         entry = QueuedTunnel(
             sock=sock,
             gen=_lease_gen_locked(key),
@@ -927,6 +981,7 @@ def tunnel_conn(conn: socket.socket, addr: tuple[str, int]) -> None:
                 if admitted_v2 is not None:
                     admitted_v2.ready.set()
             conn.settimeout(None)
+            set_tcp_keepalive(conn)
             log(f"host tunnel v2 attached from {addr} host {host}")
             return
         if token != "websocket":  # noqa: S105 - a protocol identifier, not a secret
@@ -1148,6 +1203,7 @@ def pair(
     label: str,
     wait: int,
     on_detach: Callable[[], None] | None = None,
+    on_pair: Callable[[], None] | None = None,
 ) -> None:
     """Pair one incoming connection with the oldest live tunnel in ``q``.
 
@@ -1158,6 +1214,20 @@ def pair(
 
     ``on_detach`` runs once when one direction ends, so the caller can retire
     its active-pairing count without waiting out the drain.
+    ``on_pair`` runs once when an active, live tunnel is paired with ``conn``,
+    allowing callers to defer incrementing active pairing counts until an actual
+    tunnel is acquired.
+
+    Preconditions:
+        ``conn`` is a connected client or peer socket.
+        ``q`` is a tunnel queue containing ``QueuedTunnel`` instances or raw sockets.
+        ``wait`` is timeout seconds to wait on ``q.get``.
+    Postconditions:
+        When pairing succeeds, configures socket options, notifies ``on_pair``,
+        and pumps traffic until closed or detached.
+    Failure Modes:
+        Raises ``queue.Empty`` if wait expires without a live tunnel arriving.
+        Closes sockets safely on errors.
     """
     saw_dead = False
     try:
@@ -1224,6 +1294,8 @@ def pair(
         assert nb is not None and item is not None
         nb = _sock_of(item)
         log(f"pairing {label} with a host")
+        if on_pair is not None:
+            on_pair()
         # Both legs are unbounded once paired: a session may sit idle for
         # hours, and a socket timeout left armed on either side would tear
         # the pair down without anyone noticing.
@@ -1235,16 +1307,7 @@ def pair(
         # (the cause of the 3s-reconnect race in CI).  The bridge stays blind:
         # socket options are transport-level, not decrypting.
         for _sock in (conn, nb):
-            with contextlib.suppress(OSError):
-                _sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-            for _opt, _val in (
-                (getattr(socket, "TCP_KEEPIDLE", None), 5),
-                (getattr(socket, "TCP_KEEPINTVL", None), 2),
-                (getattr(socket, "TCP_KEEPCNT", None), 3),
-            ):
-                if _opt is not None:
-                    with contextlib.suppress(OSError):
-                        _sock.setsockopt(socket.IPPROTO_TCP, _opt, _val)
+            set_tcp_keepalive(_sock)
         if isinstance(item, QueuedTunnel) and item.response:
             # Deferred handshake: the carrier has been waiting for this 101 so
             # it can open its backend connection before any peer byte exists.
@@ -1332,7 +1395,19 @@ def read_host_label(conn: socket.socket) -> str:
 
 
 def operator_v2_conn(conn: socket.socket, addr: tuple[str, int]) -> None:
-    """Pair one operator connection with the host it asked for."""
+    """Pair one operator connection with the host it asked for.
+
+    Preconditions:
+        ``conn`` is an active socket accepted from an incoming operator connection.
+        ``addr`` is the (host, port) tuple of the peer.
+    Postconditions:
+        Reads host label, resolves queue, and invokes ``pair()``. Increments active
+        host pairing count only upon successful pairing via ``on_pair`` callback,
+        and decrements it upon detachment.
+    Failure Modes:
+        Invalid or missing host labels trigger socket closure and refusal.
+        Timeouts or empty queues during wait exit without marking host active.
+    """
     host = read_host_label(conn)
     if not host or not valid_host(host):
         log(f"operator from {addr[0]}:{addr[1]} sent invalid host label; refusing")
@@ -1344,16 +1419,22 @@ def operator_v2_conn(conn: socket.socket, addr: tuple[str, int]) -> None:
         with contextlib.suppress(OSError):
             conn.close()
         return
+    paired = threading.Event()
     detached = threading.Lock()
+
+    def attach() -> None:
+        """Record active pairing once a tunnel has been acquired."""
+        if not paired.is_set():
+            paired.set()
+            touch_host(host, 1)
 
     def detach() -> None:
         """Stop counting this pairing as attached; safe to call twice."""
-        if detached.acquire(blocking=False):
+        if paired.is_set() and detached.acquire(blocking=False):
             touch_host(host, -1)
 
-    touch_host(host, 1)
     try:
-        pair(conn, q, f"operator-v2[{host}]", 120, on_detach=detach)
+        pair(conn, q, f"operator-v2[{host}]", 120, on_detach=detach, on_pair=attach)
     finally:
         detach()
 

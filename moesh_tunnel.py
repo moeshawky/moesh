@@ -125,7 +125,45 @@ DETACHED_BUFFER = 262144
 
 _stopping = False
 _conflict_refused = False
-CARRIER_ID = os.environ.get("MOESH_TUNNEL_ID", "").strip() or os.urandom(8).hex()
+
+
+def derive_carrier_id(env_var: str = "MOESH_TUNNEL_ID") -> str:
+    """Return a persistent carrier ID from env or stable host identity.
+
+    When ``MOESH_TUNNEL_ID`` is not set, derives a stable 16-hex identity from
+    system machine-id (/etc/machine-id, /var/lib/dbus/machine-id) or static key
+    material so restarts on the same host do not generate alien carrier IDs that
+    collide with earlier leases.
+
+    Preconditions:
+        ``env_var`` is the environment variable name to inspect.
+    Postconditions:
+        Returns a non-empty hex carrier ID string.
+    Failure Modes:
+        If file access fails or machine-id is absent, falls back to static key
+        or os.urandom(8).hex().
+    """
+    explicit = os.environ.get(env_var, "").strip()
+    if explicit:
+        return explicit
+    for path in ("/etc/machine-id", "/var/lib/dbus/machine-id"):
+        try:
+            with open(path, encoding="utf-8") as f:
+                content = f.read().strip()
+                if content:
+                    return hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
+        except OSError:
+            pass
+    key = (
+        os.environ.get("MOESH_TUNNEL_AGENT_KEY", "").strip()
+        or os.environ.get("MOESH_TUNNEL_V2_AGENT_KEY", "").strip()
+    )
+    if key:
+        return hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
+    return os.urandom(8).hex()
+
+
+CARRIER_ID = derive_carrier_id()
 
 
 class HostConflictError(ProtocolError):
@@ -1262,17 +1300,28 @@ def tunnel_worker(host: str, port: int, path: str, name: str, pool: ShellPool) -
     thread.  When the session ends the worker opens a fresh tunnel, so the
     receiver always has a spare waiting for the next operator.
 
-    This is the tmux shape rather than the SSH one: the host holds the
-    shells and every operator brings its own transport, instead of one
-    transport carrying many channels (RFC 4254 section 5).
+    Resets the 409 conflict deadline per incident so transient conflicts during
+    steady-state operation retry properly instead of aborting the agent process.
+
+    Preconditions:
+        ``host`` and ``port`` identify the receiver bridge.
+        ``path`` is the HTTP upgrade path (e.g. /__moesh/tunnel/<name>).
+        ``name`` is the host routing label.
+        ``pool`` is the shared ``ShellPool`` instance.
+    Postconditions:
+        Runs the tunnel dialing loop until interrupted or stopped.
+    Failure Modes:
+        Sets ``_conflict_refused = True`` and stops if a HostConflictError persists
+        beyond the incident retry deadline.
     """
     global _conflict_refused, _stopping
     backoff = 2.0
-    claim_deadline = time.time() + 2.0
+    claim_deadline: float | None = None
     while not _stopping:
         try:
             outcome = serve_once(host, port, path, name, pool)
             backoff = 2.0
+            claim_deadline = None
             if outcome == "closed":
                 log("a shell exited; the others keep running")
             else:
@@ -1281,17 +1330,22 @@ def tunnel_worker(host: str, port: int, path: str, name: str, pool: ShellPool) -
             break
         except HostConflictError as exc:
             log(f"ERROR: {exc}")
-            if time.time() >= claim_deadline:
+            now = time.time()
+            if claim_deadline is None:
+                claim_deadline = now + 2.0
+            if now >= claim_deadline:
                 _conflict_refused = True
                 _stopping = True
                 break
             time.sleep(1.5)
         except AuthenticationError as exc:
+            claim_deadline = None
             log(
                 f"AUTHENTICATION FAILED: {exc} — refusing to retry for {int(AUTH_BACKOFF)}s"
             )
             time.sleep(AUTH_BACKOFF)
         except TransportEOF:
+            claim_deadline = None
             log(
                 "transport ended without an authenticated close (abrupt EOF) at "
                 + time.strftime("%H:%M:%S")
@@ -1302,6 +1356,7 @@ def tunnel_worker(host: str, port: int, path: str, name: str, pool: ShellPool) -
             # a genuinely unreachable receiver, not for a client that went away.
             backoff = 2.0
         except (ProtocolError, OSError) as exc:
+            claim_deadline = None
             log(f"session failed: {exc!r}")
             time.sleep(backoff)
             backoff = min(backoff * 2, NET_BACKOFF_MAX)

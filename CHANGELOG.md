@@ -3,6 +3,33 @@
 All notable changes to `moesh`. The project is pre-1.0: behaviour may change
 between minor releases without a deprecation period.
 
+## Unreleased
+
+### Fixed — bridge admission, reconnection deadlocks, and socket keepalive
+
+- **Deferred operator active accounting (`moesh-bridge.py`).** In `operator_v2_conn`,
+  `touch_host(host, 1)` is now deferred until a live tunnel is actually dequeued
+  and paired via an `on_pair` callback. An operator client waiting in `pair()`
+  for a tunnel no longer marks `_host_active[host] = 1`, preventing a circular
+  deadlock where a restarting agent is refused with `409 Conflict` because the
+  waiting operator is counted as an active session.
+- **Standby socket TCP keepalive (`moesh-bridge.py`).** Standby queued tunnel
+  and relay carrier sockets now enable `SO_KEEPALIVE` with tight probe intervals
+  (`TCP_KEEPIDLE=5`, `TCP_KEEPINTVL=2`, `TCP_KEEPCNT=3`), so half-open ghost
+  sockets from ungraceful drops (power loss, network partitions) are detected and
+  purged by the kernel instead of returning `True` in `alive()` via `MSG_PEEK`.
+- **Generational counter atomicity under queue capacity (`moesh-bridge.py`).**
+  In `admit_host`, the generation counter `_lease_gens[host]` is only committed
+  when `q.put_nowait` succeeds, preventing desynchronization on `queue.Full`.
+- **Incident-scoped conflict deadlines (`moesh_tunnel.py`, `moesh_relay.py`).**
+  `claim_deadline` is now initialized and evaluated per conflict incident rather
+  than once at process startup, allowing steady-state transient 409 conflicts to
+  retry without immediately terminating the agent process with exit code 3.
+- **Persistent carrier identity fallback (`moesh_tunnel.py`, `moesh_relay.py`).**
+  `derive_carrier_id()` generates a stable 16-hex identity derived from machine ID
+  or static key material when `MOESH_TUNNEL_ID` or `MOESH_RELAY_ID` is unset,
+  preventing alien carrier ID collisions across process restarts.
+
 ## 0.2.0a4 — 2026-10-28
 
 Engineering audit and remediation. Every entry below was reproduced with an

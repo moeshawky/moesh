@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import base64
 import contextlib
+import hashlib
 import json
 import os
 import socket
@@ -55,6 +56,34 @@ DEFAULT_SESSION_IDLE = int(os.environ.get("MOESH_RELAY_SESSION_IDLE", "120"))
 
 _log_lock = threading.Lock()
 _port_logged = False
+
+
+def derive_carrier_id(explicit_id: str = "") -> str:
+    """Return a persistent carrier ID from explicit argument, env, or stable host identity.
+
+    When neither explicit argument nor ``MOESH_RELAY_ID`` is provided, derives a
+    stable 16-hex identity from the machine ID (/etc/machine-id, /var/lib/dbus/machine-id)
+    so restarts do not generate alien carrier IDs that collide with prior leases.
+
+    Preconditions:
+        ``explicit_id`` is an optional string passed from CLI arguments.
+    Postconditions:
+        Returns a non-empty hex carrier ID string.
+    Failure Modes:
+        If file access fails or machine-id is absent, falls back to os.urandom(8).hex().
+    """
+    explicit = explicit_id.strip() or os.environ.get("MOESH_RELAY_ID", "").strip()
+    if explicit:
+        return explicit
+    for path in ("/etc/machine-id", "/var/lib/dbus/machine-id"):
+        try:
+            with open(path, encoding="utf-8") as f:
+                content = f.read().strip()
+                if content:
+                    return hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
+        except OSError:
+            pass
+    return os.urandom(8).hex()
 
 
 def log(msg: str) -> None:
@@ -284,8 +313,24 @@ def worker(
     immediately dials a replacement standby tunnel.  This prevents HTTP
     keep-alive pools from exhausting the standby tunnel queue (measured
     2026-10-26: 4 keep-alive sockets previously parked all 4 workers).
+
+    Resets the 409 conflict deadline per incident so transient conflicts during
+    steady-state operation retry properly instead of aborting the relay daemon.
+
+    Preconditions:
+        ``host`` and ``port`` identify the receiver bridge.
+        ``path`` is the relay path (e.g. /__relay/<port>).
+        ``target_host`` and ``target_port`` identify the local target service.
+        ``idle`` is the idle standby timeout in seconds.
+        ``claim_deadline`` specifies the retry duration or deadline for conflict resolution.
+    Postconditions:
+        Runs the standby tunnel maintenance loop until interrupted or refused.
+    Failure Modes:
+        Signals ``refused`` if a RelayRefused error persists beyond the incident
+        retry deadline.
     """
     global _port_logged
+    incident_deadline: float | None = None
     while True:
         sock = None
         try:
@@ -298,6 +343,7 @@ def worker(
                 auth_token=token,
                 header_timeout=float(max(idle, 20)),
             )
+            incident_deadline = None
             if not _port_logged and assigned_port > 0:
                 _port_logged = True
                 log(
@@ -336,11 +382,20 @@ def worker(
                     sock.close()
         except RelayRefused as err:
             log(f"ERROR: refused by receiver (409 Conflict): {err}")
-            if refused is not None and time.time() >= claim_deadline:
+            now = time.time()
+            if incident_deadline is None:
+                incident_wait = (
+                    max(0.1, claim_deadline - now)
+                    if claim_deadline > 1_000_000_000
+                    else (claim_deadline if claim_deadline > 0 else 2.0)
+                )
+                incident_deadline = now + incident_wait
+            if refused is not None and now >= incident_deadline:
                 refused.set()
                 return
             time.sleep(1.5)
         except Exception as err:
+            incident_deadline = None
             log(f"worker {index}: {type(err).__name__}: {err}; redialing in 2s")
             if sock:
                 with contextlib.suppress(OSError):
@@ -482,9 +537,9 @@ def main(argv: list[str] | None = None) -> int:
         f"-> local {target_host}:{target_port} ({workers} standby workers) via {host}:{port}"
     )
 
-    carrier_id = args.id or os.urandom(8).hex()
+    carrier_id = derive_carrier_id(args.id)
     refused = threading.Event()
-    claim_deadline = time.time() + args.claim_wait
+    claim_wait = args.claim_wait
     for i in range(workers):
         threading.Thread(
             target=worker,
@@ -498,7 +553,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.idle,
                 carrier_id,
                 refused,
-                claim_deadline,
+                claim_wait,
                 req_remote_port,
                 args.session_idle,
                 args.token,
