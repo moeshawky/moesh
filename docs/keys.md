@@ -105,7 +105,7 @@ Instead of generating and distributing separate key pairs for each remote host,
 a fleet of hosts can be derived from a single 32-byte master secret:
 
 ```
-Master Secret (32 bytes) ──▶ HKDF-SHA256(info=b"moesh-agent-key-host-<n>") ──▶ Static Key for host-<n>
+Master Secret (32 bytes) ──▶ HKDF-SHA256(info=b"moesh-tunnel-v2/agent-static-key/v1/host-<n>") ──▶ Static Key for host-<n>
 ```
 
 ### Deriving keys on the Operator Client

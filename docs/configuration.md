@@ -67,7 +67,7 @@ The client requires a valid TTY when starting an interactive terminal session.
 
 Legacy aliases `MOESH_TUNNEL_V2_*` and `NB_TUNNEL_V2_*` are supported for backward compatibility.
 
-`MOESH_TUNNEL_AGENT_KEY` is checked first; `MOESH_TUNNEL_AGENT_KEYFILE` is the fallback. If `MOESH_TUNNEL_MASTER` is provided, the static key is deterministically derived from `HKDF-SHA256(info=b"moesh-agent-key-host-<n>")`.
+`MOESH_TUNNEL_AGENT_KEY` is checked first; `MOESH_TUNNEL_AGENT_KEYFILE` is the fallback. If `MOESH_TUNNEL_MASTER` is provided, the static key is deterministically derived from `HKDF-SHA256(info=b"moesh-tunnel-v2/agent-static-key/v1/host-<n>")`.
 
 ### Flags
 

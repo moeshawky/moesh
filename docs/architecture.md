@@ -185,11 +185,11 @@ Instead of managing separate key pairs for each remote host, fleets can derive i
 from a single 32-byte shared master secret (`MOESH_TUNNEL_MASTER`):
 
 ```
-Master Secret (32 bytes) ──▶ HKDF-SHA256(info=b"moesh-agent-key-host-<n>") ──▶ Static Keypair for host-<n>
+Master Secret (32 bytes) ──▶ HKDF-SHA256(info=b"moesh-tunnel-v2/agent-static-key/v1/host-<n>") ──▶ Static Keypair for host-<n>
 ```
 
 * **Agent Derivation:** When `MOESH_TUNNEL_MASTER` is present, `moesh_tunnel.py` derives its X25519 static
-  key using HKDF-SHA256 with the info parameter bound to the host routing label (`host-<n>`).
+  key using HKDF-SHA256 with the info parameter bound to the host routing label (`b"moesh-tunnel-v2/agent-static-key/v1/" + name.encode("utf-8")`).
 * **Operator Verification:** In `~/.config/moesh/hosts.toml`, a top-level `master = "<hex>"` entry allows
   the operator client to derive and pin the expected public key for any host number automatically.
 * **Dual-Key Migration:** Operator configurations can pin both `master` and `legacy_agent_pub`
