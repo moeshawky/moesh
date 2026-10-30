@@ -450,6 +450,7 @@ def run():
             os.makedirs(target, exist_ok=True)
         send_frame({"status": "OK", "target_is_dir": dest_is_dir})
 
+        files_received = 0
         while True:
             msg, payload = recv_frame()
             op = msg.get("op")
@@ -460,6 +461,11 @@ def run():
                 send_frame({"status": "ERROR", "message": f"unexpected op: {op}"})
                 return 1
 
+            if files_received > 0 and not dest_is_dir and not is_dir_upload:
+                send_frame({"status": "ERROR", "message": f"destination '{target}' is not a directory"})
+                return 1
+            files_received += 1
+
             raw_rel = msg.get("rel_path", "")
             try:
                 rel = sanitize_relpath(raw_rel)
@@ -469,10 +475,14 @@ def run():
 
             target_abs = os.path.realpath(os.path.abspath(target))
             if is_dir_upload:
+                root = target_abs
                 dest_file = os.path.join(target_abs, rel)
             elif dest_is_dir:
+                root = target_abs
                 dest_file = os.path.join(target_abs, os.path.basename(rel))
             else:
+                # Single-file upload containment root is the destination's parent (October 2026)
+                root = os.path.dirname(target_abs) or "/"
                 dest_file = target_abs
 
             # Containment through the resolved filesystem, not lexically: an
@@ -484,7 +494,8 @@ def run():
             except OSError as exc:
                 send_frame({"status": "ERROR", "message": f"invalid target path: {exc}"})
                 return 1
-            if parent_real != target_abs and not parent_real.startswith(target_abs + os.sep):
+            root_real = os.path.realpath(root)
+            if parent_real != root_real and not parent_real.startswith(root_real.rstrip(os.sep) + os.sep):
                 send_frame({"status": "ERROR", "message": f"path escapes target directory: {dest_file}"})
                 return 1
             if os.path.islink(dest_file):
@@ -735,9 +746,9 @@ def parse_path_spec(spec: str, default_host: str = "") -> PathSpec:
     """Parse a command-line path specification into a local or remote target.
 
     Supports formats:
-        - `host-3:/path/to/file` -> remote host-3
-        - `3:/path/to/file` -> remote host-3
-        - `remote:/path/to/file` -> remote default_host
+        - `[user@]host-3:/path/to/file` -> remote host-3
+        - `[user@]3:/path/to/file` -> remote host-3
+        - `[user@]remote:/path/to/file` -> remote default_host
         - `/path/to/local` -> local path
 
     Args:
@@ -757,6 +768,8 @@ def parse_path_spec(spec: str, default_host: str = "") -> PathSpec:
         host_part, _, path_part = spec.partition(":")
         if not path_part:
             path_part = "."
+        # Strip optional user@ prefix before label validation (DEF-09, October 2026)
+        _, _, host_part = host_part.rpartition("@")
         if host_part.lower() == "remote":
             host = default_host or "host-1"
         elif host_part.isdigit():
@@ -806,22 +819,36 @@ class FramedStreamClient:
     def _read_more(self, deadline: float | None = None, timeout: float = 30.0) -> None:
         """Drain incoming data from SecureChannel into buffer.
 
+        Inspects incoming records (DEF-10, October 2026):
+          - Msg.ERROR: raises ProtocolError with decoded remote message.
+          - Msg.CLOSE: raises TransportEOF on authenticated remote close.
+          - Msg.DATA: appends payload bytes to internal buffer.
+
         Args:
             deadline: Optional absolute monotonic deadline timestamp.
             timeout: Seconds to wait for socket readability before error if deadline not given.
 
         Raises:
             TimeoutError: If peer fails to respond within timeout or before deadline.
-            TransportEOF: If connection is broken.
+            TransportEOF: If connection is broken or remote closed session.
+            ProtocolError: If peer reports an application error.
         """
         if deadline is None:
             deadline = time.monotonic() + timeout
+
+        def _consume_records(records: list[tuple[int, bytes]]) -> None:
+            for msg_type, data in records:
+                if msg_type == Msg.ERROR:
+                    raise ProtocolError(f"remote error: {data.decode('utf-8', 'replace')}")
+                if msg_type == Msg.CLOSE:
+                    raise TransportEOF("remote closed session")
+                if msg_type == Msg.DATA:
+                    self._buf.extend(data)
+
         while True:
             records = self.secure.buffered()
             if records:
-                for msg_type, data in records:
-                    if msg_type == Msg.DATA:
-                        self._buf.extend(data)
+                _consume_records(records)
                 if self._buf:
                     return
 
@@ -834,9 +861,7 @@ class FramedStreamClient:
                 raise TimeoutError("timed out waiting for remote response")
 
             records = self.secure.drain()
-            for msg_type, data in records:
-                if msg_type == Msg.DATA:
-                    self._buf.extend(data)
+            _consume_records(records)
             if self._buf:
                 return
 
@@ -1026,7 +1051,7 @@ def upload_files(
     summary = summary or TransferSummary()
 
     for src in sources:
-        if not os.path.exists(src):
+        if not os.path.lexists(src):
             sys.stderr.write(f"moecp: {src}: No such file or directory\n")
             summary.failed += 1
             summary.print_summary()
@@ -1094,15 +1119,24 @@ def upload_files(
         summary.print_summary()
         return 1
 
-    for full_path, rel_path in file_manifest:
-        st = os.stat(full_path)
-        hasher = hashlib.sha256()
+    # Standard scp requirement: when uploading multiple source files, verify destination is an existing directory (DEF-07, October 2026)
+    if len(sources) > 1 and not init_ack.get("target_is_dir", False):
+        raise ProtocolError(f"destination '{target_spec.path}' is not a directory")
 
-        # Compute SHA256 before streaming
-        with open(full_path, "rb") as f:
-            while chunk := f.read(65536):
-                hasher.update(chunk)
-        expected_sha = hasher.hexdigest()
+    for full_path, rel_path in file_manifest:
+        try:
+            st = os.stat(full_path)
+            hasher = hashlib.sha256()
+
+            # Compute SHA256 before streaming
+            with open(full_path, "rb") as f:
+                while chunk := f.read(65536):
+                    hasher.update(chunk)
+            expected_sha = hasher.hexdigest()
+        except OSError as err:
+            sys.stderr.write(f"moecp: cannot access '{full_path}': {err}\n")
+            summary.skipped += 1
+            continue
 
         client.send_frame({
             "op": "FILE_START",
@@ -1163,6 +1197,9 @@ def upload_files(
 
     client.send_frame({"op": "DONE"})
     done_ack, _ = client.recv_frame()
+    if done_ack.get("status") == "DONE":
+        with contextlib.suppress(Exception):
+            client.secure.send_control(Msg.CLOSE, {"reason": "transfer complete"})
     summary.print_summary()
     return 0 if done_ack.get("status") == "DONE" else 1
 
@@ -1251,8 +1288,9 @@ def _receive_pull_file(
     pull_id = pull_transfer_id(dest_file, size, mtime, content_sha)
     staged = StagedFile(root, rel_parts, pull_id)
     with contextlib.ExitStack() as stack:
-        stack.enter_context(staged.lock())
+        # Register close before acquiring lock so dir_fd is closed even if TransferBusyError is raised (October 2026)
         stack.callback(staged.close)
+        stack.enter_context(staged.lock())
         ledger.record_transfer(pull_id, dest_file, size, content_sha)
         try:
             resume_offset, hasher = _verified_prefix(ledger, staged, pull_id)
@@ -1462,6 +1500,9 @@ def download_files(
 
     client.send_frame({"op": "DONE"})
     done_ack, _ = client.recv_frame()
+    if done_ack.get("status") == "DONE":
+        with contextlib.suppress(Exception):
+            client.secure.send_control(Msg.CLOSE, {"reason": "transfer complete"})
     summary.print_summary()
     return 0 if done_ack.get("status") == "DONE" else 1
 
@@ -1719,8 +1760,9 @@ def _receive_push_file(
 
     staged = StagedFile(root, rel_parts, transfer_id)
     with contextlib.ExitStack() as stack:
-        stack.enter_context(staged.lock())
+        # Register close before acquiring lock so dir_fd is closed even if TransferBusyError is raised (October 2026)
         stack.callback(staged.close)
+        stack.enter_context(staged.lock())
         stack.enter_context(_discard_on_error(staged, ledger, transfer_id))
         if expected_sha and ledger.is_committed(transfer_id) and os.path.exists(dest_file):
             try:
@@ -1827,6 +1869,7 @@ def run_native_agent_transfer(
             os.makedirs(target, exist_ok=True)
         client.send_frame({"status": "OK", "target_is_dir": dest_is_dir})
 
+        files_received = 0
         while True:
             msg, _payload = client.recv_frame()
             op = msg.get("op")
@@ -1836,6 +1879,12 @@ def run_native_agent_transfer(
             if op != "FILE_START":
                 client.send_frame({"status": "ERROR", "message": f"unexpected op: {op}"})
                 return
+
+            # Abort if multiple files sent to non-directory target (DEF-07, October 2026)
+            if files_received > 0 and not dest_is_dir and not is_dir_upload:
+                client.send_frame({"status": "ERROR", "message": f"destination '{target}' is not a directory"})
+                return
+            files_received += 1
 
             raw_rel = msg.get("rel_path", "")
             try:
@@ -2110,7 +2159,8 @@ def connect_and_run(
             sys.stderr.write(f"moecp: cannot connect to receiver bridge at {args.addr}: {exc}\n")
             return 1
 
-        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        with contextlib.suppress(OSError):
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         sock.sendall(PRELUDE_PREFIX + host.encode("latin-1") + b"\n")
 
         try:
@@ -2131,7 +2181,7 @@ def connect_and_run(
                 client.wait_for_ready(timeout=15.0)
 
             return action_fn(client)
-        except (TimeoutError, TransportEOF, OSError) as exc:
+        except (TimeoutError, TransportEOF, OSError, ProtocolError) as exc:
             if attempt + 1 < retries:
                 time.sleep(0.5 * (attempt + 1))
                 continue
@@ -2231,6 +2281,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if not any_src_remote and not dst_remote:
         # Local-to-local fallback (mirrors scp behavior)
+        if len(sources_raw) > 1 and not os.path.isdir(target_raw):
+            sys.stderr.write(f"moecp: destination '{target_raw}' is not a directory\n")
+            return 1
         try:
             for s in sources_raw:
                 if os.path.isdir(s):

@@ -113,6 +113,11 @@ def splice(a: socket.socket, b: socket.socket, idle_timeout: int = 0) -> None:
     implementation shut the *read* side of the surviving direction, so a client
     that half-closed after its request never saw the reply.
 
+    Half-close linger is harmonized to 60s matching the receiver bridge
+    (MOESH_BRIDGE_HALFCLOSE_LINGER, October 2026). On any OSError (e.g. connection
+    reset, broken pipe, target abort), SHUT_RDWR is issued immediately on both
+    sockets to tear down the session without lingering.
+
     ``idle_timeout`` bounds an otherwise idle session; when either direction
     times out the session is torn down rather than parked in CLOSE_WAIT.
     """
@@ -120,6 +125,7 @@ def splice(a: socket.socket, b: socket.socket, idle_timeout: int = 0) -> None:
         a.settimeout(idle_timeout)
         b.settimeout(idle_timeout)
     done = threading.Event()
+    error_occurred = threading.Event()
 
     def copy(src: socket.socket, dst: socket.socket) -> None:
         try:
@@ -129,7 +135,10 @@ def splice(a: socket.socket, b: socket.socket, idle_timeout: int = 0) -> None:
                     break
                 dst.sendall(data)
         except OSError:
-            pass
+            error_occurred.set()
+            for s in (a, b):
+                with contextlib.suppress(OSError):
+                    s.shutdown(socket.SHUT_RDWR)
         finally:
             with contextlib.suppress(OSError):
                 dst.shutdown(socket.SHUT_WR)
@@ -142,7 +151,7 @@ def splice(a: socket.socket, b: socket.socket, idle_timeout: int = 0) -> None:
     for worker_thread in workers:
         worker_thread.start()
     done.wait()
-    linger = float(max(idle_timeout, 30))
+    linger = 0.0 if error_occurred.is_set() else 60.0
     deadline = time.time() + linger
     for worker_thread in workers:
         worker_thread.join(max(0.0, deadline - time.time()))
@@ -384,10 +393,12 @@ def worker(
             log(f"ERROR: refused by receiver (409 Conflict): {err}")
             now = time.time()
             if incident_deadline is None:
+                # Default retry window on 409 Conflict harmonized to 45.0s (October 2026,
+                # matching docs/CONNECT.md:280 and docs/configuration.md:154).
                 incident_wait = (
                     max(0.1, claim_deadline - now)
                     if claim_deadline > 1_000_000_000
-                    else (claim_deadline if claim_deadline > 0 else 2.0)
+                    else (claim_deadline if claim_deadline > 0 else 45.0)
                 )
                 incident_deadline = now + incident_wait
             if refused is not None and now >= incident_deadline:
@@ -462,8 +473,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument(
         "--claim-wait",
         type=float,
-        default=2.0,
-        help="Seconds to retry on 409 Conflict before exiting with status 3 (default 2.0)",
+        default=45.0,
+        help="Seconds to retry on 409 Conflict before exiting with status 3 (default 45.0)",
     )
     ap.add_argument(
         "--idle",
