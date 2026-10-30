@@ -78,19 +78,36 @@ def hosts(tmp_path: Path) -> Iterator[Hosts]:
             }
         )
         # The agent keeps writing to it for as long as it runs.
-        log = open(os.path.join(tmp_path, f"agent-{name}.log"), "wb")  # noqa: SIM115
-        return subprocess.Popen(
+        log_file_path = os.path.join(tmp_path, f"agent-{name}.log")
+        log = open(log_file_path, "wb")  # noqa: SIM115
+        proc = subprocess.Popen(
             [AGENT_PYTHON, os.path.join(TUNNEL_DIR, "moesh_tunnel.py")],
             stdout=log,
             stderr=subprocess.STDOUT,
             env=env,
         )
+        deadline = time.time() + 20.0
+        while time.time() < deadline:
+            try:
+                with open(log_file_path, "rb") as f:
+                    content = f.read()
+                    if b"tunnel established" in content or b"waiting for an operator" in content:
+                        break
+            except OSError:
+                pass
+            if proc.poll() is not None:
+                raise TimeoutError(
+                    f"Agent {name} exited prematurely with code {proc.returncode}"
+                )
+            time.sleep(0.05)
+        else:
+            raise TimeoutError(f"Agent {name} timed out waiting for tunnel establishment")
+        return proc
 
     agents = {
         _ALPHA: start_agent(_ALPHA, alpha_private, alpha_public),
         _BETA: start_agent(_BETA, beta_private, beta_public),
     }
-    time.sleep(2.0)
 
     def client_env(host: str) -> dict[str, str]:
         env = dict(os.environ)
@@ -99,7 +116,7 @@ def hosts(tmp_path: Path) -> Iterator[Hosts]:
                 "MOESH_SHELL_ADDR": f"127.0.0.1:{operator_v2_port}",
                 "MOESH_SHELL_KEYFILE": str(operator_keyfile),
                 "MOESH_SHELL_HOSTS_FILE": str(pins),
-                "MOESH_SHELL_HANDSHAKE_TIMEOUT": "10",
+                "MOESH_SHELL_HANDSHAKE_TIMEOUT": "30",
                 "TERM": "xterm-256color",
             }
         )

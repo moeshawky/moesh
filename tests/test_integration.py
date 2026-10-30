@@ -105,7 +105,7 @@ def test_the_operator_gets_an_interactive_shell(stack: Stack) -> None:
         [AGENT_PYTHON, CLIENT], stack["client_env"], rows=30, cols=100
     )
     try:
-        session.read_until(b"$", timeout=30)
+        session.read_until(b"$", timeout=45)
         session.write(b"echo MARK_SHELL_OK\n")
         assert b"MARK_SHELL_OK" in session.read_until(b"MARK_SHELL_OK", timeout=20)
         session.write(b"tty\n")
@@ -120,7 +120,7 @@ def test_the_remote_pty_uses_the_negotiated_size(stack: Stack) -> None:
         [AGENT_PYTHON, CLIENT], stack["client_env"], rows=37, cols=113
     )
     try:
-        session.read_until(b"$", timeout=30)
+        session.read_until(b"$", timeout=45)
         session.write(b"stty size\n")
         output = session.read_until(b"37 113", timeout=20)
         assert b"37 113" in output
@@ -134,7 +134,7 @@ def test_a_resize_reaches_the_remote_pty(stack: Stack) -> None:
         [AGENT_PYTHON, CLIENT], stack["client_env"], rows=24, cols=80
     )
     try:
-        session.read_until(b"$", timeout=30)
+        session.read_until(b"$", timeout=45)
         session.write(b"stty size\n")
         session.read_until(b"24 80", timeout=20)
         session.resize(50, 132)
@@ -151,7 +151,7 @@ def test_ctrl_c_interrupts_the_remote_foreground_process(stack: Stack) -> None:
         [AGENT_PYTHON, CLIENT], stack["client_env"], rows=24, cols=80
     )
     try:
-        session.read_until(b"$", timeout=30)
+        session.read_until(b"$", timeout=45)
         session.write(b"sleep 30\n")
         time.sleep(1.0)
         session.write(b"\x03")
@@ -265,7 +265,7 @@ def test_the_agent_redials_after_the_transport_drops(stack: Stack) -> None:
         [AGENT_PYTHON, CLIENT], stack["client_env"], rows=24, cols=80
     )
     try:
-        first.read_until(b"$", timeout=30)
+        first.read_until(b"$", timeout=45)
     finally:
         first.close()
     time.sleep(8)
@@ -273,7 +273,7 @@ def test_the_agent_redials_after_the_transport_drops(stack: Stack) -> None:
         [AGENT_PYTHON, CLIENT], stack["client_env"], rows=24, cols=80
     )
     try:
-        second.read_until(b"$", timeout=40)
+        second.read_until(b"$", timeout=45)
         second.write(b"echo MARK_REDIAL_OK\n")
         assert b"MARK_REDIAL_OK" in second.read_until(b"MARK_REDIAL_OK", timeout=20)
     finally:
@@ -300,7 +300,7 @@ def test_the_shell_survives_an_operator_disconnect(stack: Stack) -> None:
         [AGENT_PYTHON, CLIENT], stack["client_env"], rows=24, cols=80
     )
     try:
-        first.read_until(b"$", timeout=30)
+        first.read_until(b"$", timeout=45)
         first.write(b"export REATTACH_MARK=42\n")
         assert b"REATTACH_MARK" in first.read_until(b"REATTACH_MARK", timeout=20)
     finally:
@@ -311,7 +311,7 @@ def test_the_shell_survives_an_operator_disconnect(stack: Stack) -> None:
         [AGENT_PYTHON, CLIENT], stack["client_env"], rows=24, cols=80
     )
     try:
-        second.read_until(b"$", timeout=40)
+        second.read_until(b"$", timeout=45)
         second.write(b"echo MARK_IS=[$REATTACH_MARK]\n")
         assert b"MARK_IS=[42]" in second.read_until(b"MARK_IS=[42]", timeout=25)
     finally:
@@ -324,7 +324,7 @@ def test_a_fresh_session_can_be_requested(stack: Stack) -> None:
         [AGENT_PYTHON, CLIENT], stack["client_env"], rows=24, cols=80
     )
     try:
-        first.read_until(b"$", timeout=30)
+        first.read_until(b"$", timeout=45)
         first.write(b"export FRESH_MARK=42\n")
         first.read_until(b"FRESH_MARK", timeout=20)
     finally:
@@ -334,7 +334,7 @@ def test_a_fresh_session_can_be_requested(stack: Stack) -> None:
     env = dict(stack["client_env"])
     second = OperatorSession([AGENT_PYTHON, CLIENT, "--fresh"], env, rows=24, cols=80)
     try:
-        second.read_until(b"$", timeout=40)
+        second.read_until(b"$", timeout=45)
         second.write(b"echo FRESH_IS=[$FRESH_MARK]\n")
         assert b"FRESH_IS=[]" in second.read_until(b"FRESH_IS=[]", timeout=25)
     finally:
@@ -349,7 +349,7 @@ def test_the_agent_stops_cleanly_and_leaves_no_shell(
         [AGENT_PYTHON, CLIENT], stack["client_env"], rows=24, cols=80
     )
     try:
-        session.read_until(b"$", timeout=30)
+        session.read_until(b"$", timeout=45)
         shell_pid = None
         deadline = time.time() + 15
         pidfile = os.path.join(tmp_path, "shell.pid")
@@ -484,7 +484,7 @@ def test_the_operator_reconnects_after_the_host_drops(stack: Stack) -> None:
         [AGENT_PYTHON, CLIENT], stack["client_env"], rows=24, cols=80
     )
     try:
-        session.read_until(b"$", timeout=30)
+        session.read_until(b"$", timeout=45)
         session.write(b"echo FIRST_MARK\n")
         assert b"FIRST_MARK" in session.read_until(b"FIRST_MARK", timeout=20)
         # The host's transport dies with its agent.
@@ -578,7 +578,7 @@ def test_two_operators_get_two_shells_at_once(stack: Stack) -> None:
     )
     second = None
     try:
-        first.read_until(b"$", timeout=30)
+        first.read_until(b"$", timeout=45)
         first.write(b"export FIRST_ONLY=42\n")
         time.sleep(0.5)
         first.write(b"echo FIRST_MARK=$FIRST_ONLY\n")
@@ -588,7 +588,7 @@ def test_two_operators_get_two_shells_at_once(stack: Stack) -> None:
         second = OperatorSession(
             [AGENT_PYTHON, CLIENT], stack["client_env"], rows=24, cols=80
         )
-        second.read_until(b"$", timeout=30)
+        second.read_until(b"$", timeout=45)
         second.write(b"echo SECOND_SEES=[$FIRST_ONLY]\n")
         # A separate shell: the first operator's variable is not visible.
         assert b"SECOND_SEES=[]" in second.read_until(b"SECOND_SEES=[]", timeout=25)

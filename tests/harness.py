@@ -302,16 +302,23 @@ def start_agent(
     proc = subprocess.Popen(
         [AGENT_PYTHON, AGENT], stdout=log, stderr=subprocess.STDOUT, env=env
     )
-    log.write(f"\n--- agent start pid={proc.pid} ---\n".encode())
+    marker = f"\n--- agent start pid={proc.pid} ---\n".encode()
+    log.write(marker)
     log.flush()
 
-    deadline = time.time() + 10.0
+    deadline = time.time() + 20.0
     while time.time() < deadline:
         try:
             with open(log_path, "rb") as f:
                 content = f.read()
-                if b"tunnel established" in content or b"waiting for an operator" in content:
-                    return proc
+                marker_idx = content.rfind(marker)
+                if marker_idx != -1:
+                    fresh = content[marker_idx + len(marker) :]
+                    if (
+                        b"tunnel established" in fresh
+                        or b"waiting for an operator" in fresh
+                    ):
+                        return proc
         except OSError:
             pass
         if proc.poll() is not None:

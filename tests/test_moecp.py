@@ -74,14 +74,28 @@ def moecp_test_env(tmp_path: Path) -> Iterator[MoecpHosts]:
             "MOESH_TUNNEL_NAME": _ALPHA,
         }
     )
-    log_file = open(tmp_path / f"agent-{_ALPHA}.log", "wb")  # noqa: SIM115
+    log_path = tmp_path / f"agent-{_ALPHA}.log"
+    log_file = open(log_path, "wb")  # noqa: SIM115
     agent = subprocess.Popen(
         [AGENT_PYTHON, os.path.join(TUNNEL_DIR, "moesh_tunnel.py")],
         stdout=log_file,
         stderr=subprocess.STDOUT,
         env=env,
     )
-    time.sleep(2.0)
+    deadline = time.time() + 20.0
+    while time.time() < deadline:
+        try:
+            with open(log_path, "rb") as f:
+                content = f.read()
+                if b"tunnel established" in content or b"waiting for an operator" in content:
+                    break
+        except OSError:
+            pass
+        if agent.poll() is not None:
+            raise TimeoutError(f"Agent {_ALPHA} exited prematurely with code {agent.returncode}")
+        time.sleep(0.05)
+    else:
+        raise TimeoutError(f"Agent {_ALPHA} timed out waiting for tunnel establishment")
 
     def client_env(host: str) -> dict[str, str]:
         cenv = dict(os.environ)
@@ -90,7 +104,7 @@ def moecp_test_env(tmp_path: Path) -> Iterator[MoecpHosts]:
                 "MOESH_SHELL_ADDR": f"127.0.0.1:{operator_v2_port}",
                 "MOESH_SHELL_KEYFILE": str(operator_keyfile),
                 "MOESH_SHELL_HOSTS_FILE": str(pins),
-                "MOESH_SHELL_HANDSHAKE_TIMEOUT": "10",
+                "MOESH_SHELL_HANDSHAKE_TIMEOUT": "30",
             }
         )
         return cenv

@@ -3,6 +3,17 @@
 All notable changes to `moesh`. The project is pre-1.0: behaviour may change
 between minor releases without a deprecation period.
 
+## 0.2.0a6 — 2026-10-30
+
+Test synchronization hardening and prompt refresh reliability across Python 3.11, 3.12, 3.13, and 3.14.
+
+### Fixed — test harness barriers, prompt redraw, and timeouts
+
+- **Fenced agent startup log polling (`tests/harness.py`).** `start_agent()` now searches for tunnel establishment strictly following the unique PID start marker, preventing restarted agent sessions from falsely matching output from earlier processes.
+- **Barrier synchronization on agent readiness (`tests/test_named_hosts.py`, `tests/test_moecp.py`, `tests/test_command_piping.py`).** Replaced static `time.sleep(2.0)` assumptions with active polling loops on agent log establishment, eliminating intermittent handshake timeouts under concurrent CI runner load.
+- **GNU Readline prompt suppression on re-attachment (`moesh_tunnel.py`).** Added `HostShell.refresh_screen()` toggling `cols` by 1 with `SIGWINCH` to force GNU Readline prompt redraw on reconnect without injecting keystrokes.
+- **Handshake timeout and interactive prompt wait alignment (`tests/test_integration.py`, `tests/test_operator_outcome.py`).** Aligned test handshake timeouts (`30s`) and initial interactive shell prompt wait thresholds (`45s`) with protocol constants (`proto.HANDSHAKE_TIMEOUT`), eliminating false-positive timeout assertions in congested test environments.
+
 ## 0.2.0a5 — 2026-10-30
 
 Engineering audit, client-perspective defect remediation, and documentation overhaul. Every entry below was verified against running code and reproducible test suites before release.

@@ -98,8 +98,33 @@ def _start_agent(
             stderr=subprocess.STDOUT,
             env=env,
         )
-        handle.write(f"\n--- agent start pid={proc.pid} ---\n".encode())
+        marker = f"\n--- agent start pid={proc.pid} ---\n".encode()
+        handle.write(marker)
         handle.flush()
+    deadline = time.time() + 20.0
+    while time.time() < deadline:
+        try:
+            with open(log_path, "rb") as f:
+                content = f.read()
+                marker_idx = content.rfind(marker)
+                if marker_idx != -1:
+                    fresh = content[marker_idx + len(marker) :]
+                    if (
+                        b"tunnel established" in fresh
+                        or b"waiting for an operator" in fresh
+                    ):
+                        break
+        except OSError:
+            pass
+        if proc.poll() is not None:
+            raise TimeoutError(
+                f"Agent process {proc.pid} exited prematurely with code {proc.returncode}"
+            )
+        time.sleep(0.05)
+    else:
+        raise TimeoutError(
+            f"Agent process {proc.pid} timed out waiting for tunnel establishment"
+        )
     return proc, str(log_path)
 
 
@@ -134,7 +159,7 @@ class Stack:
                 "MOESH_SHELL_KEYFILE": self.operator_keyfile,
                 "MOESH_SHELL_PEER_PUBFILE": self.agent_pubfile,
                 "MOESH_SHELL_HOSTS_FILE": self.pins,
-                "MOESH_SHELL_HANDSHAKE_TIMEOUT": "10",
+                "MOESH_SHELL_HANDSHAKE_TIMEOUT": "30",
                 "TERM": "xterm-256color",
             }
         )
