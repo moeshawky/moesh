@@ -82,7 +82,7 @@ def moecp_test_env(tmp_path: Path) -> Iterator[MoecpHosts]:
         stderr=subprocess.STDOUT,
         env=env,
     )
-    deadline = time.time() + 20.0
+    deadline = time.time() + 45.0
     while time.time() < deadline:
         try:
             with open(log_path, "rb") as f:

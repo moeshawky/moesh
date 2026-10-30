@@ -70,6 +70,7 @@ def stack(tmp_path: Path) -> Iterator[Stack]:
     agent = start_agent(
         tmp_path, "127.0.0.1", tunnel_port, agent_private, operator_public
     )
+    bridge._wait_for_line("host tunnel v2 attached", timeout=30.0)
     client_env = dict(os.environ)
     client_env.update(
         {

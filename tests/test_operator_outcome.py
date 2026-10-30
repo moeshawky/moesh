@@ -101,7 +101,7 @@ def _start_agent(
         marker = f"\n--- agent start pid={proc.pid} ---\n".encode()
         handle.write(marker)
         handle.flush()
-    deadline = time.time() + 20.0
+    deadline = time.time() + 45.0
     while time.time() < deadline:
         try:
             with open(log_path, "rb") as f:

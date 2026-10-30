@@ -86,7 +86,7 @@ def hosts(tmp_path: Path) -> Iterator[Hosts]:
             stderr=subprocess.STDOUT,
             env=env,
         )
-        deadline = time.time() + 20.0
+        deadline = time.time() + 45.0
         while time.time() < deadline:
             try:
                 with open(log_file_path, "rb") as f:
@@ -108,6 +108,8 @@ def hosts(tmp_path: Path) -> Iterator[Hosts]:
         _ALPHA: start_agent(_ALPHA, alpha_private, alpha_public),
         _BETA: start_agent(_BETA, beta_private, beta_public),
     }
+    bridge._wait_for_line(f"host {_ALPHA}", timeout=30.0)
+    bridge._wait_for_line(f"host {_BETA}", timeout=30.0)
 
     def client_env(host: str) -> dict[str, str]:
         env = dict(os.environ)

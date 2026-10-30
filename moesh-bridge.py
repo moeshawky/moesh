@@ -47,6 +47,7 @@ import hmac
 import json
 import os
 import queue
+import select
 import socket
 import sys
 import threading
@@ -289,7 +290,7 @@ def live_queued(q: queue.Queue[Any]) -> int:
         kept: list[Any] = []
         dead: list[Any] = []
         for item in list(q.queue):
-            if alive(_sock_of(item)):
+            if (isinstance(item, QueuedTunnel) and not item.ready.is_set()) or alive(_sock_of(item)):
                 kept.append(item)
             else:
                 dead.append(item)
@@ -1123,15 +1124,13 @@ def alive(sock: socket.socket) -> bool:
     bytes never delivered).
     """
     try:
-        sock.setblocking(False)
-        try:
-            data = sock.recv(1, socket.MSG_PEEK)
-        finally:
-            sock.setblocking(True)
-        return data != b""
-    except BlockingIOError:
-        return True
-    except OSError:
+        r, _, _ = select.select([sock], [], [], 0)
+        if not r:
+            return True
+        flags = socket.MSG_PEEK | getattr(socket, "MSG_DONTWAIT", 0)
+        peek = sock.recv(1, flags)
+        return peek != b""
+    except (OSError, ValueError):
         return False
 
 

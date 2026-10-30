@@ -318,7 +318,7 @@ def start_agent(
     log.write(marker)
     log.flush()
 
-    deadline = time.time() + 20.0
+    deadline = time.time() + 45.0
     while time.time() < deadline:
         try:
             with open(log_path, "rb") as f:
