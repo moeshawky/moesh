@@ -814,4 +814,167 @@ def test_prompt_race_sigwinch_on_silent_resume(monkeypatch: pytest.MonkeyPatch) 
         agent_sock.close()
 
 
+def test_cli_dashed_commands_parsing() -> None:
+    """Test commands containing dashes (ls -la, echo -n, etc.) are parsed correctly (DEF-F3)."""
+    import argparse
+    import shlex
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-n", "--host", default="default")
+    parser.add_argument("-q", "--quiet", action="store_true")
+    parser.add_argument("-c", "--command", dest="cmd_flag")
+    parser.add_argument("command", nargs=argparse.REMAINDER)
+
+    # 1. ls -la
+    args = parser.parse_args(["-n", "3", "ls", "-la"])
+    tokens = list(args.command)
+    assert args.host == "3"
+    assert tokens == ["ls", "-la"]
+    assert shlex.join(tokens) == "ls -la"
+
+    # 2. echo -n hello
+    args = parser.parse_args(["-n", "3", "echo", "-n", "hello"])
+    tokens = list(args.command)
+    assert args.host == "3"
+    assert tokens == ["echo", "-n", "hello"]
+    assert shlex.join(tokens) == "echo -n hello"
+
+    # 3. leading --
+    args = parser.parse_args(["-n", "3", "--", "ls", "-la"])
+    tokens = list(args.command)
+    if tokens and tokens[0] == "--":
+        tokens.pop(0)
+    assert tokens == ["ls", "-la"]
+
+    # 4. python3 -c 'print(1)' arg1
+    args = parser.parse_args(["-n", "3", "python3", "-c", "print(1)", "arg1"])
+    tokens = list(args.command)
+    assert tokens == ["python3", "-c", "print(1)", "arg1"]
+
+
+def test_direct_exec_cat_large_payload_bidirectional() -> None:
+    """Test 1MB payload piped through cat completes without pipe deadlock (DEF-F1)."""
+    client_sock, client_sec, agent_sock, agent_sec, accepted = _setup_authenticated_exec(
+        command="cat"
+    )
+
+    t = threading.Thread(
+        target=lambda: moesh_tunnel.run_exec_session(agent_sock, agent_sec, accepted)
+    )
+    t.start()
+
+    r_out, w_out = os.pipe()
+    r_in, w_in = os.pipe()
+
+    payload_size = 1024 * 1024
+    payload = os.urandom(payload_size)
+    received = bytearray()
+
+    def reader() -> None:
+        while True:
+            try:
+                chunk = os.read(r_out, 65536)
+                if not chunk:
+                    break
+                received.extend(chunk)
+            except OSError:
+                break
+
+    rt = threading.Thread(target=reader)
+    rt.start()
+
+    def writer() -> None:
+        view = memoryview(payload)
+        while view:
+            written = os.write(w_in, view)
+            view = view[written:]
+        os.close(w_in)
+
+    wt = threading.Thread(target=writer)
+    wt.start()
+
+    try:
+        status = moesh_shell.run_exec_session(
+            client_sock,
+            client_sec,
+            accepted,
+            stdin_fd=r_in,
+            stdout_fd=w_out,
+        )
+        assert status == 0
+    finally:
+        os.close(w_out)
+        wt.join(timeout=5.0)
+        rt.join(timeout=5.0)
+        t.join(timeout=5.0)
+        os.close(r_out)
+        os.close(r_in)
+        client_sock.close()
+        agent_sock.close()
+
+    assert bytes(received) == payload
+
+
+def test_direct_exec_child_process_killed_on_disconnect() -> None:
+    """Test child process group is terminated cleanly on client disconnect (DEF-F2)."""
+    client_sock, _client_sec, agent_sock, agent_sec, accepted = _setup_authenticated_exec(
+    )
+
+    t = threading.Thread(
+        target=lambda: moesh_tunnel.run_exec_session(agent_sock, agent_sec, accepted)
+    )
+    t.start()
+
+    time.sleep(0.3)
+    client_sock.close()
+
+    t.join(timeout=3.0)
+    assert not t.is_alive(), "agent run_exec_session thread should terminate after client drop"
+
+
+def test_moecp_quiet_flag_suppresses_logs() -> None:
+    """Test moecp -q sets moesh_shell._QUIET (DEF-F7)."""
+    import moecp
+
+    moesh_shell._QUIET = False
+    with pytest.raises(SystemExit):
+        moecp.main(["-q", "dummy"])
+    assert moesh_shell._QUIET is True
+
+
+def test_native_transfer_missing_module_sends_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test run_native_transfer emits Msg.ERROR when moecp is not importable (DEF-F4, DEF-F5)."""
+    import sys
+
+    monkeypatch.setitem(sys.modules, "moecp", None)
+
+    client_sock, agent_sock = _tcp_pair()
+    op_priv, op_pub = proto.generate_static_keypair()
+    ag_priv, ag_pub = proto.generate_static_keypair()
+    client_session = proto.NoiseSession("initiator", op_priv, ag_pub)
+    agent_session = proto.NoiseSession("responder", ag_priv, op_pub)
+    client_chan = proto.Channel(client_sock)
+    agent_chan = proto.Channel(agent_sock)
+
+    client_chan.send_frame(client_session.write_handshake())
+    agent_session.read_handshake(agent_chan.recv_frame())
+    agent_chan.send_frame(agent_session.write_handshake())
+    client_session.read_handshake(client_chan.recv_frame())
+    client_chan.send_frame(client_session.write_handshake())
+    agent_session.read_handshake(agent_chan.recv_frame())
+
+    client_sec = proto.SecureChannel(client_chan, client_session)
+    agent_sec = proto.SecureChannel(agent_chan, agent_session)
+
+    try:
+        res = moesh_tunnel.run_native_transfer(agent_sock, agent_sec, {"session_type": "transfer"})
+        assert res == "closed"
+        records = client_sec.drain()
+        assert len(records) >= 1
+        msg_type, payload = records[0]
+        assert msg_type == proto.Msg.ERROR
+        assert b"missing required module" in payload
+    finally:
+        client_sock.close()
+        agent_sock.close()
 

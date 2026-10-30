@@ -227,7 +227,7 @@ def test_tunnel_worker_incident_scoped_deadline(monkeypatch: pytest.MonkeyPatch)
         raise moesh_tunnel.Stop()
 
     monkeypatch.setattr(moesh_tunnel, "serve_once", mock_serve_once)
-    monkeypatch.setattr(moesh_tunnel.time, "sleep", lambda _s: None)
+    monkeypatch.setattr("moesh_tunnel.time.sleep", lambda _s: None)
     moesh_tunnel._stopping = False
     moesh_tunnel._conflict_refused = False
 

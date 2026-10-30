@@ -1174,7 +1174,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "command",
-        nargs="*",
+        nargs=argparse.REMAINDER,
         help="command to execute on the remote host (e.g. 'ls -la' or 'cat')",
     )
     args = parser.parse_args(argv)
@@ -1218,17 +1218,21 @@ def main(argv: list[str] | None = None) -> int:
             f"section, or run 'moesh --new-master -n {host}' to create one"
         )
 
+    cmd_tokens = list(args.command)
+    if cmd_tokens and cmd_tokens[0] == "--":
+        cmd_tokens.pop(0)
+
     if args.cmd_flag is not None:
-        if args.command:
+        if cmd_tokens:
             # Preserve command prefix and quoted argument when positional arguments precede -c
-            cmd_str = shlex.join([*args.command, "-c", args.cmd_flag])
+            cmd_str = shlex.join([*cmd_tokens, "-c", args.cmd_flag])
         else:
             cmd_str = args.cmd_flag
-    elif len(args.command) > 1:
+    elif len(cmd_tokens) > 1:
         # Preserve quotes and argument splitting via shlex.join for multiple arguments (DEF-03, October 2026)
-        cmd_str = shlex.join(args.command)
-    elif len(args.command) == 1:
-        cmd_str = args.command[0]
+        cmd_str = shlex.join(cmd_tokens)
+    elif len(cmd_tokens) == 1:
+        cmd_str = cmd_tokens[0]
     else:
         cmd_str = None
 

@@ -917,8 +917,18 @@ def run_native_transfer(
         import moecp
 
         moecp.run_native_agent_transfer(sock, secure, accepted)
+    except ModuleNotFoundError as exc:
+        log(f"native transfer error: missing required module ({exc})")
+        with contextlib.suppress(Exception):
+            payload = json.dumps({
+                "error": f"remote host missing required module: {exc}; please deploy moecp.py on the agent"
+            }).encode("utf-8")
+            secure.send(proto.Msg.ERROR, payload)
     except Exception as exc:
         log(f"native transfer error: {exc!r}")
+        with contextlib.suppress(Exception):
+            payload = json.dumps({"error": f"native transfer error: {exc}"}).encode("utf-8")
+            secure.send(proto.Msg.ERROR, payload)
     return "closed"
 
 
@@ -961,6 +971,7 @@ def run_exec_session(
         stderr=subprocess.STDOUT,
         bufsize=0,
         env=child_env,
+        start_new_session=True,
     )
     assert proc.stdout is not None
     assert proc.stdin is not None
@@ -968,26 +979,38 @@ def run_exec_session(
     stdout_fd = proc.stdout.fileno()
     os.set_blocking(stdout_fd, False)
 
+    stdin_fd = proc.stdin.fileno()
+    os.set_blocking(stdin_fd, False)
+
     max_record = int(accepted.get("max_record", proto.MAX_DATA_PAYLOAD))
+    stdin_buf = bytearray()
+    stdin_eof_received = False
     stdin_closed = False
     stdout_eof = False
     client_interrupted = False
+    max_stdin_backpressure = 1024 * 1024
 
     while True:
-        watched: list[int | socket.socket] = [sock]
+        watched_read: list[int | socket.socket] = []
+        if len(stdin_buf) < max_stdin_backpressure:
+            watched_read.append(sock)
         if not stdout_eof:
-            watched.append(stdout_fd)
+            watched_read.append(stdout_fd)
+
+        watched_write: list[int] = []
+        if stdin_buf and not stdin_closed:
+            watched_write.append(stdin_fd)
 
         try:
-            ready, _, _ = select.select(watched, [], [], 0.5)
+            ready_read, ready_write, _ = select.select(watched_read, watched_write, [], 0.2)
         except (ValueError, OSError):
             client_interrupted = True
             break
 
         # Read output from child
-        if stdout_fd in ready:
+        if stdout_fd in ready_read:
             try:
-                data = os.read(stdout_fd, 16384)
+                data = os.read(stdout_fd, 65536)
             except (BlockingIOError, OSError):
                 data = b""
             if not data:
@@ -1001,9 +1024,22 @@ def run_exec_session(
                         stdout_eof = True
                         break
 
+        # Write buffered stdin to child non-blocking
+        if stdin_fd in ready_write and stdin_buf:
+            try:
+                written = os.write(stdin_fd, stdin_buf[:65536])
+                del stdin_buf[:written]
+            except (BrokenPipeError, OSError):
+                stdin_closed = True
+                stdin_buf.clear()
+            if stdin_eof_received and not stdin_buf and not stdin_closed:
+                stdin_closed = True
+                with contextlib.suppress(OSError):
+                    proc.stdin.close()
+
         # Check records from operator
         records = secure.buffered()
-        if sock in ready:
+        if sock in ready_read:
             try:
                 records += secure.drain()
             except proto.TransportEOF:
@@ -1014,16 +1050,13 @@ def run_exec_session(
             if msg_type == Msg.DATA:
                 if not payload:
                     # EOF from operator on stdin
-                    if not stdin_closed:
+                    stdin_eof_received = True
+                    if not stdin_buf and not stdin_closed:
                         stdin_closed = True
                         with contextlib.suppress(OSError):
                             proc.stdin.close()
-                elif not stdin_closed:
-                    try:
-                        proc.stdin.write(payload)
-                        proc.stdin.flush()
-                    except (BrokenPipeError, OSError):
-                        stdin_closed = True
+                elif not stdin_closed and not stdin_eof_received:
+                    stdin_buf.extend(payload)
             elif msg_type == Msg.CLOSE:
                 client_interrupted = True
                 stdout_eof = True
@@ -1036,7 +1069,7 @@ def run_exec_session(
             # Drain any remaining bytes from child stdout
             while True:
                 try:
-                    data = os.read(stdout_fd, 16384)
+                    data = os.read(stdout_fd, 65536)
                 except (BlockingIOError, OSError):
                     break
                 if not data:
@@ -1048,18 +1081,35 @@ def run_exec_session(
 
     with contextlib.suppress(OSError):
         proc.stdin.close()
+
+    pgid: int | None = None
+    with contextlib.suppress(OSError):
+        pgid = os.getpgid(proc.pid)
+
     if client_interrupted and proc.poll() is None:
-        proc.terminate()
+        if pgid is not None:
+            with contextlib.suppress(OSError):
+                os.killpg(pgid, signal.SIGTERM)
+        with contextlib.suppress(OSError):
+            proc.terminate()
         try:
             status = proc.wait(timeout=0.5)
         except subprocess.TimeoutExpired:
-            proc.kill()
+            if pgid is not None:
+                with contextlib.suppress(OSError):
+                    os.killpg(pgid, signal.SIGKILL)
+            with contextlib.suppress(OSError):
+                proc.kill()
             status = proc.wait()
     else:
         try:
             status = proc.wait(timeout=5.0)
         except subprocess.TimeoutExpired:
-            proc.kill()
+            if pgid is not None:
+                with contextlib.suppress(OSError):
+                    os.killpg(pgid, signal.SIGKILL)
+            with contextlib.suppress(OSError):
+                proc.kill()
             status = proc.wait()
 
     log(f"exec session finished: exit_code={status}")

@@ -839,7 +839,12 @@ class FramedStreamClient:
         def _consume_records(records: list[tuple[int, bytes]]) -> None:
             for msg_type, data in records:
                 if msg_type == Msg.ERROR:
-                    raise ProtocolError(f"remote error: {data.decode('utf-8', 'replace')}")
+                    err_text = data.decode("utf-8", "replace")
+                    with contextlib.suppress(Exception):
+                        err_json = json.loads(err_text)
+                        if isinstance(err_json, dict) and "error" in err_json:
+                            err_text = str(err_json["error"])
+                    raise ProtocolError(f"remote error: {err_text}")
                 if msg_type == Msg.CLOSE:
                     raise TransportEOF("remote closed session")
                 if msg_type == Msg.DATA:
@@ -2182,7 +2187,7 @@ def connect_and_run(
 
             return action_fn(client)
         except (TimeoutError, TransportEOF, OSError, ProtocolError) as exc:
-            if attempt + 1 < retries:
+            if attempt + 1 < retries and not isinstance(exc, ProtocolError):
                 time.sleep(0.5 * (attempt + 1))
                 continue
             sys.stderr.write(f"moecp: connection interrupted: {exc}\n")
@@ -2260,6 +2265,11 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     args = parser.parse_args(argv)
+
+    if args.quiet:
+        import moesh_shell
+
+        moesh_shell._QUIET = True
 
     if len(args.paths) < 2:
         parser.error("must provide at least one source and one destination target")

@@ -304,7 +304,7 @@ def test_rc5_tunnel_worker_recovers_from_transient_conflict(monkeypatch: pytest.
         return "closed"
 
     monkeypatch.setattr(moesh_tunnel, "serve_once", mock_serve_once)
-    monkeypatch.setattr(moesh_tunnel.time, "sleep", lambda _s: None)
+    monkeypatch.setattr("moesh_tunnel.time.sleep", lambda _s: None)
     moesh_tunnel._stopping = False
     moesh_tunnel._conflict_refused = False
 
@@ -334,8 +334,8 @@ def test_rc5_tunnel_worker_falsification_persistent_conflict_terminates(monkeypa
     def mock_serve_once(*_args: Any, **_kwargs: Any) -> str:
         raise moesh_tunnel.HostConflictError("persistent 409 conflict")
 
-    monkeypatch.setattr(moesh_tunnel.time, "time", mock_time)
-    monkeypatch.setattr(moesh_tunnel.time, "sleep", mock_sleep)
+    monkeypatch.setattr("moesh_tunnel.time.time", mock_time)
+    monkeypatch.setattr("moesh_tunnel.time.sleep", mock_sleep)
     monkeypatch.setattr(moesh_tunnel, "serve_once", mock_serve_once)
     moesh_tunnel._stopping = False
     moesh_tunnel._conflict_refused = False
@@ -371,7 +371,7 @@ def test_rc9_relay_worker_recovers_from_transient_conflict(monkeypatch: pytest.M
         return s, 26420, b"", False
 
     monkeypatch.setattr(moesh_relay, "connect_tunnel", mock_connect_tunnel)
-    monkeypatch.setattr(moesh_relay.time, "sleep", lambda _s: None)
+    monkeypatch.setattr("moesh_relay.time.sleep", lambda _s: None)
 
     refused = threading.Event()
     with contextlib.suppress(KeyboardInterrupt):
@@ -399,8 +399,8 @@ def test_rc9_relay_worker_falsification_persistent_conflict_aborts(monkeypatch: 
     def mock_connect_tunnel(*_args: Any, **_kwargs: Any) -> tuple[Any, int, bytes, bool]:
         raise moesh_relay.RelayRefused("persistent 409 conflict")
 
-    monkeypatch.setattr(moesh_relay.time, "time", mock_time)
-    monkeypatch.setattr(moesh_relay.time, "sleep", mock_sleep)
+    monkeypatch.setattr("moesh_relay.time.time", mock_time)
+    monkeypatch.setattr("moesh_relay.time.sleep", mock_sleep)
     monkeypatch.setattr(moesh_relay, "connect_tunnel", mock_connect_tunnel)
 
     refused = threading.Event()

@@ -112,8 +112,8 @@ is /__moesh/tunnel)."""
 
 BASE = "/kaggle/working" if os.path.isdir("/kaggle/working") else os.getcwd()
 
-AGENT_FILES = ("moesh_wire.py", "moesh_proto.py", "moesh_tunnel.py")
-"""The agent and the two modules it imports, fetched from the upstream
+AGENT_FILES = ("moesh_wire.py", "moesh_proto.py", "moesh_tunnel.py", "moecp.py", "moesh_shell.py")
+"""The agent and the modules it imports, fetched from the upstream
 repository. Measured 2026-10-25: these are the published names and each one
 answers HTTP 200; the earlier `_v2` names answer 404 on every surface."""
 

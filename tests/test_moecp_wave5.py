@@ -14,6 +14,7 @@ import socket
 import struct
 import subprocess
 import sys
+import threading
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -156,7 +157,7 @@ def test_upload_multiple_files_to_non_dir_raises_protocol_error(tmp_path: Path) 
         resp = _pack_frame({"status": "OK", "target_is_dir": False})
         s_server.sendall(resp)
 
-    t = subprocess.threading.Thread(target=server_thread, daemon=True)
+    t = threading.Thread(target=server_thread, daemon=True)
     t.start()
 
     dest_path = str(tmp_path / "existing_file")
@@ -393,7 +394,7 @@ def test_clean_transfer_sends_msg_close(tmp_path: Path) -> None:
         _ = read_exact(s_server, hl + pl)
         s_server.sendall(_pack_frame({"status": "DONE"}))
 
-    t = subprocess.threading.Thread(target=server_thread, daemon=True)
+    t = threading.Thread(target=server_thread, daemon=True)
     t.start()
 
     try:
@@ -501,7 +502,7 @@ def test_upload_skips_broken_symlink_without_crashing(tmp_path: Path, capsys: py
         _ = read_exact(s_server, hl + pl)
         s_server.sendall(_pack_frame({"status": "DONE"}))
 
-    t = subprocess.threading.Thread(target=server_thread, daemon=True)
+    t = threading.Thread(target=server_thread, daemon=True)
     t.start()
 
     try:
