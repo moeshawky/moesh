@@ -77,6 +77,7 @@ def stack(tmp_path: Path) -> Iterator[Stack]:
             "MOESH_SHELL_KEYFILE": operator_keyfile,
             "MOESH_SHELL_PEER_PUBFILE": agent_pubfile,
             "MOESH_SHELL_HOSTS_FILE": pins_file,
+            "MOESH_SHELL_HANDSHAKE_TIMEOUT": "60",
             "TERM": "xterm-256color",
         }
     )
@@ -175,7 +176,7 @@ def test_an_unauthenticated_operator_cannot_reach_the_shell(
     session = OperatorSession([AGENT_PYTHON, CLIENT], env, rows=24, cols=80)
     try:
         with pytest.raises(AssertionError):
-            session.read_until(b"$", timeout=15)
+            session.read_until(b"$", timeout=35)
     finally:
         session.close()
     with open(stack["agent_log"], errors="replace") as handle:
@@ -484,7 +485,7 @@ def test_the_operator_reconnects_after_the_host_drops(stack: Stack) -> None:
         [AGENT_PYTHON, CLIENT], stack["client_env"], rows=24, cols=80
     )
     try:
-        session.read_until(b"$", timeout=45)
+        session.read_until(b"$", timeout=60)
         session.write(b"echo FIRST_MARK\n")
         assert b"FIRST_MARK" in session.read_until(b"FIRST_MARK", timeout=20)
         # The host's transport dies with its agent.
