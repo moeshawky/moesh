@@ -124,6 +124,30 @@ NET_BACKOFF_MAX = 30.0
 DETACHED_BUFFER = 262144
 """Bytes of shell output kept while no operator is attached (256 KiB)."""
 
+# Environment variables containing static private keys, master secrets, and tokens scrubbed from child process environments.
+SECRET_ENV_VARS = (
+    "MOESH_TUNNEL_AGENT_KEY",
+    "MOESH_TUNNEL_V2_AGENT_KEY",
+    "NB_TUNNEL_V2_AGENT_KEY",
+    "MOESH_TUNNEL_AGENT_KEYFILE",
+    "MOESH_TUNNEL_V2_AGENT_KEYFILE",
+    "NB_TUNNEL_V2_AGENT_KEYFILE",
+    "MOESH_TUNNEL_MASTER",
+    "MOESH_TUNNEL_V2_MASTER",
+    "NB_TUNNEL_V2_MASTER",
+    "MOESH_TUNNEL_AGENT_MASTER_SECRET",
+    "MOESH_TUNNEL_V2_AGENT_MASTER_SECRET",
+    "NB_TUNNEL_V2_AGENT_MASTER_SECRET",
+    "MOESH_TUNNEL_OPERATOR_PUB",
+    "MOESH_TUNNEL_V2_OPERATOR_PUB",
+    "NB_TUNNEL_V2_OPERATOR_PUB",
+    "MOESH_BRIDGE_RELAY_TOKEN",
+    "MOESH_RELAY_TOKEN",
+)
+"""Environment variables containing sensitive cryptographic secrets, tokens, and
+key locations scrubbed from spawned child process environments (DEF-12, measured October 2026).
+"""
+
 _stopping = False
 _conflict_refused = False
 
@@ -496,6 +520,9 @@ class HostShell:
     def spawn(self, term: str, rows: int, cols: int) -> None:
         """Terminate any previous shell and start a fresh interactive Bash.
 
+        Cleanses sensitive cryptographic material and configuration tokens from the
+        environment before executing the child shell (DEF-12, measured October 2026).
+
         Raises:
             ProtocolError: the child could not be started.
         """
@@ -506,15 +533,10 @@ class HostShell:
             os.environ["TERM"] = term
             os.environ["LANG"] = "C.UTF-8"
             os.environ["LC_ALL"] = "C.UTF-8"
-            for secret_var in (
-                "MOESH_TUNNEL_AGENT_KEY",
-                "MOESH_TUNNEL_AGENT_KEYFILE",
-                "MOESH_TUNNEL_MASTER",
-                "MOESH_TUNNEL_AGENT_MASTER_SECRET",
-                "MOESH_SHELL_OPERATOR_KEY",
-                "MOESH_TUNNEL_CHILD_PIDFILE",
-            ):
+            for secret_var in SECRET_ENV_VARS:
                 os.environ.pop(secret_var, None)
+            os.environ.pop("MOESH_SHELL_OPERATOR_KEY", None)
+            os.environ.pop("MOESH_TUNNEL_CHILD_PIDFILE", None)
             try:
                 # exec, not a shell: the argv is fixed and the path is
                 # absolute, so nothing here is interpolated.
@@ -825,9 +847,15 @@ class ShellPool:
             self._cond.notify_all()
 
     def reap(self) -> None:
-        """Terminate the shells that have exited, keeping the pool bounded."""
+        """Terminate the shells that have exited, keeping the pool bounded.
+
+        Reaps non-busy shells to prevent terminated child processes from lingering
+        as defunct zombies (DEF-16, measured October 2026).
+        """
         with self._cond:
             for shell in list(self._shells):
+                if id(shell) not in self._busy:
+                    shell.reap()
                 if not shell.alive:
                     self._drop(shell)
             idle = [s for s in self._shells if id(s) not in self._busy]
@@ -901,6 +929,10 @@ def run_exec_session(
 ) -> str:
     """Execute a non-interactive command or pipeline and relay stdin/stdout.
 
+    Scrubs secret environment variables from the child environment (DEF-12)
+    and terminates the child process promptly upon client interruption or
+    disconnect (DEF-04, measured October 2026).
+
     Preconditions:
         Noise handshake is complete; accepted dictionary carries optional "command".
     Postconditions:
@@ -917,15 +949,10 @@ def run_exec_session(
     child_env = os.environ.copy()
     child_env["LANG"] = "C.UTF-8"
     child_env["LC_ALL"] = "C.UTF-8"
-    for secret_var in (
-        "MOESH_TUNNEL_AGENT_KEY",
-        "MOESH_TUNNEL_AGENT_KEYFILE",
-        "MOESH_TUNNEL_MASTER",
-        "MOESH_TUNNEL_AGENT_MASTER_SECRET",
-        "MOESH_SHELL_OPERATOR_KEY",
-        "MOESH_TUNNEL_CHILD_PIDFILE",
-    ):
+    for secret_var in SECRET_ENV_VARS:
         child_env.pop(secret_var, None)
+    child_env.pop("MOESH_SHELL_OPERATOR_KEY", None)
+    child_env.pop("MOESH_TUNNEL_CHILD_PIDFILE", None)
 
     proc = subprocess.Popen(  # noqa: S603 - authenticated remote shell command execution
         shell_cmd,
@@ -944,6 +971,7 @@ def run_exec_session(
     max_record = int(accepted.get("max_record", proto.MAX_DATA_PAYLOAD))
     stdin_closed = False
     stdout_eof = False
+    client_interrupted = False
 
     while True:
         watched: list[int | socket.socket] = [sock]
@@ -953,6 +981,7 @@ def run_exec_session(
         try:
             ready, _, _ = select.select(watched, [], [], 0.5)
         except (ValueError, OSError):
+            client_interrupted = True
             break
 
         # Read output from child
@@ -968,6 +997,7 @@ def run_exec_session(
                     try:
                         secure.send(Msg.DATA, piece)
                     except (OSError, ProtocolError):
+                        client_interrupted = True
                         stdout_eof = True
                         break
 
@@ -977,6 +1007,7 @@ def run_exec_session(
             try:
                 records += secure.drain()
             except proto.TransportEOF:
+                client_interrupted = True
                 break
 
         for msg_type, payload in records:
@@ -994,6 +1025,7 @@ def run_exec_session(
                     except (BrokenPipeError, OSError):
                         stdin_closed = True
             elif msg_type == Msg.CLOSE:
+                client_interrupted = True
                 stdout_eof = True
                 break
 
@@ -1016,11 +1048,19 @@ def run_exec_session(
 
     with contextlib.suppress(OSError):
         proc.stdin.close()
-    try:
-        status = proc.wait(timeout=5.0)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        status = proc.wait()
+    if client_interrupted and proc.poll() is None:
+        proc.terminate()
+        try:
+            status = proc.wait(timeout=0.5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            status = proc.wait()
+    else:
+        try:
+            status = proc.wait(timeout=5.0)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            status = proc.wait()
 
     log(f"exec session finished: exit_code={status}")
     with contextlib.suppress(Exception):
@@ -1036,7 +1076,9 @@ def negotiate(
 ) -> dict[str, Any]:
     """Run HELLO/ACCEPT/READY and attach to (or start) the shell.
 
-    Returns the accepted configuration.
+    Returns the accepted configuration. On silent re-attachment to an existing
+    shell with an empty output buffer, sends SIGWINCH to redraw the prompt without
+    injecting extraneous keystrokes (measured October 2026).
 
     Raises:
         NegotiationError: the operator's HELLO was not acceptable.
@@ -1098,6 +1140,9 @@ def negotiate(
                 log(f"replaying {len(held)} buffered bytes")
             for piece in chunks(held, accepted["max_record"]):
                 secure.send(Msg.DATA, piece)
+        elif resumed and shell.pid is not None:
+            with contextlib.suppress(ProcessLookupError, OSError):
+                os.kill(shell.pid, signal.SIGWINCH)
         accepted["_shell"] = shell
         success = True
         return accepted
@@ -1153,9 +1198,9 @@ def run_session(
                 log("the operator stopped answering; detaching")
                 return "detached"
         if dead_after > 0 and now - last_rx > dead_after:
-            # The operator client pings every 15s; 90s of silence means it is
+            # The operator client pings every 15s; silence beyond dead_after means it is
             # gone (or the path is black-holing).  Detach and keep the shell.
-            log("no traffic from the operator for 90s; detaching (the shell stays)")
+            log(f"no traffic from the operator for {int(dead_after)}s; detaching (the shell stays)")
             return "detached"
         if shell.fd in ready:
             data = shell.read_output()
@@ -1386,11 +1431,21 @@ def generate_key(keyfile: str, force: bool = False) -> int:
 
 
 def fetch_status(host: str, port: int) -> dict[str, Any]:
-    """Query ``GET /__moesh/status`` on the receiver and return the parsed JSON."""
+    """Query ``GET /__moesh/status`` on the receiver and return the parsed JSON.
+
+    Includes the relay authentication header if configured so probe and auto-host
+    succeed on authenticated bridges (G-COMP-1, measured October 2026).
+    """
+    token = (
+        os.environ.get("MOESH_BRIDGE_RELAY_TOKEN", "").strip()
+        or os.environ.get("MOESH_RELAY_TOKEN", "").strip()
+    )
+    auth_header = f"X-Moesh-Relay-Auth: {token}\r\n" if token else ""
     with socket.create_connection((host, port), timeout=10) as sock:
         req = (
             f"GET /__moesh/status HTTP/1.1\r\n"
             f"Host: {host}\r\n"
+            f"{auth_header}"
             "Connection: close\r\n\r\n"
         ).encode()
         sock.sendall(req)
