@@ -30,6 +30,7 @@ runs and restores it afterwards; writes the session's bytes to stdout.
 from __future__ import annotations
 
 import argparse
+import atexit
 import base64
 import contextlib
 import fcntl
@@ -37,6 +38,7 @@ import hashlib
 import json
 import os
 import select
+import shlex
 import signal
 import socket
 import stat
@@ -64,12 +66,23 @@ from moesh_proto import (
 
 # Default operator-shell receiver address as 'host:port' ('127.0.0.1:44441'); overridden by MOESH_SHELL_ADDR. Used as the default --addr for the shell client.
 DEFAULT_ADDR = "127.0.0.1:44441"
+def get_hosts_file() -> str:
+    """Return the filesystem path to the hosts.toml configuration file.
+
+    Evaluated dynamically on every invocation so runtime environment changes
+    (such as test harness overrides of MOESH_SHELL_HOSTS_FILE) take immediate effect
+    without requiring module reloading (G-SLOPPY-1, measured October 2026).
+    """
+    return os.environ.get(
+        "MOESH_SHELL_HOSTS_FILE",
+        os.path.expanduser("~/.config/moesh/hosts.toml"),
+    )
+
+
 # All of the operator's state lives in one config directory: the key material
 # and the pins file.  Override any piece with its environment variable.
-HOSTS_FILE = os.environ.get(
-    "MOESH_SHELL_HOSTS_FILE",
-    os.path.expanduser("~/.config/moesh/hosts.toml"),
-)
+# Module-level constant retained for backward compatibility (G-SLOPPY-1, October 2026).
+HOSTS_FILE = get_hosts_file()
 # Filesystem path to the operator's static private key (~/.config/moesh/operator.key); overridden by MOESH_SHELL_KEYFILE. Used to authenticate to agents.
 DEFAULT_KEYFILE = os.path.expanduser("~/.config/moesh/operator.key")
 # Filesystem path to the pinned agent static public key (~/.config/moesh/agent.pub); overridden by MOESH_SHELL_PEER_PUBFILE. Used to verify the remote agent's identity.
@@ -98,18 +111,21 @@ def load_config() -> dict[str, Any]:
 
     The file holds the prefix used to expand a number into a name, and one
     entry per host with its pinned public key (or the master secret the
-    key is derived from).
+    key is derived from). Evaluates MOESH_SHELL_HOSTS_FILE dynamically at
+    call time rather than relying solely on import-time module scope
+    (G-SLOPPY-1, measured October 2026).
     """
+    hosts_path = get_hosts_file()
     try:
         import tomllib
 
-        with open(HOSTS_FILE, "rb") as handle:
+        with open(hosts_path, "rb") as handle:
             config: dict[str, Any] = tomllib.load(handle)
             return config
     except FileNotFoundError:
         return {}
     except Exception as exc:
-        raise ProtocolError(f"cannot read {HOSTS_FILE}: {exc}") from exc
+        raise ProtocolError(f"cannot read {hosts_path}: {exc}") from exc
 
 
 def _check_label(name: str) -> str:
@@ -167,7 +183,7 @@ def new_master(host: str) -> int:
     print(f"master secret: {master.hex()}")
     print("  -> provision this to the host as MOESH_TUNNEL_MASTER")
     print(f"agent public:  {public}")
-    print(f"  -> put this in {HOSTS_FILE} as [hosts.{host}] agent_pub")
+    print(f"  -> put this in {get_hosts_file()} as [hosts.{host}] agent_pub")
     return 0
 
 
@@ -287,10 +303,11 @@ def pinned_key(host: str) -> bytes | tuple[bytes, ...]:
     if len(candidates) > 1:
         return tuple(candidates)
 
+    hosts_path = get_hosts_file()
     raise ProtocolError(
         "no pin for host {!r} in {} (known: {})".format(
             host,
-            HOSTS_FILE,
+            hosts_path,
             ", ".join(sorted(pins)) if isinstance(pins, dict) else "none",
         )
     )
@@ -353,7 +370,8 @@ def resolve_operator_keys(
     if os.path.exists(keyfile):
         keys.append(read_key(keyfile, "operator static private key"))
 
-    config = load_config() if os.path.exists(HOSTS_FILE) else {}
+    hosts_path = get_hosts_file()
+    config = load_config() if os.path.exists(hosts_path) else {}
     pins = config.get("hosts", {})
     entry = pins.get(host) if isinstance(pins, dict) else None
     if not isinstance(entry, dict):
@@ -400,16 +418,30 @@ class RawTerminal:
     """Put the local terminal in raw mode and restore it afterwards.
 
     The saved attributes are restored by :meth:`restore`, which is called from
-    every exit path (normal end, exception, SIGINT/SIGTERM/SIGHUP).
+    every exit path (normal end, exception, SIGINT/SIGTERM/SIGHUP). Installs
+    signal handlers for SIGTERM and SIGHUP and registers an atexit hook to
+    guarantee that the operator's local terminal line discipline is restored
+    to cooked mode even on sudden kill signals (S-ORPHAN-2, measured October 2026).
     """
 
     def __init__(self, fd: int) -> None:
         """Stores the file descriptor to put in raw mode and initializes saved termios attributes to None; no terminal changes occur until __enter__ saves and applies them."""
         self._fd = fd
         self._saved: list[Any] | None = None
+        self._old_handlers: dict[int, Any] = {}
+
+    def _signal_handler(self, signum: int, frame: Any) -> None:
+        """Restore cooked terminal mode on SIGTERM/SIGHUP then invoke previous handler or exit."""
+        self.restore()
+        old = self._old_handlers.get(signum)
+        if callable(old):
+            old(signum, frame)
+        else:
+            signal.signal(signum, signal.SIG_DFL)
+            os.kill(os.getpid(), signum)
 
     def __enter__(self) -> RawTerminal:
-        """Enter raw mode."""
+        """Enter raw mode and install signal/atexit safety restoration handlers."""
         if not os.isatty(self._fd):
             return self
         self._saved = termios.tcgetattr(self._fd)
@@ -439,14 +471,31 @@ class RawTerminal:
         mode[6][termios.VMIN] = 1
         mode[6][termios.VTIME] = 0
         termios.tcsetattr(self._fd, termios.TCSADRAIN, mode)
+
+        with contextlib.suppress(Exception):
+            atexit.register(self.restore)
+        self._old_handlers.clear()
+        for sig in (signal.SIGTERM, signal.SIGHUP):
+            try:
+                old = signal.signal(sig, self._signal_handler)
+                self._old_handlers[sig] = old
+            except (ValueError, OSError):
+                # Signals might not be registerable in non-main threads or some environments
+                pass
         return self
 
     def restore(self) -> None:
-        """Restore the saved terminal attributes (idempotent)."""
+        """Restore the saved terminal attributes and unregister signal hooks (idempotent)."""
         if self._saved is not None:
             with contextlib.suppress(OSError, termios.error):
                 termios.tcsetattr(self._fd, termios.TCSADRAIN, self._saved)
             self._saved = None
+        for sig, old in list(self._old_handlers.items()):
+            with contextlib.suppress(Exception):
+                signal.signal(sig, old)
+        self._old_handlers.clear()
+        with contextlib.suppress(Exception):
+            atexit.unregister(self.restore)
 
     def __exit__(
         self,
@@ -932,10 +981,11 @@ def run_exec_session(
     Postconditions:
         Local stdin is forwarded as Msg.DATA records to the remote command;
         Remote stdout/stderr arriving as Msg.DATA is written to local stdout;
-        Returns the command exit status code.
+        Returns the command exit status code (130 on SIGINT, 0 on broken pipe).
     Failure Modes:
         Surfaces TransportEOF if connection drops unexpectedly, and catches
-        local pipe errors on stdin/stdout writes.
+        local pipe errors on stdin/stdout writes (BrokenPipeError/OSError)
+        and local SIGINT interruption cleanly (DEF-04, DEF-05, measured October 2026).
     """
     if stdin_fd is None:
         try:
@@ -952,72 +1002,110 @@ def run_exec_session(
     stdin_eof = False
     cmd_exited = False
     status = 0
+    interrupted = False
+
+    def on_sigint(_signum: int, _frame: Any) -> None:
+        nonlocal interrupted
+        interrupted = True
+        raise KeyboardInterrupt
+
+    old_sigint: Any = None
+    try:
+        old_sigint = signal.getsignal(signal.SIGINT)
+        signal.signal(signal.SIGINT, on_sigint)
+    except (ValueError, OSError):
+        old_sigint = None
 
     try:
         fcntl.fcntl(stdin_fd, fcntl.F_GETFL)
     except OSError:
         stdin_eof = True
 
-    while True:
-        watched: list[int | socket.socket] = [sock]
-        if not stdin_eof:
-            watched.append(stdin_fd)
-
-        try:
-            ready, _, _ = select.select(watched, [], [], 0.5)
-        except (ValueError, OSError):
-            break
-
-        records = secure.buffered()
-        if sock in ready:
-            try:
-                records += secure.drain()
-            except TransportEOF:
-                if cmd_exited:
-                    return status
-                log("the connection dropped; remote command exited or network broke")
-                raise
-
-        for msg_type, payload in records:
-            if msg_type == Msg.DATA:
-                _write_all(stdout_fd, payload)
-            elif msg_type == Msg.PING:
-                secure.send(Msg.PONG, payload)
-            elif msg_type == Msg.PONG:
-                pass
-            elif msg_type == Msg.EXIT:
-                cmd_exited = True
-                try:
-                    decoded = json.loads(payload)
-                    if isinstance(decoded, dict):
-                        status = int(decoded.get("status", 0))
-                except (json.JSONDecodeError, TypeError, ValueError):
-                    status = 0
-                log(f"remote command finished (status {status})")
-            elif msg_type == Msg.CLOSE:
-                return status
-            elif msg_type == Msg.ERROR:
-                log(f"agent reported an error: {payload[:200]!r}")
-                return status or 1
-
-        if not stdin_eof and stdin_fd in ready:
-            try:
-                data = os.read(stdin_fd, 65536)
-            except OSError:
-                data = b""
-            if not data:
-                stdin_eof = True
+    try:
+        while True:
+            if interrupted:
                 with contextlib.suppress(Exception):
-                    secure.send(Msg.DATA, b"")
-            else:
-                for index in range(0, len(data), max_record):
-                    try:
-                        secure.send(Msg.DATA, data[index : index + max_record])
-                    except (OSError, ProtocolError):
-                        stdin_eof = True
-                        break
+                    secure.send_control(Msg.CLOSE, {"reason": "interrupt", "signal": "SIGINT"})
+                return 130
 
-    return status
+            watched: list[int | socket.socket] = [sock]
+            if not stdin_eof:
+                watched.append(stdin_fd)
+
+            try:
+                ready, _, _ = select.select(watched, [], [], 0.5)
+            except (ValueError, OSError):
+                if interrupted:
+                    with contextlib.suppress(Exception):
+                        secure.send_control(Msg.CLOSE, {"reason": "interrupt", "signal": "SIGINT"})
+                    return 130
+                break
+
+            records = secure.buffered()
+            if sock in ready:
+                try:
+                    records += secure.drain()
+                except TransportEOF:
+                    if cmd_exited:
+                        return status
+                    log("the connection dropped; remote command exited or network broke")
+                    raise
+
+            for msg_type, payload in records:
+                if msg_type == Msg.DATA:
+                    try:
+                        _write_all(stdout_fd, payload)
+                    except (BrokenPipeError, OSError):
+                        with contextlib.suppress(Exception):
+                            secure.send_control(Msg.CLOSE, {"reason": "broken_pipe"})
+                        return 0
+                elif msg_type == Msg.PING:
+                    secure.send(Msg.PONG, payload)
+                elif msg_type == Msg.PONG:
+                    pass
+                elif msg_type == Msg.EXIT:
+                    cmd_exited = True
+                    try:
+                        decoded = json.loads(payload)
+                        if isinstance(decoded, dict):
+                            status = int(decoded.get("status", 0))
+                    except (json.JSONDecodeError, TypeError, ValueError):
+                        status = 0
+                    log(f"remote command finished (status {status})")
+                elif msg_type == Msg.CLOSE:
+                    return status
+                elif msg_type == Msg.ERROR:
+                    log(f"agent reported an error: {payload[:200]!r}")
+                    return status or 1
+
+            if not stdin_eof and stdin_fd in ready:
+                try:
+                    data = os.read(stdin_fd, 65536)
+                except OSError:
+                    data = b""
+                if not data:
+                    stdin_eof = True
+                    with contextlib.suppress(Exception):
+                        secure.send(Msg.DATA, b"")
+                else:
+                    for index in range(0, len(data), max_record):
+                        try:
+                            secure.send(Msg.DATA, data[index : index + max_record])
+                        except (OSError, ProtocolError):
+                            stdin_eof = True
+                            break
+
+        return status
+    except KeyboardInterrupt:
+        with contextlib.suppress(Exception):
+            secure.send_control(Msg.CLOSE, {"reason": "interrupt", "signal": "SIGINT"})
+        return 130
+    finally:
+        if old_sigint is not None:
+            with contextlib.suppress(Exception):
+                signal.signal(signal.SIGINT, old_sigint)
+        with contextlib.suppress(BrokenPipeError, OSError):
+            sys.stdout.flush()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1078,6 +1166,13 @@ def main(argv: list[str] | None = None) -> int:
         help="suppress informational messages on stderr",
     )
     parser.add_argument(
+        "-c",
+        "--command",
+        dest="cmd_flag",
+        metavar="COMMAND",
+        help="command string to execute non-interactively on the remote host",
+    )
+    parser.add_argument(
         "command",
         nargs="*",
         help="command to execute on the remote host (e.g. 'ls -la' or 'cat')",
@@ -1101,7 +1196,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     op_keys = resolve_operator_keys(args.keyfile, host, explicit_keyfile=explicit_kf)
     private = op_keys[0]
-    config = load_config() if os.path.exists(HOSTS_FILE) else {}
+    hosts_path = get_hosts_file()
+    config = load_config() if os.path.exists(hosts_path) else {}
     hosts = config.get("hosts", {})
     env_master = (
         os.environ.get("MOESH_TUNNEL_MASTER", "").strip()
@@ -1118,17 +1214,25 @@ def main(argv: list[str] | None = None) -> int:
         peer = read_key(args.peer_pubfile, "agent static public key")
     else:
         raise ProtocolError(
-            f"no configuration for host {host!r} in {HOSTS_FILE}: add a [hosts.{host}] "
+            f"no configuration for host {host!r} in {hosts_path}: add a [hosts.{host}] "
             f"section, or run 'moesh --new-master -n {host}' to create one"
         )
 
-    is_exec = bool(args.command) or not os.isatty(sys.stdin.fileno())
-    if not is_exec and not os.isatty(sys.stdin.fileno()):
-        raise ProtocolError(
-            "standard input is not a terminal: moesh needs a real terminal "
-            "to advertise its size and to restore it afterwards"
-        )
-    cmd_str = " ".join(args.command) if args.command else None
+    if args.cmd_flag is not None:
+        if args.command:
+            # Preserve command prefix and quoted argument when positional arguments precede -c
+            cmd_str = shlex.join([*args.command, "-c", args.cmd_flag])
+        else:
+            cmd_str = args.cmd_flag
+    elif len(args.command) > 1:
+        # Preserve quotes and argument splitting via shlex.join for multiple arguments (DEF-03, October 2026)
+        cmd_str = shlex.join(args.command)
+    elif len(args.command) == 1:
+        cmd_str = args.command[0]
+    else:
+        cmd_str = None
+
+    is_exec = (cmd_str is not None) or not os.isatty(sys.stdin.fileno())
     session_type = "exec" if is_exec else "shell"
     if is_exec:
         args.reconnect = False
@@ -1152,6 +1256,9 @@ def main(argv: list[str] | None = None) -> int:
         except AuthenticationError:
             # An identity failure is not a network failure: never retry it.
             raise
+        except BrokenPipeError:
+            # Downstream broken pipe on non-interactive exec must return cleanly (DEF-05).
+            return 0
         except (TransportEOF, SessionTimeout, ProtocolError, OSError) as exc:
             if len(op_keys) > 1 and key_idx == 0 and isinstance(exc, TransportEOF):
                 key_idx += 1
