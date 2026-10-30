@@ -28,7 +28,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "moesh"
-version = "0.2.0a4"
+version = "0.2.0a5"
 description = "An SSH-like encrypted remote shell: Noise_XX over an HTTP/1.1 Upgrade, with a persistent shell"
 readme = "README.md"
 license = "Apache-2.0"
@@ -47,7 +47,7 @@ keywords = [
     "moecp",
 ]
 classifiers = [
-    # The version is 0.2.0a4, and the security policy calls the project
+    # The version is 0.2.0a5, and the security policy calls the project
     # pre-1.0 with no stable series.  The classifier says what the version
     # says; it does not claim a beta.
     "Development Status :: 3 - Alpha",
@@ -129,12 +129,10 @@ include = [
     "tests/**",
     "README.md",
     "CHANGELOG.md",
-    "HANDOFF.md",
     "LICENSE",
     "NOTICE",
     "PROTOCOL.md",
     "SECURITY.md",
-    "TEST-PROTOCOL.md",
     "pyproject.toml",
     "uv.lock",
     "docs/**",

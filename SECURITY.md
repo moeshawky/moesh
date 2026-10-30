@@ -48,8 +48,10 @@ From a source checkout the same two commands are
 
 Private keys are written with mode `0600`, are never printed, and never
 leave the host that generated them. Only the public half is meant to travel,
-and each side pins the other's public half by hand. See
-[docs/keys.md](docs/keys.md).
+and each side pins the other's public half by hand (or derives it deterministically
+from a shared fleet master secret). Sensitive key and token environment variables
+are scrubbed from child process environments spawned by the agent (`moesh_tunnel.py:128-149`).
+See [docs/keys.md](https://github.com/moeshawky/moesh/blob/master/docs/keys.md).
 
 If you find a private key committed in this repository, or in any history of
 it, treat it as compromised: report it privately and rotate the key on every
@@ -73,7 +75,7 @@ allows, and behaviour may change without a deprecation period between minor
 releases.
 
 The security model — what `moesh` protects and what it does not — is written
-down in [docs/security.md](docs/security.md). In short: the receiver is a
+down in [docs/security.md](https://github.com/moeshawky/moesh/blob/master/docs/security.md). In short: the receiver is a
 blind byte pump and never holds plaintext terminal data; the two ends pin
 each other's static keys; and the tool does not defend against a compromised
 endpoint, traffic analysis, or denial of service against the receiver.

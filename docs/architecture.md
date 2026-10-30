@@ -2,7 +2,7 @@
 
 This page explains how the pieces fit together and where the design came
 from. The wire contract — framing, record types, the session state machine —
-is in [../PROTOCOL.md](../PROTOCOL.md).
+is in [PROTOCOL.md](https://github.com/moeshawky/moesh/blob/master/PROTOCOL.md).
 
 ---
 
@@ -14,12 +14,12 @@ is in [../PROTOCOL.md](../PROTOCOL.md).
 | `moesh_proto.py` | the wire protocol engine: framing serialization, the Noise_XX session state machine, deterministic HKDF key derivation, terminal size negotiation. |
 | `moesh-tunnel` (`moesh_tunnel.py`) | **the agent daemon**: runs on the target host that offers the shell, holds the pool of tunnels and the pool of persistent PTY shells. |
 | `moesh` (`moesh_shell.py`) | **the operator client**: attaches to the receiver's operator port, performs mutual Noise_XX authentication, handles raw terminal discipline and window resizes. |
-| `moecp` (`moecp.py`) | **secure file copy**: scp-like utility over encrypted moesh transport, bootstrapping an ephemeral in-memory worker in a dedicated fresh PTY session with end-to-end SHA-256 verification and atomic staging. |
+| `moecp` (`moecp.py`) | **secure file copy**: scp-like utility over encrypted moesh transport, negotiating a native in-process transfer session on current agents (with fallback in-memory bootstrap worker on legacy agents), end-to-end SHA-256 verification, and atomic staging. |
 | `moesh-relay` (`moesh_relay.py`) | **accelerator reverse relay**: zero-dependency HTTP/1.1 Upgrade reverse pump connecting accelerator services (vLLM, GPU runners, embeddings) on remote nodes to receiver listening ports. |
 | `moesh-bridge` (`moesh-bridge.py`) | **the receiver broker**: pairs an operator with an agent's tunnel and copies bytes. It is a blind socket pump holding 0 keys and decrypting 0 bytes. |
 | `moesh-bridge.service` | the systemd unit for the receiver bridge. |
 | `PROTOCOL.md` | the wire contract and framing specification. |
-| `tests/` | the integration and verification suite: 149 tests covering protocol core, key generation, host identity, operator outcomes, moecp file transfers, and adversarial security boundaries. |
+| `tests/` | the verification suite: 254+ tests covering protocol core, key generation, host identity, operator outcomes, moecp file transfers, adversarial security boundaries, and automated documentation drift verification. |
 
 ---
 
@@ -78,14 +78,14 @@ agent host                                  receiver                    operator
 ```
 
 * The agent runs one worker thread per concurrent operator —
-  `MOESH_TUNNEL_SESSIONS`, three by default (`moesh_tunnel.py:1193`).
+  `MOESH_TUNNEL_SESSIONS`, three by default (`moesh_tunnel.py:1694`).
   Each worker holds one connection to the receiver and serves whoever claims
-  it (`moesh_tunnel.py:990-1030`).
-* The receiver keeps one queue per host name (`moesh-bridge.py:85-92`) and
+  it (`moesh_tunnel.py:1210-1280`).
+* The receiver keeps one queue per host name (`moesh-bridge.py:84-100`) and
   pairs an operator with the oldest **live** tunnel in that queue
-  (`moesh-bridge.py:298-324`). A tunnel that died while queued is discarded
+  (`moesh-bridge.py:1240-1340`). A tunnel that died while queued is discarded
   rather than paired.
-* The agent's shell pool hands out one shell per session (`moesh_tunnel.py:530-580`).
+* The agent's shell pool hands out one shell per session (`moesh_tunnel.py:738-868`).
   A detached shell is kept and given to the next operator; `--fresh` asks for a
   new one.
 
@@ -111,7 +111,7 @@ CONNECTED → AUTHENTICATED → NEGOTIATING → READY → ACTIVE → CLOSING
 
 Every transition is checked; an unlisted transition fails the session
 closed. The record types and the exact field lists are in
-[../PROTOCOL.md](../PROTOCOL.md).
+[PROTOCOL.md](https://github.com/moeshawky/moesh/blob/master/PROTOCOL.md).
 
 ---
 
@@ -141,7 +141,7 @@ operator terminal (moecp)                      receiver (blind bridge)          
    script file remotely.  This path keeps mixed fleets working; it is not the path a
    current agent uses.
 3. **Framed Streaming Protocol:** Communication switches to binary framing over the raw PTY:
-   - Chunked streaming with 1 MiB transfer chunks and zlib compression.
+   - Chunked streaming with 32 KiB transfer chunks (`moecp.py:77`) and zlib compression.
    - Maximum frame header: 64 KiB; maximum payload: 10 MiB (defends against memory exhaustion).
    - Decompressed output is bounded as well, and the decoded byte count cannot
      exceed the size the manifest declared for that file.
@@ -204,8 +204,8 @@ but not the agent:
 
 * the operator detaches → the shell keeps running, and its output is held
   in a bounded buffer (256 KiB) for the next operator
-  (`moesh_tunnel.py:114`, `:430-436`);
+  (`moesh_tunnel.py:124`, `:502-524`);
 * the operator re-attaches → the same shell, its directory, its variables
-  and its jobs (`moesh_tunnel.py:641-696`);
+  and its jobs (`moesh_tunnel.py:620-680`);
 * the agent stops → the shell is terminated with `SIGHUP` and reaped
-  (`moesh_tunnel.py:487-501`).
+  (`moesh_tunnel.py:702-736`).

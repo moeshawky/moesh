@@ -57,6 +57,22 @@ export MOESH_TUNNEL_HOST="auto"   # automatically claims lowest free host-<N> sl
 moesh-tunnel
 ```
 
+#### Standalone File Deployment (Ephemeral Containers / Kaggle / Colab)
+If running without `pip install moesh` by downloading raw source files from git, the agent requires 5 files in its working directory for full capabilities:
+- `moesh_wire.py` & `moesh_proto.py` (framing and cryptography engine)
+- `moesh_tunnel.py` (agent runner)
+- `moecp.py` (imported by `moesh_tunnel.py:917` for native in-process file transfers)
+- `moesh_shell.py` (imported for shared constants and resolution)
+
+```bash
+# Example standalone download:
+BASE="https://raw.githubusercontent.com/moeshawky/moesh/master"
+for f in moesh_wire.py moesh_proto.py moesh_tunnel.py moecp.py moesh_shell.py; do
+  curl -fsSL "$BASE/$f" -o "$f"
+done
+python3 moesh_tunnel.py
+```
+
 ### 2.2 Systemd Persistent Service
 To keep the agent running across reboots on a VM:
 

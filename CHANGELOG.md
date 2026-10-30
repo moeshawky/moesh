@@ -3,32 +3,37 @@
 All notable changes to `moesh`. The project is pre-1.0: behaviour may change
 between minor releases without a deprecation period.
 
-## Unreleased
+## 0.2.0a5 — 2026-10-30
 
-### Fixed — bridge admission, reconnection deadlocks, and socket keepalive
+Engineering audit, client-perspective defect remediation, and documentation overhaul. Every entry below was verified against running code and reproducible test suites before release.
 
-- **Deferred operator active accounting (`moesh-bridge.py`).** In `operator_v2_conn`,
-  `touch_host(host, 1)` is now deferred until a live tunnel is actually dequeued
-  and paired via an `on_pair` callback. An operator client waiting in `pair()`
-  for a tunnel no longer marks `_host_active[host] = 1`, preventing a circular
-  deadlock where a restarting agent is refused with `409 Conflict` because the
-  waiting operator is counted as an active session.
-- **Standby socket TCP keepalive (`moesh-bridge.py`).** Standby queued tunnel
-  and relay carrier sockets now enable `SO_KEEPALIVE` with tight probe intervals
-  (`TCP_KEEPIDLE=5`, `TCP_KEEPINTVL=2`, `TCP_KEEPCNT=3`), so half-open ghost
-  sockets from ungraceful drops (power loss, network partitions) are detected and
-  purged by the kernel instead of returning `True` in `alive()` via `MSG_PEEK`.
-- **Generational counter atomicity under queue capacity (`moesh-bridge.py`).**
-  In `admit_host`, the generation counter `_lease_gens[host]` is only committed
-  when `q.put_nowait` succeeds, preventing desynchronization on `queue.Full`.
-- **Incident-scoped conflict deadlines (`moesh_tunnel.py`, `moesh_relay.py`).**
-  `claim_deadline` is now initialized and evaluated per conflict incident rather
-  than once at process startup, allowing steady-state transient 409 conflicts to
-  retry without immediately terminating the agent process with exit code 3.
-- **Persistent carrier identity fallback (`moesh_tunnel.py`, `moesh_relay.py`).**
-  `derive_carrier_id()` generates a stable 16-hex identity derived from machine ID
-  or static key material when `MOESH_TUNNEL_ID` or `MOESH_RELAY_ID` is unset,
-  preventing alien carrier ID collisions across process restarts.
+### Added — non-interactive execution and binary streaming (`moesh`, `moesh_tunnel.py`)
+
+- **Direct remote execution (`session_type="exec"`).** `moesh` now supports non-interactive execution via `-c COMMAND` or positional argument lists (`moesh -n <N> [--] COMMAND [ARG ...]`). Commands execute in a dedicated subshell without requiring a local or remote TTY (`moesh_shell.py:1240-1257`, `moesh_tunnel.py:935-1119`).
+- **Dashed argument and quote preservation.** Command-line tokens are captured via `nargs=argparse.REMAINDER`, stripped of leading `--`, and joined via `shlex.join`, allowing complex dashed flags and quoted sub-commands (e.g. `moesh -n 3 python3 -c "print(1)"`) to pass through uncorrupted (`moesh_shell.py:1222-1234`).
+- **Bidirectional stdin/stdout streaming and pipe multiplexing.** Local `stdin` streams non-blocking to the remote child process, multiplexed with child `stdout` reads via `select.select` with a 1 MiB backpressure ceiling on unconsumed stdin buffers (`moesh_tunnel.py:991-1039`).
+- **Clean process group termination.** Remote commands execute in their own process session group (`start_new_session=True`). On client disconnect or transport loss, `moesh_tunnel.py` delivers `SIGTERM` followed by `SIGKILL` to the child process group (`os.killpg`), preventing orphaned background processes (`moesh_tunnel.py:974`, `:1085-1114`).
+- **Quiet mode logging (`-q` / `--quiet`).** Added `-q` to `moesh` and `moecp` to silence informational connection messages on `stderr`, allowing clean binary pipelines to `stdout` (`moesh_shell.py:1162-1166`, `moecp.py:2224-2228`, `:2269-2272`).
+
+### Fixed — dead-tunnel recovery, bridge deadlocks, and transfer errors
+
+- **CI matrix Python binding (`.github/workflows/ci.yml`, `.github/workflows/publish.yml`).** Explicitly pinned `uv sync --python ${{ matrix.python-version }}` and set `UV_PYTHON` across all matrix jobs, followed by an automated runtime version assertion (`sys.version_info`). Previously, `.python-version` specifying `3.14` caused `uv` to download and run pre-release Python 3.14 on all jobs regardless of the matrix interpreter.
+- **Multi-threaded agent PTY fork deadlock elimination (`moesh_tunnel.py`).** Replaced `pty.fork()` in `PersistentShell.spawn()` with `pty.openpty()` and `subprocess.Popen(["/bin/bash", "-i"], start_new_session=True, close_fds=True, env=child_env)`. Under POSIX `fork()` in multi-threaded processes (e.g. concurrent `tunnel_worker` threads), mutexes held by background threads deadlocked the child process in Python bytecode before `os.execv`, causing intermittent operator connection timeouts (`timed out waiting for b'$'; saw b''`).
+- **Client stderr diagnosis on test assertion timeout (`tests/harness.py`).** `read_until` now appends client stderr log contents to the `AssertionError` message on timeout, providing immediate diagnostic output if client-side connections drop or fail.
+- **Dead tunnel early detection (`PAIR_DEAD_MARKER`).** The bridge detects when an agent worker walks away before or during a Noise handshake and immediately writes `\x01MOESH_DEAD_TUNNEL\n` to the operator socket (`moesh_wire.py:63`, `moesh-bridge.py:1331-1333`). The client reads this after writing its first handshake frame and reconnects immediately without timing out (`moesh_proto.py:294-315`, `moesh_shell.py:532-557`).
+- **Deferred operator active accounting (`moesh-bridge.py`).** In `operator_v2_conn`, `touch_host(host, 1)` is deferred until a live tunnel is actually dequeued and paired. A waiting operator client no longer marks the host active, resolving circular 409 conflict deadlocks during agent restarts.
+- **Standby socket TCP keepalive (`moesh-bridge.py`).** Standby queued tunnel and relay carrier sockets enable `SO_KEEPALIVE` with tight probe intervals (`TCP_KEEPIDLE=5`, `TCP_KEEPINTVL=2`, `TCP_KEEPCNT=3`), purging half-open sockets caused by ungraceful drops.
+- **Incident-scoped conflict retry deadlines (`moesh_tunnel.py`, `moesh_relay.py`).** Conflict deadlines are initialized per incident rather than process startup, allowing transient 409 conflicts to retry cleanly.
+- **Persistent carrier identity derivation (`derive_carrier_id()`).** Derives a stable 16-hex identity from `/etc/machine-id` or static keys when `MOESH_TUNNEL_ID` or `MOESH_RELAY_ID` is unset (`moesh_tunnel.py:155-188`, `moesh_relay.py:61-86`).
+- **Structured native transfer error propagation (`moecp`, `moesh_tunnel.py`).** When `moecp` is missing on a remote agent during native transfer requests, `moesh_tunnel.py` emits a structured `Msg.ERROR` JSON payload instructing the operator to deploy `moecp.py` (`moesh_tunnel.py:920-928`). `moecp.py` decodes the error and aborts immediately without redundant retries on fatal protocol errors (`moecp.py:842-847`, `:2189-2190`).
+- **Sensitive environment variable scrubbing.** Sensitive variables (`MOESH_TUNNEL_*_KEY*`, `MOESH_TUNNEL_*MASTER*`, `MOESH_TUNNEL_*OPERATOR_PUB*`, `MOESH_*RELAY_TOKEN*`) are stripped from child processes spawned by the agent (`moesh_tunnel.py:128-149`, `:537-539`, `:962-965`).
+
+### Documentation and Packaging
+
+- **Created CLI Reference (`docs/cli.md`).** Full reference covering all 5 executables (`moesh`, `moecp`, `moesh-tunnel`, `moesh-relay`, `moesh-bridge`) with argparse definitions, exit codes, and examples.
+- **Automated doc drift verification (`tests/test_doc_drift.py`).** Pytest test suite asserting CLI option parity, valid source line citations, PyPI README link validity, and sdist exclusions.
+- **PyPI packaging hygiene (`pyproject.toml`).** Removed gitignored operator artifacts (`HANDOFF.md`, `TEST-PROTOCOL.md`) from the sdist tarball target, and converted `README.md` relative links to full GitHub URLs so links do not 404 on PyPI.
+- **Corrected documentation inconsistencies.** Fixed `--port` option in `docs/configuration.md` (was `--receiver-port`), corrected `CHUNK_SIZE` documentation to 32 KiB, resolved `moecp` in-process transfer descriptions in `docs/architecture.md`, and updated all source line citations.
 
 ## 0.2.0a4 — 2026-10-28
 

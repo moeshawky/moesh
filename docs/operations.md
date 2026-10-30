@@ -24,7 +24,7 @@ journalctl -u moesh-bridge -n 50
 
 ### The agent
 
-With the systemd unit from [install.md](install.md):
+With the systemd unit from [install.md](https://github.com/moeshawky/moesh/blob/master/docs/install.md):
 
 ```sh
 sudo systemctl start moesh-agent
@@ -92,6 +92,7 @@ moesh-relay \
 | `host tunnel v2 attached from ... host host-3` | an agent tunnel connection registered |
 | `operator-v2[host-3] attached from ...` | an operator client connected |
 | `pairing operator-v2[host-3] with a host` | operator client and agent tunnel spliced |
+| `sending PAIR_DEAD_MARKER to host-3 operator` | queued tunnel died before handoff; operator notified to retry |
 | `discarding stale operator-v2[host-3] tunnel` | a dead tunnel was pruned from the queue |
 | `operator-v2[host-3] connected but no tunnel within 120s` | connection timed out waiting for an agent |
 | `tunnel queue full — dropping ...` | queue reached maximum buffer capacity (8 slots) |
@@ -108,6 +109,10 @@ moesh-relay \
 | `authenticated (peer static key matched the pin)` | operator public key verified |
 | `shell started (pid 1234, 24x80)` | fresh bash PTY spawned |
 | `attached to the running shell (pid 1234)` | operator re-attached to existing shell |
+| `exec session active: command='...'` | non-interactive command execution started |
+| `exec session finished: exit_code=0` | non-interactive command exited cleanly |
+| `native transfer session active` | in-process `moecp` file transfer session established |
+| `native transfer error: missing required module (...)` | agent host missing `moecp.py`; transfer rejected |
 | `replaying 136 buffered bytes` | sending output accumulated while detached |
 | `session active: term=xterm-256color 24x80` | terminal streaming active |
 | `resized to 40x120` | window dimensions synchronized (`SIGWINCH`) |
@@ -121,7 +126,9 @@ moesh-relay \
 |---|---|
 | `waiting for host 'host-3' — the receiver is holding this connection...` | waiting for agent to connect/pair |
 | `authenticated (agent static key matched the pin)` | agent static key verified |
-| `a new shell was started` | fresh session started |
+| `command execution session established` | non-interactive command session active |
+| `remote command finished (status 0)` | non-interactive command exited normally |
+| `a new shell was started` | fresh interactive session started |
 | `re-attached to the running shell: the previous session continues` | restored prior interactive shell |
 | `session active: 24x80 term=xterm-256color` | session running |
 | `sent resize 40x120` | local window resize transmitted |
@@ -193,6 +200,18 @@ tmux ls
 ```
 
 Kill stale sessions; the agent's available slots will immediately replenish.
+
+### `moecp` fails with "missing required module"
+
+```
+native transfer error: missing required module (No module named 'moecp')
+```
+
+When deploying `moesh` on an agent host as standalone files rather than an installed package, native file transfer requires `moecp.py` to be located in Python's import search path alongside `moesh_tunnel.py`.
+
+* Ensure all five standalone files are copied to the agent directory:
+  `moesh_wire.py`, `moesh_proto.py`, `moesh_tunnel.py`, `moecp.py`, and `moesh_shell.py`.
+* Alternatively, install `moesh` via `pip install moesh` or wheel.
 
 ---
 

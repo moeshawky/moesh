@@ -113,7 +113,7 @@ Master Secret (32 bytes) ──▶ HKDF-SHA256(info=b"moesh-tunnel-v2/agent-stat
 To inspect or generate a new fleet master secret and view derived keys:
 
 ```sh
-python3 moesh_shell.py --new-master -n 3
+moesh --new-master -n 3
 ```
 
 This outputs:
@@ -134,7 +134,8 @@ master = "7f8a9b...<32-byte-hex-master-secret>"
 ```
 
 The operator client now automatically derives and pins the expected static public
-key for any host number specified on the command line (`-n 1` .. `-n 10`).
+key for any host number specified on the command line (`-n 1` .. `-n 10`) using
+`proto.derive_static_key(master, host)` (`moesh_proto.py:810`, used at `moesh_shell.py:244-259`).
 
 ### Configuring the Agent Host
 
@@ -143,12 +144,14 @@ Provide `MOESH_TUNNEL_MASTER` in the agent's environment:
 ```sh
 export MOESH_TUNNEL_MASTER="7f8a9b...<32-byte-hex-master-secret>"
 export MOESH_TUNNEL_HOST="3"
-export MOESH_TUNNEL_OPERATOR_PUB="<operator-public-key-hex>"
-python3 moesh_tunnel.py
+# Note: MOESH_TUNNEL_OPERATOR_PUB is optional when MOESH_TUNNEL_MASTER is set;
+# moesh-tunnel derives the operator public key using HKDF-SHA256(master, info=b"operator")
+# automatically (moesh_tunnel.py:267-316).
+moesh-tunnel
 ```
 
 `moesh_tunnel.py` derives the static private key in memory using HKDF-SHA256
-bound to `host-3`. No agent key file needs to be stored on disk.
+bound to `host-3` (`moesh_tunnel.py:375-395`). No agent key file needs to be stored on disk.
 
 ---
 

@@ -196,11 +196,20 @@ export MOESH_TUNNEL_MASTER="<64-HEX-MASTER-KEY>"
 # Open an interactive shell on host-3:
 moesh -n 3
 
-# Copy a file to host-3:
-moecp ./weights.safetensors host-3:/models/
+# Execute non-interactive command strings:
+moesh -n 3 -c "uname -a && nvidia-smi"
+
+# Execute command tokens with dashed flags:
+moesh -n 3 ls -la /tmp
+
+# Pipe binary streams with -q to keep stdout clean:
+head -c 1048576 /dev/urandom | moesh -n 3 -q cat | sha256sum
+
+# Copy a file to host-3 (numeric shorthand supported):
+moecp ./weights.safetensors 3:/models/
 
 # Copy a directory from host-3 preserving permissions and timestamps:
-moecp -r -p host-3:/var/log/app ./logs/
+moecp -r -p 3:/var/log/app ./logs/
 ```
 
 ### Connecting with `~/.config/moesh/hosts.toml` (Persistent Operator Setup)
@@ -218,13 +227,15 @@ master = "<64-HEX-MASTER-KEY>"
 moesh -n 3
 
 # Upload and download files with moecp:
-moecp ./archive.tar.zst host-3:/tmp/
-moecp -r host-3:/tmp/output ./output
+moecp ./archive.tar.zst 3:/tmp/
+moecp -r 3:/tmp/output ./output
 ```
 
-- Disconnecting (`Ctrl+D` or network drop) leaves the remote PTY running. Re-running `moesh -n <N>` re-attaches to the same shell and replays recent output.
-- `moecp` always negotiates an isolated transfer session (`fresh_session=True`), so file transfers never interfere with active interactive shells.
+- Disconnecting (`Ctrl+D`, `~.`, or network drop) leaves the remote PTY running. Re-running `moesh -n <N>` re-attaches to the same shell and replays recent output.
+- Non-interactive execution (`session_type="exec"`) executes in an isolated session with non-blocking stdin pipes, 1 MiB backpressure ceiling, and process group signal cleanup on client termination.
+- `moecp` negotiates `session_type="transfer"` directly with the agent process, performing in-process streaming without borrowing interactive shells or spawning PTY subprocesses.
 - Pre-compressed files (`.safetensors`, `.gguf`, `.pt`, `.zst`, `.tar.gz`, `.zip`, `.mp4`) automatically bypass CPU compression for maximum transfer speed.
+- See [docs/cli.md](cli.md) for full syntax and option reference.
 
 ---
 

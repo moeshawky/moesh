@@ -36,8 +36,8 @@ client and the target agent host.
 
 Both endpoints enforce strict static key pinning before transport data is accepted:
 
-* **Operator Client:** Pins agent static keys per host in `~/.config/moesh/hosts.toml`, or derives them deterministically from `MOESH_TUNNEL_MASTER` via HKDF-SHA256 (`moesh_shell.py:203-283`).
-* **Agent Host:** Pins the operator's static public key via `MOESH_TUNNEL_OPERATOR_PUB` (`moesh_tunnel.py:192-200`).
+* **Operator Client:** Pins agent static keys per host in `~/.config/moesh/hosts.toml`, or derives them deterministically from `MOESH_TUNNEL_MASTER` via HKDF-SHA256 (`moesh_shell.py:228-285`).
+* **Agent Host:** Pins the operator's static public key via `MOESH_TUNNEL_OPERATOR_PUB` or derives it deterministically from `MOESH_TUNNEL_MASTER` via HKDF-SHA256 (`moesh_tunnel.py:267-316`).
 
 A key mismatch immediately terminates the connection with `AuthenticationError` before a shell or worker process is spawned.
 

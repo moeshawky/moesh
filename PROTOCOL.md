@@ -114,10 +114,20 @@ uint32_be(ciphertext_length) || ciphertext
 The same framing carries the three Noise handshake messages and every
 transport record; the phases never interleave.
 
-* `MAX_CIPHERTEXT = 65535` (Noise `MAX_MESSAGE_LEN`).
+* `MAX_CIPHERTEXT = 65535` (Noise `MAX_MESSAGE_LEN`, defined at `moesh_proto.py:129`).
 * A zero-length frame or a frame above the bound is refused immediately.
 * A frame split across reads is reassembled; multiple frames in one read
   buffer are sequentially processed.
+
+### Dead Tunnel Early Rejection Marker (`PAIR_DEAD_MARKER`)
+
+When the bridge pairs an operator socket with a tunnel whose agent worker walked
+away, the bridge writes `PAIR_DEAD_MARKER` (`b"\x01MOESH_DEAD_TUNNEL\n"`, defined
+at `moesh_wire.py:63`) directly to the operator socket. Because a valid Noise
+handshake frame begins with a 4-byte big-endian length whose first byte is `0x00`,
+the non-zero leading byte `0x01` is unambiguous against ciphertext frames. The
+client reads this marker after writing its first handshake message and retries
+immediately (`moesh_proto.py:294-315`, `moesh_shell.py:532-557`).
 
 Transport record plaintext:
 
@@ -130,17 +140,17 @@ uint8(message_type) || payload
 | 1 | HELLO | JSON | operator → agent |
 | 2 | ACCEPT | JSON | agent → operator |
 | 3 | READY | JSON | both |
-| 4 | DATA | raw terminal bytes | both |
+| 4 | DATA | raw terminal or stdin/stdout stream bytes | both |
 | 5 | RESIZE | `uint16_be rows \|\| uint16_be cols` | operator → agent |
 | 6 | EXIT | JSON `{"status": int, "signal": int\|null}` | agent → operator |
 | 7 | PING | JSON `{"t": int}` | both |
 | 8 | PONG | JSON `{"t": int}` | both |
-| 9 | ERROR | JSON `{"code": str, "message": str}` | both |
+| 9 | ERROR | JSON `{"code": str, "message": str}` or `{"error": str}` | both |
 | 10 | CLOSE | JSON `{"reason": str}` | both |
 
-`DATA` payloads are binary-safe terminal or file transfer bytes and are never
+`DATA` payloads are binary-safe terminal or streaming bytes and are never
 reinterpreted. Control payloads are compact JSON, at most 4096 bytes
-(`MAX_CONTROL_PAYLOAD`); a `DATA` payload is at most 32768 bytes (`MAX_DATA_PAYLOAD`).
+(`MAX_CONTROL_PAYLOAD`, `moesh_wire.py:40`); a `DATA` payload is at most 32768 bytes (`MAX_DATA_PAYLOAD`, `moesh_wire.py:36`).
 
 ---
 
@@ -157,24 +167,30 @@ HELLO (operator):
   "cols": 80,
   "capabilities": ["resize", "ping"],
   "max_record": 32768,
-  "handshake_hash": "<hex>"
+  "handshake_hash": "<hex>",
+  "session_type": "shell",
+  "fresh_session": false,
+  "command": null
 }
 ```
 
-The agent validates every value (version, terminal type without control
+The agent validates every value (version `2`, terminal type without control
 characters, `utf-8` encoding, 1 ≤ rows ≤ 1000, 1 ≤ cols ≤ 1000,
-`max_record` ≥ 256) and answers with ACCEPT carrying the accepted
+`max_record` ≥ 256; `moesh_proto.py:681-746`) and answers with ACCEPT carrying the accepted
 configuration. The operator's `handshake_hash` is compared with the agent's
 own handshake hash, binding negotiation to the authenticated transcript.
 
-Two optional fields carry the session policy:
+Session parameters:
 
+* `session_type` (HELLO, default `"shell"`) — selects session dispatch:
+  - `"shell"`: Interactive persistent PTY session.
+  - `"exec"`: Non-interactive direct execution of `command` with bidirectional stdin/stdout streaming and process group cleanup.
+  - `"transfer"`: Native in-process file transfer engine served by `moecp`.
+* `command` (HELLO, optional string) — command string to execute when `session_type="exec"`.
 * `fresh_session` (HELLO, default `false`) — when `true`, the agent allocates
   a **fresh** unshared shell process instead of re-attaching to a running one.
-  This is used by `moesh-shell --fresh` and exclusively by `moecp` for isolated
-  file transfers.
-* `resumed` (ACCEPT, always present) — the agent answers `true` when it is
-  re-attaching to the shell that survived a previous disconnect.
+* `resumed` (ACCEPT, boolean) — the agent answers `true` when re-attaching
+  to a shell that survived a previous disconnect.
 
 ACCEPT → READY (operator) → READY (agent) → the session is ACTIVE.
 

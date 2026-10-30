@@ -230,8 +230,14 @@ class OperatorSession:
             if not chunk:
                 break
             self.buffer += chunk
+        err_msg = ""
+        if self.err_path and os.path.exists(self.err_path):
+            with contextlib.suppress(OSError), open(self.err_path, "rb") as ef:
+                err_data = ef.read()
+                if err_data:
+                    err_msg = f"; client stderr: {err_data[-1000:]!r}"
         raise AssertionError(
-            f"timed out waiting for {needle!r}; saw {self.buffer[-800:]!r}"
+            f"timed out waiting for {needle!r}; saw {self.buffer[-800:]!r}{err_msg}"
         )
 
     def write(self, data: bytes) -> None:

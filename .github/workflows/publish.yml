@@ -13,6 +13,9 @@ jobs:
     name: Release acceptance gate
     runs-on: ubuntu-latest
 
+    env:
+      UV_PYTHON: "3.11"
+
     steps:
       - uses: actions/checkout@v4
 
@@ -27,7 +30,12 @@ jobs:
           python-version: "3.11"
 
       - name: Sync dependencies
-        run: uv sync
+        run: uv sync --python 3.11
+
+      - name: Confirm runtime Python version
+        run: |
+          uv run python -c "import sys; info = sys.version_info; assert f'{info.major}.{info.minor}' == '3.11', f'Expected 3.11, got {sys.version}'"
+          uv run python -V
 
       - name: Lint
         run: uv run ruff check .

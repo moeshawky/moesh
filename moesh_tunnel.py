@@ -503,6 +503,7 @@ class HostShell:
         """Initializes a shell with no process (pid/fd None), CREATED state, empty output buffer, zero dropped bytes, given max_buffer (default DETACHED_BUFFER), and default terminal dimensions from proto; no process is spawned until spawn()."""
         self.pid: int | None = None
         self.fd: int | None = None
+        self.proc: subprocess.Popen[bytes] | None = None
         self.state: ShellState = ShellState.CREATED
         self.exit_status: int | None = None
         self.buffer = bytearray()
@@ -528,30 +529,54 @@ class HostShell:
         """
         if self.pid is not None or self.fd is not None:
             self.terminate()
-        pid, fd = pty.fork()
-        if pid == 0:
-            os.environ["TERM"] = term
-            os.environ["LANG"] = "C.UTF-8"
-            os.environ["LC_ALL"] = "C.UTF-8"
-            for secret_var in SECRET_ENV_VARS:
-                os.environ.pop(secret_var, None)
-            os.environ.pop("MOESH_SHELL_OPERATOR_KEY", None)
-            os.environ.pop("MOESH_TUNNEL_CHILD_PIDFILE", None)
+        master, slave = pty.openpty()
+        set_winsize(master, rows, cols)
+        child_env = dict(os.environ)
+        child_env["TERM"] = term
+        child_env["LANG"] = "C.UTF-8"
+        child_env["LC_ALL"] = "C.UTF-8"
+        for secret_var in SECRET_ENV_VARS:
+            child_env.pop(secret_var, None)
+        child_env.pop("MOESH_SHELL_OPERATOR_KEY", None)
+        child_env.pop("MOESH_TUNNEL_CHILD_PIDFILE", None)
+
+        try:
+            # exec, not a shell: the argv is fixed and the path is
+            # absolute, so nothing here is interpolated.
+            proc = subprocess.Popen(
+                ["/bin/bash", "-i"],
+                stdin=slave,
+                stdout=slave,
+                stderr=slave,
+                start_new_session=True,
+                env=child_env,
+                close_fds=True,
+            )
+        except OSError:
             try:
-                # exec, not a shell: the argv is fixed and the path is
-                # absolute, so nothing here is interpolated.
-                os.execv("/bin/bash", ["/bin/bash", "-i"])  # noqa: S606
-            except OSError:
-                os._exit(127)
-        set_winsize(fd, rows, cols)
-        self.pid, self.fd = pid, fd
+                proc = subprocess.Popen(
+                    ["/bin/sh", "-i"],
+                    stdin=slave,
+                    stdout=slave,
+                    stderr=slave,
+                    start_new_session=True,
+                    env=child_env,
+                    close_fds=True,
+                )
+            except OSError as exc:
+                os.close(slave)
+                os.close(master)
+                raise ProtocolError(f"cannot spawn shell: {exc}") from exc
+        os.close(slave)
+        self.proc = proc
+        self.pid, self.fd = proc.pid, master
         self.state = ShellState.RUNNING
         self.exit_status = None
         self.term, self.rows, self.cols = term, rows, cols
         self.buffer.clear()
         self.dropped = 0
         self._write_pidfile()
-        log(f"shell started (pid {pid}, {rows}x{cols})")
+        log(f"shell started (pid {proc.pid}, {rows}x{cols})")
 
     def _write_pidfile(self) -> None:
         """Record the shell's PID where the operator asked for it."""
@@ -618,6 +643,22 @@ class HostShell:
         """Reap the shell if it exited and return its status."""
         if self.pid is None:
             return self.exit_status or 0
+        if self.proc is not None:
+            ret = self.proc.poll()
+            if ret is None:
+                return 0
+            status = ret if ret >= 0 else (128 - ret)
+            self.exit_status = status
+            self.state = ShellState.REAPED
+            if self.fd is not None:
+                with contextlib.suppress(OSError):
+                    os.close(self.fd)
+                self.fd = None
+            self.pid = None
+            self.proc = None
+            self._remove_pidfile()
+            return status
+
         status = 0
         try:
             pid, wait_status = os.waitpid(self.pid, os.WNOHANG)
@@ -663,6 +704,26 @@ class HostShell:
         """
         if self.pid is None:
             return self.exit_status or 0
+        if self.proc is not None:
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                ret = self.proc.poll()
+                if ret is not None:
+                    status = ret if ret >= 0 else (128 - ret)
+                    self.exit_status = status
+                    self.state = ShellState.REAPED
+                    if self.fd is not None:
+                        with contextlib.suppress(OSError):
+                            os.close(self.fd)
+                        self.fd = None
+                    self.pid = None
+                    self.proc = None
+                    self._remove_pidfile()
+                    return status
+                time.sleep(0.01)
+            log("timed out waiting for the shell to become reapable; reporting status 0")
+            return self.exit_status or 0
+
         deadline = time.monotonic() + timeout
         while True:
             try:
@@ -703,10 +764,31 @@ class HostShell:
         """Terminate the shell and reap it; never leave a zombie or an orphan."""
         pid = self.pid
         fd = self.fd
+        proc = self.proc
         self.state = ShellState.TERMINATED
         self.pid = None
         self.fd = None
-        if pid is not None:
+        self.proc = None
+        if proc is not None:
+            with contextlib.suppress(OSError):
+                with contextlib.suppress(OSError):
+                    os.killpg(os.getpgid(proc.pid), signal.SIGHUP)
+                proc.send_signal(signal.SIGHUP)
+            deadline = time.monotonic() + 1.0
+            reaped = False
+            while time.monotonic() < deadline:
+                if proc.poll() is not None:
+                    reaped = True
+                    break
+                time.sleep(0.02)
+            if not reaped:
+                with contextlib.suppress(OSError):
+                    with contextlib.suppress(OSError):
+                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                    proc.kill()
+                with contextlib.suppress(OSError):
+                    proc.wait(timeout=1.0)
+        elif pid is not None:
             with contextlib.suppress(OSError):
                 with contextlib.suppress(OSError):
                     os.killpg(os.getpgid(pid), signal.SIGHUP)
@@ -730,7 +812,7 @@ class HostShell:
         if fd is not None:
             with contextlib.suppress(OSError):
                 os.close(fd)
-        if pid is not None or fd is not None:
+        if pid is not None or fd is not None or proc is not None:
             self._remove_pidfile()
             log("shell terminated")
 
