@@ -152,10 +152,10 @@ def test_moesh_c_flag_command_piping(
         env=env,
         capture_output=True,
         text=True,
-        check=True,
+        check=False,
         timeout=15,
     )
-    assert res.returncode == 0
+    assert res.returncode == 0, f"moesh failed with {res.returncode}: stdout={res.stdout!r}, stderr={res.stderr!r}"
     assert res.stdout == "hello world\n"
 
 
@@ -179,8 +179,8 @@ def test_moesh_c_flag_quoted_arguments(
         env=env,
         capture_output=True,
         text=True,
-        check=True,
+        check=False,
         timeout=15,
     )
-    assert res.returncode == 0
+    assert res.returncode == 0, f"moesh failed with {res.returncode}: stdout={res.stdout!r}, stderr={res.stderr!r}"
     assert res.stdout == "preserves quotes\n"

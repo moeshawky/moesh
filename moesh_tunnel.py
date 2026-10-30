@@ -605,6 +605,31 @@ class HostShell:
         set_winsize(fd, rows, cols)
         self.rows, self.cols = rows, cols
 
+    def refresh_screen(self, rows: int, cols: int) -> None:
+        """Force a PTY terminal redisplay without injecting a newline.
+
+        When an operator reattaches to an idle shell with unchanged terminal
+        dimensions, GNU Readline ignores SIGWINCH if rows/cols are identical,
+        producing zero output and hanging waiting for a prompt (DEF-01 open defect).
+        Toggling columns by 1 triggers an actual dimension change in the kernel PTY
+        and causes Readline to clean the line and re-render the current prompt
+        and any unsubmitted input buffer without executing commands.
+        """
+        fd = self.fd
+        if fd is None:
+            return
+        alt_cols = cols + 1 if cols > 1 else cols + 2
+        set_winsize(fd, rows, alt_cols)
+        if self.pid is not None:
+            with contextlib.suppress(ProcessLookupError, OSError):
+                os.kill(self.pid, signal.SIGWINCH)
+        time.sleep(0.02)
+        set_winsize(fd, rows, cols)
+        if self.pid is not None:
+            with contextlib.suppress(ProcessLookupError, OSError):
+                os.kill(self.pid, signal.SIGWINCH)
+        self.rows, self.cols = rows, cols
+
     def read_output(self) -> bytes | None:
         """Read what the shell produced.
 
@@ -1272,9 +1297,8 @@ def negotiate(
                 log(f"replaying {len(held)} buffered bytes")
             for piece in chunks(held, accepted["max_record"]):
                 secure.send(Msg.DATA, piece)
-        elif resumed and shell.pid is not None:
-            with contextlib.suppress(ProcessLookupError, OSError):
-                os.kill(shell.pid, signal.SIGWINCH)
+        elif resumed:
+            shell.refresh_screen(accepted["rows"], accepted["cols"])
         accepted["_shell"] = shell
         success = True
         return accepted
