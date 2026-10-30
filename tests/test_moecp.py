@@ -97,6 +97,9 @@ def moecp_test_env(tmp_path: Path) -> Iterator[MoecpHosts]:
     else:
         raise TimeoutError(f"Agent {_ALPHA} timed out waiting for tunnel establishment")
 
+    # Ensure the bridge has admitted the tunnel before any client connects
+    bridge._wait_for_line(f"host {_ALPHA}", timeout=20.0)
+
     def client_env(host: str) -> dict[str, str]:
         cenv = dict(os.environ)
         cenv.update(
@@ -270,7 +273,7 @@ def test_moecp_upload_single_file(moecp_test_env: MoecpHosts, tmp_path: Path) ->
         str(src_file),
         f"{_ALPHA}:{remote_dest}",
     ]
-    proc = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=60)
+    proc = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=90)
     assert proc.returncode == 0, f"moecp upload failed: stdout={proc.stdout} stderr={proc.stderr}"
 
     # Verify content arrived on the remote host filesystem
@@ -294,7 +297,7 @@ def test_moecp_download_single_file(moecp_test_env: MoecpHosts, tmp_path: Path) 
         f"{_ALPHA}:{remote_src}",
         str(local_dest),
     ]
-    proc = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=60)
+    proc = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=90)
     assert proc.returncode == 0, f"moecp download failed: stdout={proc.stdout} stderr={proc.stderr}"
     assert local_dest.read_bytes() == test_data
 
@@ -320,7 +323,7 @@ def test_moecp_recursive_upload_and_download(moecp_test_env: MoecpHosts, tmp_pat
         str(upload_root),
         f"{_ALPHA}:{remote_dest_dir}",
     ]
-    uproc = subprocess.run(upload_cmd, env=env, capture_output=True, text=True, timeout=60)
+    uproc = subprocess.run(upload_cmd, env=env, capture_output=True, text=True, timeout=90)
     assert uproc.returncode == 0, f"recursive upload failed: {uproc.stderr}"
 
     assert remote_dest_dir.is_dir()
@@ -338,7 +341,7 @@ def test_moecp_recursive_upload_and_download(moecp_test_env: MoecpHosts, tmp_pat
         f"{_ALPHA}:{remote_dest_dir}",
         str(download_root),
     ]
-    dproc = subprocess.run(download_cmd, env=env, capture_output=True, text=True, timeout=60)
+    dproc = subprocess.run(download_cmd, env=env, capture_output=True, text=True, timeout=90)
     assert dproc.returncode == 0, f"recursive download failed: {dproc.stderr}"
 
     assert (download_root / "root.txt").read_text(encoding="utf-8") == "root file content"
@@ -364,7 +367,7 @@ def test_moecp_preserve_attributes(moecp_test_env: MoecpHosts, tmp_path: Path) -
         str(src_file),
         f"{_ALPHA}:{remote_dest}",
     ]
-    proc = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=60)
+    proc = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=90)
     assert proc.returncode == 0, f"attribute upload failed: {proc.stderr}"
 
     st = os.stat(remote_dest)

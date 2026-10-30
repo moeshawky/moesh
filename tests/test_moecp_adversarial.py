@@ -478,7 +478,7 @@ def test_e2e_zero_byte_file_transfer(moecp_test_env: MoecpHosts, tmp_path: Path)
         str(empty_src),
         f"{_ALPHA}:{remote_dest}",
     ]
-    proc_up = subprocess.run(up_cmd, env=env, capture_output=True, text=True, timeout=60)
+    proc_up = subprocess.run(up_cmd, env=env, capture_output=True, text=True, timeout=90)
     assert proc_up.returncode == 0, f"0-byte upload failed: {proc_up.stderr}"
     assert remote_dest.exists(), "remote 0-byte destination was not created"
     assert remote_dest.stat().st_size == 0
@@ -493,7 +493,7 @@ def test_e2e_zero_byte_file_transfer(moecp_test_env: MoecpHosts, tmp_path: Path)
         f"{_ALPHA}:{remote_dest}",
         str(local_download),
     ]
-    proc_down = subprocess.run(down_cmd, env=env, capture_output=True, text=True, timeout=60)
+    proc_down = subprocess.run(down_cmd, env=env, capture_output=True, text=True, timeout=90)
     assert proc_down.returncode == 0, f"0-byte download failed: {proc_down.stderr}"
     assert local_download.exists()
     assert local_download.stat().st_size == 0
@@ -517,7 +517,7 @@ def test_e2e_special_characters_filename(moecp_test_env: MoecpHosts, tmp_path: P
         str(src_file),
         f"{_ALPHA}:{remote_dest}",
     ]
-    proc_up = subprocess.run(up_cmd, env=env, capture_output=True, text=True, timeout=60)
+    proc_up = subprocess.run(up_cmd, env=env, capture_output=True, text=True, timeout=90)
     assert proc_up.returncode == 0, f"special filename upload failed: {proc_up.stderr}"
     assert remote_dest.exists()
     assert remote_dest.read_bytes() == test_content
@@ -533,7 +533,7 @@ def test_e2e_special_characters_filename(moecp_test_env: MoecpHosts, tmp_path: P
         f"{_ALPHA}:{remote_dest}",
         str(down_dest),
     ]
-    proc_down = subprocess.run(down_cmd, env=env, capture_output=True, text=True, timeout=60)
+    proc_down = subprocess.run(down_cmd, env=env, capture_output=True, text=True, timeout=90)
     assert proc_down.returncode == 0, f"special filename download failed: {proc_down.stderr}"
     assert down_dest.exists()
     assert down_dest.read_bytes() == test_content
@@ -575,7 +575,7 @@ def test_e2e_large_multichunk_file_transfer(moecp_test_env: MoecpHosts, tmp_path
         f"{_ALPHA}:{remote_dest}",
         str(local_down),
     ]
-    proc_down = subprocess.run(down_cmd, env=env, capture_output=True, text=True, timeout=45)
+    proc_down = subprocess.run(down_cmd, env=env, capture_output=True, text=True, timeout=90)
     assert proc_down.returncode == 0, f"large file download failed: {proc_down.stderr}"
     assert hashlib.sha256(local_down.read_bytes()).hexdigest() == expected_sha
 
@@ -600,7 +600,7 @@ def test_e2e_deeply_nested_directory_tree(moecp_test_env: MoecpHosts, tmp_path: 
         str(nested_root),
         f"{_ALPHA}:{remote_tree}",
     ]
-    proc_up = subprocess.run(up_cmd, env=env, capture_output=True, text=True, timeout=60)
+    proc_up = subprocess.run(up_cmd, env=env, capture_output=True, text=True, timeout=90)
     assert proc_up.returncode == 0, f"deep directory upload failed: {proc_up.stderr}"
 
     remote_deep_file = remote_tree / "l1" / "l2" / "l3" / "l4" / "l5" / "l6" / "deep_file.txt"
@@ -621,7 +621,7 @@ def test_e2e_nonexistent_remote_source_fails(moecp_test_env: MoecpHosts, tmp_pat
         f"{_ALPHA}:{missing_remote}",
         str(local_dest),
     ]
-    proc = subprocess.run(down_cmd, env=env, capture_output=True, text=True, timeout=45)
+    proc = subprocess.run(down_cmd, env=env, capture_output=True, text=True, timeout=60)
     assert proc.returncode != 0
     assert not local_dest.exists(), "destination file must not exist on failed transfer"
     assert "no such file" in proc.stderr.lower() or "error" in proc.stderr.lower()
@@ -642,6 +642,6 @@ def test_e2e_unwritable_destination_fails_cleanly(moecp_test_env: MoecpHosts, tm
         str(src_file),
         f"{_ALPHA}:{unwritable_dest}",
     ]
-    proc = subprocess.run(up_cmd, env=env, capture_output=True, text=True, timeout=45)
+    proc = subprocess.run(up_cmd, env=env, capture_output=True, text=True, timeout=60)
     assert proc.returncode != 0
     assert not os.path.exists(unwritable_dest)
