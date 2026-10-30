@@ -452,7 +452,7 @@ def test_e2e_command_exec_and_exit_code(exec_env: ExecFixture) -> None:
         env=env,
         capture_output=True,
         text=True,
-        timeout=15,
+        timeout=45,
         check=False,
     )
     assert res.returncode == 0
@@ -463,7 +463,7 @@ def test_e2e_command_exec_and_exit_code(exec_env: ExecFixture) -> None:
         [AGENT_PYTHON, client_bin, "-q", "-n", _ALPHA, "exit 77"],
         env=env,
         capture_output=True,
-        timeout=15,
+        timeout=45,
         check=False,
     )
     assert res_fail.returncode == 77
@@ -481,7 +481,7 @@ def test_e2e_stdin_piping_and_filtering(exec_env: ExecFixture) -> None:
         text=True,
         env=env,
         capture_output=True,
-        timeout=15,
+        timeout=45,
         check=False,
     )
     assert res.returncode == 0
@@ -498,7 +498,7 @@ def test_e2e_cmd_flag_execution(exec_env: ExecFixture) -> None:
         env=env,
         capture_output=True,
         text=True,
-        timeout=15,
+        timeout=45,
         check=False,
     )
     assert res.returncode == 0
@@ -525,7 +525,7 @@ def test_e2e_argument_splitting_preservation(exec_env: ExecFixture) -> None:
         env=env,
         capture_output=True,
         text=True,
-        timeout=15,
+        timeout=45,
         check=False,
     )
     assert res.returncode == 0

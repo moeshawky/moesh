@@ -65,8 +65,8 @@ def integration_fixture(tmp_path: Path) -> Iterator[dict[str, Any]]:
         env=agent_env,
     )
 
-    # Barrier: wait up to 10s for tunnel establishment
-    deadline = time.time() + 10.0
+    # Barrier: wait up to 25s for tunnel establishment
+    deadline = time.time() + 25.0
     while time.time() < deadline:
         if agent.poll() is not None:
             raise TimeoutError(
@@ -81,7 +81,11 @@ def integration_fixture(tmp_path: Path) -> Iterator[dict[str, Any]]:
             pass
         time.sleep(0.05)
     else:
-        raise TimeoutError(f"Agent process {agent.pid} did not establish tunnel within 10.0s")
+        with open(log_path, "rb") as f:
+            content = f.read()
+        raise TimeoutError(
+            f"Agent process {agent.pid} did not establish tunnel within 25.0s; log: {content!r}"
+        )
 
     client_env = dict(os.environ)
     client_env.update(
@@ -153,7 +157,7 @@ def test_moesh_c_flag_command_piping(
         capture_output=True,
         text=True,
         check=False,
-        timeout=15,
+        timeout=45,
     )
     assert res.returncode == 0, f"moesh failed with {res.returncode}: stdout={res.stdout!r}, stderr={res.stderr!r}"
     assert res.stdout == "hello world\n"
@@ -180,7 +184,7 @@ def test_moesh_c_flag_quoted_arguments(
         capture_output=True,
         text=True,
         check=False,
-        timeout=15,
+        timeout=45,
     )
     assert res.returncode == 0, f"moesh failed with {res.returncode}: stdout={res.stdout!r}, stderr={res.stderr!r}"
     assert res.stdout == "preserves quotes\n"

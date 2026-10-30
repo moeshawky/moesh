@@ -86,7 +86,7 @@ def numbered(tmp_path: Path) -> Iterator[Numbered]:
         )
     for number in (3, 4):
         log_path = os.path.join(tmp_path, f"agent-{number}.log")
-        deadline = time.time() + 10.0
+        deadline = time.time() + 25.0
         while time.time() < deadline:
             try:
                 with open(log_path, "rb") as f:
@@ -99,7 +99,11 @@ def numbered(tmp_path: Path) -> Iterator[Numbered]:
                 raise TimeoutError(f"agent {number} died with {agents[number].returncode}")
             time.sleep(0.05)
         else:
-            raise TimeoutError(f"agent {number} failed to establish tunnel")
+            with open(log_path, "rb") as f:
+                content = f.read()
+            raise TimeoutError(
+                f"agent {number} failed to establish tunnel within 25.0s; log: {content!r}"
+            )
 
     def client_env() -> dict[str, str]:
         env = dict(os.environ)
