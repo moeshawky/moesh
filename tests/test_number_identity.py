@@ -84,7 +84,22 @@ def numbered(tmp_path: Path) -> Iterator[Numbered]:
             stderr=subprocess.STDOUT,
             env=_agent_env(tunnel_port, master, number, operator_public),
         )
-    time.sleep(2.5)
+    for number in (3, 4):
+        log_path = os.path.join(tmp_path, f"agent-{number}.log")
+        deadline = time.time() + 10.0
+        while time.time() < deadline:
+            try:
+                with open(log_path, "rb") as f:
+                    content = f.read()
+                    if b"tunnel established" in content or b"waiting for an operator" in content:
+                        break
+            except OSError:
+                pass
+            if agents[number].poll() is not None:
+                raise TimeoutError(f"agent {number} died with {agents[number].returncode}")
+            time.sleep(0.05)
+        else:
+            raise TimeoutError(f"agent {number} failed to establish tunnel")
 
     def client_env() -> dict[str, str]:
         env = dict(os.environ)

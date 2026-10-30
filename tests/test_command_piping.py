@@ -14,6 +14,7 @@ Validates:
 from __future__ import annotations
 
 import os
+import signal
 import socket
 import subprocess
 import threading
@@ -471,3 +472,346 @@ def test_e2e_stdin_piping_and_filtering(exec_env: ExecFixture) -> None:
     )
     assert res.returncode == 0
     assert res.stdout == "beta\nbeta\n"
+
+
+def test_e2e_cmd_flag_execution(exec_env: ExecFixture) -> None:
+    """Run remote command via moesh_shell CLI using -c flag (DEF-03)."""
+    env = exec_env["client_env"](_ALPHA)
+    client_bin = os.path.join(TUNNEL_DIR, "moesh_shell.py")
+
+    res = subprocess.run(
+        [AGENT_PYTHON, client_bin, "-q", "-n", _ALPHA, "-c", "echo e2e_c_flag_success"],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    assert res.returncode == 0
+    assert res.stdout.strip() == "e2e_c_flag_success"
+
+
+def test_e2e_argument_splitting_preservation(exec_env: ExecFixture) -> None:
+    """Run remote command with arguments containing spaces preserved via shlex.join (DEF-03)."""
+    env = exec_env["client_env"](_ALPHA)
+    client_bin = os.path.join(TUNNEL_DIR, "moesh_shell.py")
+
+    res = subprocess.run(
+        [
+            AGENT_PYTHON,
+            client_bin,
+            "-q",
+            "-n",
+            _ALPHA,
+            "printf",
+            "%s|%s\n",
+            "hello world",
+            "another arg",
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    assert res.returncode == 0
+    assert res.stdout.strip() == "hello world|another arg"
+
+
+def test_dynamic_hosts_file_evaluation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test dynamic evaluation of MOESH_SHELL_HOSTS_FILE at runtime (G-SLOPPY-1)."""
+    hosts_a = tmp_path / "hosts_a.toml"
+    hosts_a.write_text('[hosts.host_a]\nagent_pub = "1111111111111111111111111111111111111111111111111111111111111111"\n', encoding="utf-8")
+    hosts_b = tmp_path / "hosts_b.toml"
+    hosts_b.write_text('[hosts.host_b]\nagent_pub = "2222222222222222222222222222222222222222222222222222222222222222"\n', encoding="utf-8")
+
+    monkeypatch.setenv("MOESH_SHELL_HOSTS_FILE", str(hosts_a))
+    cfg_a = moesh_shell.load_config()
+    assert "host_a" in cfg_a.get("hosts", {})
+
+    monkeypatch.setenv("MOESH_SHELL_HOSTS_FILE", str(hosts_b))
+    cfg_b = moesh_shell.load_config()
+    assert "host_b" in cfg_b.get("hosts", {})
+
+
+def test_raw_terminal_sigterm_sighup_handlers() -> None:
+    """Test RawTerminal installs SIGTERM and SIGHUP handlers (S-ORPHAN-2)."""
+    master_fd, slave_fd = os.openpty()
+    try:
+        term = moesh_shell.RawTerminal(slave_fd)
+        with term:
+            assert signal.SIGTERM in term._old_handlers
+            assert signal.SIGHUP in term._old_handlers
+        assert term._old_handlers == {}
+    finally:
+        os.close(master_fd)
+        os.close(slave_fd)
+
+
+def test_run_exec_session_broken_pipe() -> None:
+    """Test BrokenPipeError on downstream pipe closure returns 0 cleanly (DEF-05)."""
+    client_sock, client_sec, agent_sock, agent_sec, accepted = _setup_authenticated_exec(
+        command="yes | head -n 1000"
+    )
+
+    t = threading.Thread(
+        target=lambda: moesh_tunnel.run_exec_session(agent_sock, agent_sec, accepted)
+    )
+    t.start()
+
+    r_out, w_out = os.pipe()
+    r_in, w_in = os.pipe()
+    os.close(w_in)
+    # Immediately close read end so writing to w_out raises BrokenPipeError
+    os.close(r_out)
+
+    try:
+        status = moesh_shell.run_exec_session(
+            client_sock,
+            client_sec,
+            accepted,
+            stdin_fd=r_in,
+            stdout_fd=w_out,
+        )
+        assert status == 0
+    finally:
+        os.close(w_out)
+        os.close(r_in)
+        t.join(timeout=5.0)
+        client_sock.close()
+        agent_sock.close()
+
+
+def test_run_exec_session_sigint() -> None:
+    """Test SIGINT handling in run_exec_session returns 130 and sends interrupt (DEF-04)."""
+    client_sock, client_sec, agent_sock, agent_sec, accepted = _setup_authenticated_exec(
+        command="sleep 10"
+    )
+
+    agent_result: list[str] = []
+
+    def run_agent() -> None:
+        res = moesh_tunnel.run_exec_session(agent_sock, agent_sec, accepted)
+        agent_result.append(res)
+
+    t = threading.Thread(target=run_agent)
+    t.start()
+
+    r_out, w_out = os.pipe()
+    r_in, w_in = os.pipe()
+
+    def interrupt_after_delay() -> None:
+        time.sleep(0.3)
+        os.kill(os.getpid(), signal.SIGINT)
+
+    int_thread = threading.Thread(target=interrupt_after_delay)
+    int_thread.start()
+
+    try:
+        status = moesh_shell.run_exec_session(
+            client_sock,
+            client_sec,
+            accepted,
+            stdin_fd=r_in,
+            stdout_fd=w_out,
+        )
+        assert status == 130
+    finally:
+        int_thread.join(timeout=2.0)
+        os.close(w_in)
+        os.close(r_in)
+        os.close(w_out)
+        os.close(r_out)
+        t.join(timeout=5.0)
+        client_sock.close()
+        agent_sock.close()
+
+
+def test_secret_env_vars_scrubbed_in_exec(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify sensitive environment variables are scrubbed from child process environments (DEF-12)."""
+    for var in moesh_tunnel.SECRET_ENV_VARS:
+        monkeypatch.setenv(var, f"leaked_secret_{var}")
+    monkeypatch.setenv("MOESH_SHELL_OPERATOR_KEY", "leaked_operator_key")
+    monkeypatch.setenv("MOESH_TUNNEL_CHILD_PIDFILE", "/tmp/leaked_pidfile")  # noqa: S108
+
+    client_sock, client_sec, agent_sock, agent_sec, accepted = _setup_authenticated_exec(
+        command="env"
+    )
+
+    t = threading.Thread(
+        target=lambda: moesh_tunnel.run_exec_session(agent_sock, agent_sec, accepted)
+    )
+    t.start()
+
+    r_out, w_out = os.pipe()
+    r_in, w_in = os.pipe()
+    os.close(w_in)
+
+    try:
+        status = moesh_shell.run_exec_session(
+            client_sock,
+            client_sec,
+            accepted,
+            stdin_fd=r_in,
+            stdout_fd=w_out,
+        )
+        assert status == 0
+        os.close(w_out)
+        raw_env = b""
+        while True:
+            chunk = os.read(r_out, 4096)
+            if not chunk:
+                break
+            raw_env += chunk
+        env_text = raw_env.decode("utf-8", "replace")
+        for var in moesh_tunnel.SECRET_ENV_VARS:
+            assert f"leaked_secret_{var}" not in env_text
+            assert f"{var}=" not in env_text
+        assert "leaked_operator_key" not in env_text
+        assert "MOESH_SHELL_OPERATOR_KEY=" not in env_text
+    finally:
+        os.close(r_out)
+        os.close(r_in)
+        t.join(timeout=5.0)
+        client_sock.close()
+        agent_sock.close()
+
+
+def test_shell_pool_reap_zombie_collection() -> None:
+    """Verify ShellPool.reap() invokes reap() on non-busy shells (DEF-16)."""
+    pool = moesh_tunnel.ShellPool()
+    master_fd, slave_fd = os.openpty()
+    try:
+        shell = pool.acquire(fresh=True)
+        shell.fd = master_fd
+        shell.pid = 99999
+        shell.state = moesh_tunnel.ShellState.RUNNING
+
+        reaped = False
+
+        def mock_reap() -> int:
+            nonlocal reaped
+            reaped = True
+            shell.state = moesh_tunnel.ShellState.REAPED
+            shell.fd = None
+            return 0
+
+        shell.reap = mock_reap  # type: ignore[method-assign]
+        pool.release(shell)
+
+        assert not reaped
+        pool.reap()
+        assert reaped
+        assert shell not in pool._shells
+    finally:
+        os.close(slave_fd)
+        if shell.fd is not None:
+            os.close(master_fd)
+        pool.terminate_all()
+
+
+def test_fetch_status_relay_auth_header(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify fetch_status transmits X-Moesh-Relay-Auth when relay token is configured (G-COMP-1)."""
+    headers_received: list[bytes] = []
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    host, port = srv.getsockname()
+
+    def handle() -> None:
+        conn, _ = srv.accept()
+        raw = b""
+        while b"\r\n\r\n" not in raw:
+            chunk = conn.recv(1024)
+            if not chunk:
+                break
+            raw += chunk
+        headers_received.append(raw)
+        resp = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"hosts\": {\"in_use\": []}}"
+        conn.sendall(resp)
+        conn.close()
+
+    th = threading.Thread(target=handle)
+    th.start()
+
+    token_val = "test-secret-relay-token-1234"  # noqa: S105
+    monkeypatch.setenv("MOESH_BRIDGE_RELAY_TOKEN", token_val)
+    try:
+        data = moesh_tunnel.fetch_status(host, port)
+        assert "hosts" in data
+        assert len(headers_received) == 1
+        assert f"X-Moesh-Relay-Auth: {token_val}\r\n".encode() in headers_received[0]
+    finally:
+        th.join(timeout=2.0)
+        srv.close()
+
+
+def test_prompt_race_sigwinch_on_silent_resume(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify negotiate() signals SIGWINCH to redraw prompt when resuming with empty buffer."""
+    client_sock, agent_sock = _tcp_pair()
+    op_priv, op_pub = proto.generate_static_keypair()
+    ag_priv, ag_pub = proto.generate_static_keypair()
+
+    client_session = proto.NoiseSession("initiator", op_priv, ag_pub)
+    agent_session = proto.NoiseSession("responder", ag_priv, op_pub)
+
+    client_chan = proto.Channel(client_sock)
+    agent_chan = proto.Channel(agent_sock)
+
+    client_chan.send_frame(client_session.write_handshake())
+    agent_session.read_handshake(agent_chan.recv_frame())
+    agent_chan.send_frame(agent_session.write_handshake())
+    client_session.read_handshake(client_chan.recv_frame())
+    client_chan.send_frame(client_session.write_handshake())
+    agent_session.read_handshake(agent_chan.recv_frame())
+
+    client_sec = proto.SecureChannel(client_chan, client_session)
+    agent_sec = proto.SecureChannel(agent_chan, agent_session)
+
+    client_machine = proto.SessionState()
+    client_machine.to(proto.State.AUTHENTICATED)
+    agent_machine = proto.SessionState()
+    agent_machine.to(proto.State.AUTHENTICATED)
+
+    pool = moesh_tunnel.ShellPool()
+    master_fd, slave_fd = os.openpty()
+    existing_shell = pool.acquire(fresh=True)
+    existing_shell.state = moesh_tunnel.ShellState.RUNNING
+    existing_shell.pid = 99999
+    existing_shell.fd = master_fd
+    pool.release(existing_shell)
+
+    signals_sent: list[tuple[int, int]] = []
+
+    def mock_kill(pid: int, sig: int) -> None:
+        signals_sent.append((pid, sig))
+
+    monkeypatch.setattr(os, "kill", mock_kill)
+
+    t = threading.Thread(
+        target=lambda: moesh_tunnel.negotiate(agent_sec, agent_machine, pool)
+    )
+    t.start()
+
+    try:
+        moesh_shell.negotiate(
+            client_sec,
+            client_machine,
+            term="xterm",
+            fresh=False,
+            session_type="shell",
+        )
+        t.join(timeout=5.0)
+        assert (99999, signal.SIGWINCH) in signals_sent
+    finally:
+        existing_shell.fd = None
+        existing_shell.pid = None
+        existing_shell.state = moesh_tunnel.ShellState.TERMINATED
+        pool.terminate_all()
+        os.close(slave_fd)
+        os.close(master_fd)
+        client_sock.close()
+        agent_sock.close()
+
+
+

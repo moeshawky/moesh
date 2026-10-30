@@ -123,6 +123,8 @@ class Bridge:
         allow_v1: bool = True,
         env_extra: dict[str, str] | None = None,
     ) -> None:
+        """Initialize and spawn a Bridge instance bound to private test ports."""
+        os.makedirs("/tmp/opencode", exist_ok=True)  # noqa: S108
         env = dict(os.environ)
         env.update(
             {
@@ -177,6 +179,8 @@ class OperatorSession:
     """The operator client attached to a pty, driven like a real terminal."""
 
     def __init__(self, argv: list[str], env: dict[str, str], rows: int, cols: int):
+        """Initialize an operator session attached to a pty."""
+        os.makedirs("/tmp/opencode", exist_ok=True)  # noqa: S108
         self.master, slave = pty.openpty()
         set_winsize(self.master, rows, cols)
         self.buffer = b""
@@ -271,7 +275,11 @@ def make_keys(tmp_path: Any) -> tuple[str, str, bytes, bytes, bytes]:
 def start_agent(
     tmp_path: Any, host: str, port: int, agent_private: bytes, operator_public: bytes
 ) -> subprocess.Popen[bytes]:
-    """Start the host-side agent against a test bridge."""
+    """Start the host-side agent against a test bridge.
+
+    Polls the agent log until the tunnel is established before returning the
+    process, raising :class:`TimeoutError` if startup fails or times out.
+    """
     env = dict(os.environ)
     env.update(
         {
@@ -283,10 +291,26 @@ def start_agent(
         }
     )
     # The agent keeps writing to it for as long as it runs.
-    log = open(os.path.join(str(tmp_path), "agent.log"), "ab")  # noqa: SIM115
+    log_path = os.path.join(str(tmp_path), "agent.log")
+    log = open(log_path, "ab")  # noqa: SIM115
     proc = subprocess.Popen(
         [AGENT_PYTHON, AGENT], stdout=log, stderr=subprocess.STDOUT, env=env
     )
     log.write(f"\n--- agent start pid={proc.pid} ---\n".encode())
     log.flush()
-    return proc
+
+    deadline = time.time() + 10.0
+    while time.time() < deadline:
+        try:
+            with open(log_path, "rb") as f:
+                content = f.read()
+                if b"tunnel established" in content or b"waiting for an operator" in content:
+                    return proc
+        except OSError:
+            pass
+        if proc.poll() is not None:
+            raise TimeoutError(
+                f"Agent process {proc.pid} exited prematurely with code {proc.returncode}"
+            )
+        time.sleep(0.05)
+    raise TimeoutError(f"Agent process {proc.pid} timed out waiting for tunnel establishment")

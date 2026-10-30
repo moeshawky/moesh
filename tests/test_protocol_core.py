@@ -500,6 +500,7 @@ def test_the_agent_sees_a_frame_that_arrived_with_the_http_response() -> None:
     never returns.
     """
     left, right = socket.socketpair()
+    agent._stopping = False
     try:
         channel = proto.Channel(left)
         channel.seed(proto.frame(b"the operator's first frame"))

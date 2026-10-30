@@ -43,6 +43,8 @@ HANDOFF.md
 opencode.json
 TEST-PROTOCOL.md
 .workflows/
+maintaince.md
+.maat/
 
 # Local code intelligence & search index caches
 .codegraph/

@@ -314,6 +314,8 @@ def test_rc5_tunnel_worker_recovers_from_transient_conflict(monkeypatch: pytest.
         assert moesh_tunnel._conflict_refused is False
         assert idx == len(timeline)
     finally:
+        moesh_tunnel._stopping = False
+        moesh_tunnel._conflict_refused = False
         pool.terminate_all()
 
 
@@ -344,6 +346,8 @@ def test_rc5_tunnel_worker_falsification_persistent_conflict_terminates(monkeypa
         assert moesh_tunnel._conflict_refused is True
         assert moesh_tunnel._stopping is True
     finally:
+        moesh_tunnel._stopping = False
+        moesh_tunnel._conflict_refused = False
         pool.terminate_all()
 
 
