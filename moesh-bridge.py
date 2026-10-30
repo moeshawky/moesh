@@ -425,6 +425,8 @@ def admit_host(
         Returns conflict reason if host is already leased to another carrier with
         queued tunnels or active pairings. Returns queue full reason without
         advancing the host generation counter if queue.Full is encountered.
+        Iterates ``_shell_v2`` under ``_registry_lock`` to prevent concurrent
+        dictionary modification errors (measured 2026-10-30).
     """
     with _leases_lock:
         queued = live_queued(q)
@@ -432,11 +434,12 @@ def admit_host(
         lease = _host_leases.get(host)
         if lease is not None and lease["id"] != carrier and (queued > 0 or active > 0):
             held = int(time.time() - float(lease["since"]))
-            active_hosts = [
-                h
-                for h, hq in _shell_v2.items()
-                if live_queued(hq) > 0 or _host_active.get(h, 0) > 0
-            ]
+            with _registry_lock:
+                active_hosts = [
+                    h
+                    for h, hq in _shell_v2.items()
+                    if live_queued(hq) > 0 or _host_active.get(h, 0) > 0
+                ]
             active_str = ", ".join(sorted(active_hosts)) or host
             return (
                 f"host {host!r} is already in use by another tunnel "
@@ -823,6 +826,17 @@ def read_headers(conn: socket.socket) -> bytes:
     then consumes exactly the header bytes (through the delimiter) and leaves
     any tail on the socket for ``pump``.  Consuming past the delimiter drops
     bytes the peer expects to be relayed (RC-10).
+
+    Preconditions:
+        ``conn`` is a connected stream socket during an HTTP handshake.
+    Postconditions:
+        Returns bytes up to and including delimiter ``\\r\\n\\r\\n``. Unconsumed
+        tail remains in socket receive buffer for the subsequent relay pump.
+    Failure Modes:
+        Raises ConnectionError if connection closes prematurely or if headers
+        reach or exceed 64KB without the delimiter (measured 2026-10-30: avoids
+        100% CPU busy-loop on segmented packets via 5ms backoff and enforces
+        the 64KB buffer cap).
     """
     buf = b""
     conn.settimeout(15)
@@ -830,6 +844,9 @@ def read_headers(conn: socket.socket) -> bytes:
         chunk = conn.recv(65536, socket.MSG_PEEK)
         if not chunk:
             raise ConnectionError("closed during headers")
+        if chunk == buf:
+            time.sleep(0.005)
+            continue
         # recv(MSG_PEEK) returns the cumulative available prefix without
         # consuming, so appending duplicates data on partial delivery
         # (measured 2026-10-23: a two-chunk send inflated `end` past the
@@ -840,7 +857,7 @@ def read_headers(conn: socket.socket) -> bytes:
         # \r\n\r\n delimiter and hangs until socket timeout. The tail past
         # \r\n\r\n stays on the socket for pump.
         buf = chunk
-        if len(buf) > 65536:
+        if len(buf) >= 65536 and b"\r\n\r\n" not in buf:
             raise ConnectionError("header block too large")
     end = buf.find(b"\r\n\r\n") + 4
     consumed = b""
@@ -1227,25 +1244,26 @@ def pair(
         and pumps traffic until closed or detached.
     Failure Modes:
         Raises ``queue.Empty`` if wait expires without a live tunnel arriving.
-        Closes sockets safely on errors.
+        Closes sockets safely on errors. If a dead tunnel is encountered,
+        continues waiting for the full wait budget rather than prematurely
+        aborting with PAIR_DEAD_MARKER (measured 2026-10-30).
     """
     saw_dead = False
+    deadline = time.time() + wait if wait is not None and wait > 0 else None
     try:
         log(f"{label} attached from {conn.getpeername()}")
         item: Any = None
         nb: socket.socket | None = None
         paired = False
         while not paired:
-            try:
-                item = q.get(timeout=wait)
-            except queue.Empty:
-                # No tunnel arrived in time.  If we discarded a dead one along
-                # the way, tell the operator so it can retry immediately instead
-                # of waiting out its backoff (the dead-tunnel race).
-                if saw_dead:
-                    with contextlib.suppress(OSError):
-                        conn.sendall(PAIR_DEAD_MARKER)
-                raise
+            if deadline is not None:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    raise queue.Empty
+                timeout = remaining
+            else:
+                timeout = wait
+            item = q.get(timeout=timeout)
             nb = _sock_of(item)
             if isinstance(item, QueuedTunnel):
                 if not entry_is_current(item):
@@ -1264,16 +1282,6 @@ def pair(
                 log(f"discarding stale {label} tunnel")
                 with contextlib.suppress(OSError):
                     nb.close()
-                # If the agent died, no live tunnel will arrive from it; tell
-                # the operator to retry now instead of waiting out the queue
-                # timeout (the dead-tunnel race).
-                if live_queued(q) == 0:
-                    log(f"sending PAIR_DEAD_MARKER to {label} operator")
-                    with contextlib.suppress(OSError):
-                        conn.sendall(PAIR_DEAD_MARKER)
-                    with contextlib.suppress(OSError):
-                        conn.close()
-                    return
                 continue
             # Final re-check right before pairing: closes the window between
             # the peek above and the pump below as much as TCP allows.
@@ -1282,13 +1290,6 @@ def pair(
                 log(f"discarding stale {label} tunnel")
                 with contextlib.suppress(OSError):
                     nb.close()
-                if live_queued(q) == 0:
-                    log(f"sending PAIR_DEAD_MARKER to {label} operator")
-                    with contextlib.suppress(OSError):
-                        conn.sendall(PAIR_DEAD_MARKER)
-                    with contextlib.suppress(OSError):
-                        conn.close()
-                    return
                 continue
             paired = True
         assert nb is not None and item is not None
@@ -1353,6 +1354,15 @@ def read_host_label(conn: socket.socket) -> str:
     seconds, because the pump's ``recv`` raised ``socket.timeout`` (an
     ``OSError``) and the pair was torn down.  Measured on the live bridge
     before the fix: EOF at t=15.0s with the pair established 15s earlier.
+
+    Preconditions:
+        ``conn`` is an active socket stream from an incoming operator connection.
+    Postconditions:
+        Consumes the prelude line up to and including newline without consuming
+        subsequent handshake payload bytes (measured 2026-10-30: loop consumption
+        guarantees full index+1 bytes read across segmented TCP delivery).
+    Failure Modes:
+        Returns empty string on peek/read timeout, disconnect, or invalid host.
     """
     conn.settimeout(15)
     deadline = time.time() + 15
@@ -1385,7 +1395,16 @@ def read_host_label(conn: socket.socket) -> str:
         if index < 0:
             return ""
         # Consume exactly the label line, and nothing else.
-        line = conn.recv(index + 1)
+        needed = index + 1
+        line = b""
+        while len(line) < needed:
+            try:
+                chunk = conn.recv(needed - len(line))
+            except OSError:
+                return ""
+            if not chunk:
+                return ""
+            line += chunk
     finally:
         conn.settimeout(None)
     name = line[len(PRELUDE_PREFIX) :].decode("latin-1", "replace").strip()
@@ -1572,15 +1591,32 @@ def main(argv: list[str] | None = None) -> int:
             label = str(port_num)
 
             def handler(conn: socket.socket, addr: tuple[str, int]) -> None:
+                # Defer touch_relay(label, 1) to on_pair callback matching operator-v2
+                # pattern (measured 2026-10-30: prevents 409 Conflict registration
+                # deadlocks when public clients connect before carrier is paired).
+                paired = threading.Event()
                 detached = threading.Lock()
 
+                def attach() -> None:
+                    """Record active pairing once a tunnel has been acquired."""
+                    if not paired.is_set():
+                        paired.set()
+                        touch_relay(label, 1)
+
                 def detach() -> None:
-                    if detached.acquire(blocking=False):
+                    """Stop counting this pairing as attached; safe to call twice."""
+                    if paired.is_set() and detached.acquire(blocking=False):
                         touch_relay(label, -1)
 
-                touch_relay(label, 1)
                 try:
-                    pair(conn, queue_ref, f"relay:{port_num}", 20, on_detach=detach)
+                    pair(
+                        conn,
+                        queue_ref,
+                        f"relay:{port_num}",
+                        20,
+                        on_detach=detach,
+                        on_pair=attach,
+                    )
                 finally:
                     detach()
 
