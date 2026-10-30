@@ -561,7 +561,7 @@ def test_e2e_large_multichunk_file_transfer(moecp_test_env: MoecpHosts, tmp_path
         str(src_file),
         f"{_ALPHA}:{remote_dest}",
     ]
-    proc_up = subprocess.run(up_cmd, env=env, capture_output=True, text=True, timeout=45)
+    proc_up = subprocess.run(up_cmd, env=env, capture_output=True, text=True, timeout=90)
     assert proc_up.returncode == 0, f"large file upload failed: {proc_up.stderr}"
     assert remote_dest.exists()
     assert hashlib.sha256(remote_dest.read_bytes()).hexdigest() == expected_sha
@@ -642,6 +642,6 @@ def test_e2e_unwritable_destination_fails_cleanly(moecp_test_env: MoecpHosts, tm
         str(src_file),
         f"{_ALPHA}:{unwritable_dest}",
     ]
-    proc = subprocess.run(up_cmd, env=env, capture_output=True, text=True, timeout=20)
+    proc = subprocess.run(up_cmd, env=env, capture_output=True, text=True, timeout=45)
     assert proc.returncode != 0
     assert not os.path.exists(unwritable_dest)

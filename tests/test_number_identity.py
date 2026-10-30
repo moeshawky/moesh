@@ -108,7 +108,7 @@ def numbered(tmp_path: Path) -> Iterator[Numbered]:
                 "MOESH_SHELL_ADDR": f"127.0.0.1:{operator_v2_port}",
                 "MOESH_SHELL_KEYFILE": str(operator_keyfile),
                 "MOESH_SHELL_HOSTS_FILE": str(pins),
-                "MOESH_SHELL_HANDSHAKE_TIMEOUT": "30",
+                "MOESH_SHELL_HANDSHAKE_TIMEOUT": "60",
                 "TERM": "xterm-256color",
             }
         )

@@ -215,6 +215,7 @@ def relay_entry(
 # bridge stays blind, and refuses a conflicting carrier with HTTP 409 Conflict.
 RELAY_ID_HEADER = b"x-moesh-relay-id:"
 CARRIER_ID_HEADER = b"x-moesh-carrier-id:"
+TUNNEL_ID_HEADER = b"x-moesh-tunnel-id:"
 RELAY_PORT_HEADER = b"x-moesh-relay-port:"
 RELAY_AUTH_HEADER = b"x-moesh-relay-auth:"
 RELAY_PAIRING_HEADER = b"x-moesh-relay-pairing:"
@@ -253,7 +254,7 @@ def extract_carrier(hdrs: bytes, addr: tuple[str, int]) -> str:
     fwd = ""
     for line in hdrs.split(b"\r\n")[1:]:
         low = line.lower()
-        if low.startswith((CARRIER_ID_HEADER, RELAY_ID_HEADER)):
+        if low.startswith((CARRIER_ID_HEADER, RELAY_ID_HEADER, TUNNEL_ID_HEADER)):
             val = line.split(b":", 1)[1].strip().decode("latin-1", "replace")[:64]
             if val:
                 carrier = val

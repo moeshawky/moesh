@@ -833,7 +833,7 @@ wheels = [
 
 [[package]]
 name = "moesh"
-version = "0.2.0a6"
+version = "0.2.0a7"
 source = { editable = "." }
 dependencies = [
     { name = "cryptography" },

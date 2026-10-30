@@ -236,6 +236,18 @@ class OperatorSession:
                 err_data = ef.read()
                 if err_data:
                     err_msg = f"; client stderr: {err_data[-1000:]!r}"
+        with contextlib.suppress(Exception):
+            import glob
+
+            bridge_logs = sorted(
+                glob.glob(f"{EVIDENCE_DIR}/bridge-test-*.log"),
+                key=os.path.getmtime,
+            )
+            if bridge_logs:
+                with open(bridge_logs[-1], "rb") as bf:
+                    b_data = bf.read()
+                    if b_data:
+                        err_msg += f"; latest bridge log: {b_data[-800:]!r}"
         raise AssertionError(
             f"timed out waiting for {needle!r}; saw {self.buffer[-800:]!r}{err_msg}"
         )

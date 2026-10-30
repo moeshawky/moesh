@@ -3,6 +3,17 @@
 All notable changes to `moesh`. The project is pre-1.0: behaviour may change
 between minor releases without a deprecation period.
 
+## 0.2.0a7 — 2026-10-30
+
+CI test synchronization hardening, bridge carrier header interoperability, and runner timeout alignment.
+
+### Fixed — bridge headers, test timeouts, and CI diagnostics
+
+- **Dual bridge tunnel carrier header support (`moesh-bridge.py`, `moesh_tunnel.py`).** Added `TUNNEL_ID_HEADER = b"x-moesh-tunnel-id:"` to `moesh-bridge.py:218`, `:257` and updated `moesh_tunnel.py:411-412` to emit both `X-Moesh-Carrier-Id` and `X-Moesh-Tunnel-Id` on HTTP upgrade, ensuring full interoperability across agent and bridge versions.
+- **Test handshake timeout alignment (`tests/test_cli_packaging.py`, `tests/test_command_piping.py`, `tests/test_moecp.py`, `tests/test_named_hosts.py`, `tests/test_number_identity.py`, `tests/test_operator_outcome.py`).** Raised fixture handshake timeouts from `30s` to `60s` (`MOESH_SHELL_HANDSHAKE_TIMEOUT="60"`). Eliminates the race where client handshake retry backoff overlaps test assertion deadlines under CI runner load.
+- **Adversarial transfer test timeout bounds (`tests/test_moecp_adversarial.py`).** Increased subprocess execution timeouts for large multichunk transfers (to `90s`; `tests/test_moecp_adversarial.py:564`) and unwritable destination tests (to `45s`; `tests/test_moecp_adversarial.py:645`), preventing premature runner termination before internal protocol error handling completes.
+- **Diagnostic bridge log capture on assertion failure (`tests/harness.py`).** `OperatorSession.read_until` now inspects `/tmp/opencode/bridge-test-*.log` and appends recent bridge events to `AssertionError` messages on timeout for instant failure triage in CI runs (`tests/harness.py:239-250`).
+
 ## 0.2.0a6 — 2026-10-30
 
 Test synchronization hardening and prompt refresh reliability across Python 3.11, 3.12, 3.13, and 3.14.

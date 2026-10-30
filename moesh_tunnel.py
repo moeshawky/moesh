@@ -408,7 +408,8 @@ def http_upgrade(
         f"Upgrade: {proto.UPGRADE_TOKEN}\r\n"
         f"Connection: Upgrade\r\n"
         f"X-Moesh-Tunnel-Version: {proto.PROTOCOL_VERSION}\r\n"
-        f"X-Moesh-Carrier-Id: {CARRIER_ID}\r\n\r\n"
+        f"X-Moesh-Carrier-Id: {CARRIER_ID}\r\n"
+        f"X-Moesh-Tunnel-Id: {CARRIER_ID}\r\n\r\n"
     ).encode()
 
     sock.sendall(request)

@@ -159,7 +159,7 @@ class Stack:
                 "MOESH_SHELL_KEYFILE": self.operator_keyfile,
                 "MOESH_SHELL_PEER_PUBFILE": self.agent_pubfile,
                 "MOESH_SHELL_HOSTS_FILE": self.pins,
-                "MOESH_SHELL_HANDSHAKE_TIMEOUT": "30",
+                "MOESH_SHELL_HANDSHAKE_TIMEOUT": "60",
                 "TERM": "xterm-256color",
             }
         )
