@@ -248,18 +248,39 @@ _leases_lock = threading.Lock()
 _relay_active: dict[str, int] = {}
 _host_active: dict[str, int] = {}
 
+TRUSTED_PROXIES: frozenset[str] = frozenset(
+    ip.strip()
+    for ip in os.environ.get(
+        "MOESH_BRIDGE_TRUSTED_PROXIES", "127.0.0.1,::1,::ffff:127.0.0.1"
+    ).split(",")
+    if ip.strip()
+)
+"""Proxy peer addresses permitted to supply forwarded client IP headers."""
+
 
 def extract_carrier(hdrs: bytes, addr: tuple[str, int]) -> str:
-    """Extract carrier identity from headers, falling back to forwarded client IP."""
+    """Extract carrier identity from headers, falling back to verified client IP.
+
+    Forwarded IP headers (``CF-Connecting-IP``, ``X-Real-IP``, ``X-Forwarded-For``)
+    are honored only when the immediate TCP peer ``addr[0]`` is in
+    ``TRUSTED_PROXIES`` (measured 2026-11-02: trusting forwarded headers from
+    arbitrary direct peers let untrusted clients spoof IP-fallback carrier IDs).
+    When a carrier header is present and the effective client IP is non-loopback,
+    the carrier token is scoped to that IP (``<carrier>@<peer_ip>``) so cloned
+    VM images sharing ``/etc/machine-id`` across distinct hosts cannot collide.
+    """
     carrier = ""
     fwd = ""
+    trust_fwd = addr[0] in TRUSTED_PROXIES
     for line in hdrs.split(b"\r\n")[1:]:
         low = line.lower()
         if low.startswith((CARRIER_ID_HEADER, RELAY_ID_HEADER, TUNNEL_ID_HEADER)):
             val = line.split(b":", 1)[1].strip().decode("latin-1", "replace")[:64]
             if val:
                 carrier = val
-        elif low.startswith((b"cf-connecting-ip:", b"x-real-ip:", b"x-forwarded-for:")):
+        elif trust_fwd and low.startswith(
+            (b"cf-connecting-ip:", b"x-real-ip:", b"x-forwarded-for:")
+        ):
             cand = (
                 line.split(b":", 1)[1]
                 .split(b",")[0]
@@ -268,9 +289,12 @@ def extract_carrier(hdrs: bytes, addr: tuple[str, int]) -> str:
             )
             if cand and not fwd:
                 fwd = cand
+    peer_ip = fwd or addr[0]
     if carrier:
+        if peer_ip and peer_ip not in TRUSTED_PROXIES:
+            return f"{carrier}@{peer_ip}"
         return carrier
-    return "addr:" + (fwd or addr[0])
+    return "addr:" + peer_ip
 
 
 def relay_authorized(hdrs: bytes) -> bool:
@@ -517,7 +541,9 @@ def _resolve_relay_locked(
                     f"no free relay ports available; open ports: "
                     f"{', '.join(str(p) for p in bound)}",
                 )
-            port = free[0]
+            static_ports = set(static_map.values())
+            unreserved = [p for p in free if p not in static_ports]
+            port = unreserved[0] if unreserved else free[0]
         lease_name = str(port)
     elif svc.isdigit():
         port = int(svc)
@@ -538,7 +564,9 @@ def _resolve_relay_locked(
                     f"no free relay ports available for {svc!r}; open ports: "
                     f"{', '.join(str(p) for p in bound)}",
                 )
-            port = free[0]
+            static_ports = set(static_map.values())
+            unreserved = [p for p in free if p not in static_ports]
+            port = unreserved[0] if unreserved else free[0]
 
     summary = _free_ports_summary_locked(bound)
     if port in unavail:
@@ -566,10 +594,12 @@ def _claim_relay_locked(
     name_lease = _leases.get(svc)
     port_lease = _port_leases.get(port) if port > 0 else None
 
-    if name_lease is not None and name_lease["id"] != carrier:
+    if name_lease is not None:
         prev_port = int(name_lease.get("port", 0))
         prev_key = str(prev_port) if prev_port > 0 else svc
-        if _busy_locked(prev_key, _relays.get(prev_key), name_lease):
+        if name_lease["id"] != carrier and _busy_locked(
+            prev_key, _relays.get(prev_key), name_lease
+        ):
             held = int(time.time() - float(name_lease["since"]))
             port_note = f" on port {prev_port}" if prev_port > 0 else ""
             return (
@@ -577,6 +607,27 @@ def _claim_relay_locked(
                 f"{port_note} (for {held}s); free ports: "
                 f"{_free_ports_summary_locked(bound)}"
             )
+        # Measured 2026-11-02: two processes sharing a carrier identifier
+        # (or fallback IP) claiming the same service name on different ports
+        # previously overwrote name_lease["port"] while prev_port was live,
+        # leaving the service split across two ports.
+        if (
+            name_lease["id"] == carrier
+            and prev_port > 0
+            and port > 0
+            and prev_port != port
+            and _busy_locked(prev_key, _relays.get(prev_key), name_lease)
+        ):
+            held = int(time.time() - float(name_lease["since"]))
+            return (
+                f"relay service {svc!r} is already bound to port {prev_port} "
+                f"(for {held}s); free ports: "
+                f"{_free_ports_summary_locked(bound)}"
+            )
+        if prev_port > 0 and prev_port != port:
+            prev_port_lease = _port_leases.get(prev_port)
+            if prev_port_lease is not None and prev_port_lease.get("name") == svc:
+                _port_leases.pop(prev_port, None)
 
     if (
         port > 0
@@ -697,6 +748,17 @@ def admit_relay(
                 f"relay registry is full ({MAX_RELAY_QUEUES} labels); "
                 "release a service before claiming a new one"
             ), None
+        live_queued(q)
+        prev_name_lease = (
+            dict(_leases[lease_name]) if lease_name in _leases else None
+        )
+        prev_port_lease = (
+            dict(_port_leases[port])
+            if port > 0 and port in _port_leases
+            else None
+        )
+        prev_name_gen = _lease_gens.get(lease_name)
+        prev_key_gen = _lease_gens.get(key)
         if reason is None:
             reason = _claim_relay_locked(lease_name, carrier, q, port, bound)
         if reason is not None:
@@ -713,11 +775,26 @@ def admit_relay(
         try:
             q.put_nowait(entry)
         except queue.Full:
-            # No tunnel exists for this carrier: do not leave a lease behind.
-            if port > 0 and _port_leases.get(port, {}).get("id") == carrier:
-                _port_leases.pop(port, None)
-            if _leases.get(lease_name, {}).get("id") == carrier:
+            # Restore exact prior lease and generation state (measured 2026-11-02:
+            # popping unconditionally wiped an existing owner's active lease when
+            # its queue was full and left _lease_gens incremented on refusal).
+            if prev_name_lease is None:
                 _leases.pop(lease_name, None)
+            else:
+                _leases[lease_name] = prev_name_lease
+            if port > 0:
+                if prev_port_lease is None:
+                    _port_leases.pop(port, None)
+                else:
+                    _port_leases[port] = prev_port_lease
+            if prev_name_gen is None:
+                _lease_gens.pop(lease_name, None)
+            else:
+                _lease_gens[lease_name] = prev_name_gen
+            if prev_key_gen is None:
+                _lease_gens.pop(key, None)
+            else:
+                _lease_gens[key] = prev_key_gen
             return port, f"relay queue for {key} is full; retry shortly", None
         # The admitting thread sets ready only after its handshake write is
         # complete; the pairer waits on it before touching the socket.

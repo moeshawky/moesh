@@ -56,33 +56,60 @@ DEFAULT_SESSION_IDLE = int(os.environ.get("MOESH_RELAY_SESSION_IDLE", "120"))
 
 _log_lock = threading.Lock()
 _port_logged = False
+_target_lock = threading.Lock()
+_target_failures: dict[tuple[str, int], int] = {}
+_target_backoff_until: dict[tuple[str, int], float] = {}
 
 
-def derive_carrier_id(explicit_id: str = "") -> str:
-    """Return a persistent carrier ID from explicit argument, env, or stable host identity.
+def derive_carrier_id(explicit_id: str = "", scope: str = "") -> str:
+    """Return a persistent carrier ID from explicit argument, env, or host identity.
 
     When neither explicit argument nor ``MOESH_RELAY_ID`` is provided, derives a
-    stable 16-hex identity from the machine ID (/etc/machine-id, /var/lib/dbus/machine-id)
-    so restarts do not generate alien carrier IDs that collide with prior leases.
+    stable 16-hex identity from the host's machine-id, kernel ``boot_id``,
+    hostname, and optional ``scope`` (measured 2026-11-02: hashing only
+    ``/etc/machine-id`` caused cloned VM images and multiple relay instances on
+    the same host to emit identical ``X-Moesh-Relay-Id`` values).
 
     Preconditions:
         ``explicit_id`` is an optional string passed from CLI arguments.
+        ``scope`` is an optional target/service discriminator string.
     Postconditions:
-        Returns a non-empty hex carrier ID string.
+        Returns a non-empty hex or explicit carrier ID string.
     Failure Modes:
-        If file access fails or machine-id is absent, falls back to os.urandom(8).hex().
+        If no host identity markers are readable, falls back to os.urandom(8).hex().
     """
     explicit = explicit_id.strip() or os.environ.get("MOESH_RELAY_ID", "").strip()
     if explicit:
         return explicit
-    for path in ("/etc/machine-id", "/var/lib/dbus/machine-id"):
+    machine_id_parts: list[str] = []
+    for path in (
+        "/etc/machine-id",
+        "/var/lib/dbus/machine-id",
+    ):
         try:
             with open(path, encoding="utf-8") as f:
                 content = f.read().strip()
                 if content:
-                    return hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
+                    machine_id_parts.append(content)
         except OSError:
             pass
+    if machine_id_parts:
+        parts = list(machine_id_parts)
+        try:
+            with open("/proc/sys/kernel/random/boot_id", encoding="utf-8") as f:
+                content = f.read().strip()
+                if content:
+                    parts.append(content)
+        except OSError:
+            pass
+        with contextlib.suppress(OSError):
+            host = socket.gethostname().strip()
+            if host:
+                parts.append(host)
+        if scope:
+            parts.append(scope)
+        raw = "|".join(parts).encode("utf-8")
+        return hashlib.sha256(raw).hexdigest()[:16]
     return os.urandom(8).hex()
 
 
@@ -281,15 +308,17 @@ def _serve_session(
     target_host: str,
     target_port: int,
     session_idle: int,
+    target: socket.socket | None = None,
 ) -> None:
-    """Connect to local target, forward initial bytes, and splice until closed."""
-    try:
-        target = socket.create_connection((target_host, target_port), timeout=10)
-    except OSError as err:
-        log(f"worker {index}: target {target_host}:{target_port} refused: {err}")
-        with contextlib.suppress(OSError):
-            sock.close()
-        return
+    """Connect to local target (if not already connected), forward initial bytes, and splice."""
+    if target is None:
+        try:
+            target = socket.create_connection((target_host, target_port), timeout=10)
+        except OSError as err:
+            log(f"worker {index}: target {target_host}:{target_port} refused: {err}")
+            with contextlib.suppress(OSError):
+                sock.close()
+            return
     try:
         target.sendall(first)
         splice(sock, target, idle_timeout=session_idle)
@@ -318,10 +347,14 @@ def worker(
     """Worker maintaining one queued standby tunnel at a time.
 
     As soon as a standby tunnel is paired and receives its first peer bytes,
-    the active session is handed off to a background thread and this worker
-    immediately dials a replacement standby tunnel.  This prevents HTTP
-    keep-alive pools from exhausting the standby tunnel queue (measured
-    2026-10-26: 4 keep-alive sockets previously parked all 4 workers).
+    the local target connection is verified before handing the active session
+    off to a background thread and dialing a replacement standby tunnel.
+    This prevents HTTP keep-alive pools from exhausting the standby tunnel
+    queue (measured 2026-10-26: 4 keep-alive sockets previously parked all 4
+    workers) while ensuring a dead local target backs off instead of
+    continuously queueing blackhole standby tunnels on the receiver (measured
+    2026-11-02: an unreachable local backend previously re-queued within ms,
+    dropping every incoming peer with EOF and holding the bridge lease busy).
 
     Resets the 409 conflict deadline per incident so transient conflicts during
     steady-state operation retry properly instead of aborting the relay daemon.
@@ -340,7 +373,12 @@ def worker(
     """
     global _port_logged
     incident_deadline: float | None = None
+    target_key = (target_host, target_port)
     while True:
+        with _target_lock:
+            wait_sec = _target_backoff_until.get(target_key, 0.0) - time.time()
+        if wait_sec > 0:
+            time.sleep(wait_sec)
         sock = None
         try:
             sock, assigned_port, leftover, event_mode = connect_tunnel(
@@ -378,9 +416,29 @@ def worker(
                 if not first:
                     raise ConnectionError("paired then immediately closed before data")
             sock.settimeout(None)
+            try:
+                target = socket.create_connection((target_host, target_port), timeout=10)
+            except OSError as err:
+                log(f"worker {index}: target {target_host}:{target_port} refused: {err}")
+                with contextlib.suppress(OSError):
+                    sock.close()
+                sock = None
+                with _target_lock:
+                    streak = _target_failures.get(target_key, 0) + 1
+                    _target_failures[target_key] = streak
+                    delay = min(30.0, 2.0 * (2 ** min(streak - 1, 4)))
+                    _target_backoff_until[target_key] = max(
+                        _target_backoff_until.get(target_key, 0.0),
+                        time.time() + delay,
+                    )
+                time.sleep(delay)
+                continue
+            with _target_lock:
+                _target_failures.pop(target_key, None)
+                _target_backoff_until.pop(target_key, None)
             threading.Thread(
                 target=_serve_session,
-                args=(index, sock, first, target_host, target_port, session_idle),
+                args=(index, sock, first, target_host, target_port, session_idle, target),
                 daemon=True,
             ).start()
             sock = None
@@ -548,7 +606,9 @@ def main(argv: list[str] | None = None) -> int:
         f"-> local {target_host}:{target_port} ({workers} standby workers) via {host}:{port}"
     )
 
-    carrier_id = derive_carrier_id(args.id)
+    carrier_id = derive_carrier_id(
+        args.id, scope=f"{path}:{req_remote_port}:{target_host}:{target_port}"
+    )
     refused = threading.Event()
     claim_wait = args.claim_wait
     for i in range(workers):

@@ -12,13 +12,14 @@ from __future__ import annotations
 
 import contextlib
 import socket
+import subprocess
 import threading
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import moesh_relay
-from tests.harness import Bridge, next_ports
+from tests.harness import AGENT_PYTHON, Bridge, next_ports
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -326,3 +327,187 @@ def test_bridge_pump_does_not_leak_a_blocked_thread() -> None:
             with contextlib.suppress(OSError):
                 sock.close()
 
+
+def test_dead_target_backs_off_instead_of_blackholing_standby_queue(
+    tmp_path: Path,
+) -> None:
+    """When the local target refuses connections, the worker must back off instead of immediately re-queueing standby tunnels."""
+    dead_target_port = free_port()
+    relay_port = free_port()
+    bridge, tunnel_port, _o1, _o2 = _make_bridge(relay_port)
+    _start_relay(
+        tunnel_port=tunnel_port,
+        relay_port=relay_port,
+        target_port=dead_target_port,
+        session_idle=5,
+    )
+    try:
+        bridge._wait_for_line(f"path /__relay/{relay_port}")
+        # Trigger pairing against the dead local target.
+        with socket.create_connection(("127.0.0.1", relay_port), timeout=5) as client:
+            client.sendall(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            # The tunnel closes because the local target refused the connection.
+            assert client.recv(1024) == b""
+
+        # Wait briefly: a worker with a dead local target must be in backoff,
+        # NOT immediately re-queued on the bridge where it would blackhole
+        # the next peer and hold the lease busy.
+        time.sleep(0.4)
+        status = moesh_relay.fetch_status("127.0.0.1", tunnel_port)
+        in_use = status["relay"]["ports_in_use"].get(str(relay_port), {})
+        queued = in_use.get("queued", 0)
+        assert queued == 0, (
+            f"worker with dead target immediately re-queued {queued} standby tunnel(s)"
+        )
+    finally:
+        bridge.stop()
+
+
+def test_concurrent_relay_daemons_competing_for_same_port_e2e(
+    tmp_path: Path,
+) -> None:
+    """Two relay daemons with distinct carrier IDs competing for the same port.
+
+    The first daemon acquires port P and serves traffic. The second daemon receives
+    HTTP 409 Conflict, logs the conflict, and backs off without evicting the first.
+    When the first daemon terminates, the second daemon reconnects and acquires port P.
+    """
+    alpha_banner = b"CARRIER-ALPHA-ACTIVE\r\n"
+    beta_banner = b"CARRIER-BETA-ACTIVE\r\n"
+
+    def serve_alpha(conn: socket.socket) -> None:
+        conn.sendall(alpha_banner)
+        while conn.recv(4096):
+            pass
+
+    def serve_beta(conn: socket.socket) -> None:
+        conn.sendall(beta_banner)
+        while conn.recv(4096):
+            pass
+
+    server_alpha = Server(serve_alpha).start()
+    server_beta = Server(serve_beta).start()
+    relay_port = free_port()
+    bridge, tunnel_port, _o1, _o2 = _make_bridge(relay_port)
+
+    root = Path(__file__).resolve().parent.parent
+    relay_py = root / "moesh_relay.py"
+
+    log_alpha_path = tmp_path / "relay_alpha.log"
+    log_beta_path = tmp_path / "relay_beta.log"
+
+    with (
+        open(log_alpha_path, "w+", encoding="utf-8") as log_alpha,
+        open(log_beta_path, "w+", encoding="utf-8") as log_beta,
+    ):
+        proc_alpha = subprocess.Popen(
+            [
+                AGENT_PYTHON,
+                str(relay_py),
+                "--receiver",
+                "127.0.0.1",
+                "--port",
+                str(tunnel_port),
+                "-R",
+                str(relay_port),
+                "--target",
+                f"127.0.0.1:{server_alpha.port}",
+                "--id",
+                "carrier-alpha",
+                "--workers",
+                "1",
+            ],
+            stdout=log_alpha,
+            stderr=subprocess.STDOUT,
+        )
+
+        proc_beta: subprocess.Popen[bytes] | None = None
+        try:
+            bridge._wait_for_line(f"path /__relay/{relay_port}")
+
+            # 1. Verify worker 1 (carrier-alpha) binds and serves.
+            with socket.create_connection(("127.0.0.1", relay_port), timeout=5) as client:
+                resp = _read_until(client, alpha_banner, timeout=5.0)
+                assert alpha_banner in resp, f"expected alpha banner, got: {resp!r}"
+
+            # 2. Launch worker 2 (carrier-beta) targeting the exact same port.
+            proc_beta = subprocess.Popen(
+                [
+                    AGENT_PYTHON,
+                    str(relay_py),
+                    "--receiver",
+                    "127.0.0.1",
+                    "--port",
+                    str(tunnel_port),
+                    "-R",
+                    str(relay_port),
+                    "--target",
+                    f"127.0.0.1:{server_beta.port}",
+                    "--id",
+                    "carrier-beta",
+                    "--workers",
+                    "1",
+                    "--claim-wait",
+                    "30.0",
+                ],
+                stdout=log_beta,
+                stderr=subprocess.STDOUT,
+            )
+
+            # 3. Verify worker 2 receives 409 Conflict, logs it, and backs off without crashing.
+            conflict_logged = False
+            deadline = time.time() + 10.0
+            while time.time() < deadline:
+                log_beta.flush()
+                content = log_beta_path.read_text(encoding="utf-8")
+                if "409 Conflict" in content:
+                    conflict_logged = True
+                    break
+                time.sleep(0.2)
+            assert conflict_logged, (
+                f"worker 2 did not log 409 Conflict within timeout: "
+                f"{log_beta_path.read_text(encoding='utf-8')}"
+            )
+            assert proc_beta.poll() is None, "worker 2 crashed on 409 Conflict"
+
+            # Verify worker 1 was NOT evicted and continues serving.
+            with socket.create_connection(("127.0.0.1", relay_port), timeout=5) as client:
+                resp = _read_until(client, alpha_banner, timeout=5.0)
+                assert alpha_banner in resp, f"worker 1 was evicted: {resp!r}"
+
+            # 4. Terminate worker 1.
+            proc_alpha.terminate()
+            proc_alpha.wait(timeout=5.0)
+
+            # 5. Verify worker 2 reconnects, acquires port P lease, and serves cleanly.
+            acquired = False
+            deadline = time.time() + 10.0
+            while time.time() < deadline:
+                try:
+                    with socket.create_connection(
+                        ("127.0.0.1", relay_port), timeout=2.0
+                    ) as client:
+                        resp = _read_until(client, beta_banner, timeout=2.0)
+                        if beta_banner in resp:
+                            acquired = True
+                            break
+                except (OSError, TimeoutError):
+                    pass
+                time.sleep(0.5)
+
+            assert acquired, (
+                f"worker 2 failed to acquire port {relay_port} after worker 1 exit; "
+                f"log: {log_beta_path.read_text(encoding='utf-8')}"
+            )
+        finally:
+            if proc_alpha.poll() is None:
+                proc_alpha.terminate()
+                with contextlib.suppress(Exception):
+                    proc_alpha.wait(timeout=2.0)
+            if proc_beta is not None and proc_beta.poll() is None:
+                proc_beta.terminate()
+                with contextlib.suppress(Exception):
+                    proc_beta.wait(timeout=2.0)
+            bridge.stop()
+            server_alpha.stop()
+            server_beta.stop()

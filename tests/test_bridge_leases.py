@@ -340,3 +340,110 @@ def test_status_snapshot_completes_promptly(bridge_mod: Any) -> None:
     started = time.monotonic()
     bridge_mod.bridge_status()
     assert time.monotonic() - started < 2.0
+
+
+def test_same_carrier_cannot_rebind_live_service_to_different_port(
+    bridge_mod: Any,
+) -> None:
+    """A live named service on port A must not be silently rebound to port B."""
+    bridge_mod._bound_relay_ports.update({26500, 26510})
+    a1, b1 = _sock_pair()
+    a2, b2 = _sock_pair()
+    try:
+        port1, reason1, _entry1 = bridge_mod.admit_relay(
+            "mimo", "addr:127.0.0.1", 26510, a1
+        )
+        assert reason1 is None
+        assert port1 == 26510
+        assert bridge_mod._leases["mimo"]["port"] == 26510
+
+        # A second relay sharing the fallback carrier (or same-host carrier)
+        # asks for the same service name on a different port while 26510 is live.
+        _port2, reason2, _entry2 = bridge_mod.admit_relay(
+            "mimo", "addr:127.0.0.1", 26500, a2
+        )
+        assert reason2 is not None, "live service was silently rebound to a second port"
+        assert bridge_mod._leases["mimo"]["port"] == 26510
+    finally:
+        for sock in (a1, b1, a2, b2):
+            with contextlib.suppress(OSError):
+                sock.close()
+
+
+def test_extract_carrier_ignores_spoofed_forwarded_headers_and_isolates_remote_ips(
+    bridge_mod: Any,
+) -> None:
+    """Direct non-proxy peers cannot spoof X-Forwarded-For or collide across IPs."""
+    spoofed_hdrs = (
+        b"GET /__relay/mimo HTTP/1.1\r\n"
+        b"Host: example.com\r\n"
+        b"X-Forwarded-For: 10.0.0.1\r\n"
+        b"X-Real-IP: 10.0.0.1\r\n\r\n"
+    )
+    # Direct external connection: must ignore X-Forwarded-For / X-Real-IP.
+    direct_id = bridge_mod.extract_carrier(spoofed_hdrs, ("198.51.100.7", 51234))
+    assert direct_id == "addr:198.51.100.7", direct_id
+
+    # Trusted loopback proxy connection: must honor forwarded IP.
+    proxied_id = bridge_mod.extract_carrier(spoofed_hdrs, ("127.0.0.1", 51234))
+    assert proxied_id == "addr:10.0.0.1", proxied_id
+
+    # Cloned VMs presenting the same X-Moesh-Relay-Id from two different remote
+    # IPs must not resolve to the same carrier identity.
+    cloned_hdr_a = (
+        b"GET /__relay/mimo HTTP/1.1\r\n"
+        b"X-Moesh-Relay-Id: deadbeef12345678\r\n"
+        b"X-Real-IP: 198.51.100.7\r\n\r\n"
+    )
+    cloned_hdr_b = (
+        b"GET /__relay/mimo HTTP/1.1\r\n"
+        b"X-Moesh-Relay-Id: deadbeef12345678\r\n"
+        b"X-Real-IP: 203.0.113.9\r\n\r\n"
+    )
+    id_a = bridge_mod.extract_carrier(cloned_hdr_a, ("127.0.0.1", 50001))
+    id_b = bridge_mod.extract_carrier(cloned_hdr_b, ("127.0.0.1", 50002))
+    assert id_a != id_b, f"cloned carrier ID collided across distinct IPs: {id_a}"
+
+
+def test_admit_relay_queue_full_preserves_existing_owner_and_generation_and_purges_dead_sockets(
+    bridge_mod: Any,
+) -> None:
+    """admit_relay must purge dead sockets on same-carrier refresh and never corrupt leases or generations on queue.Full."""
+    q = bridge_mod.relay_queue("svc-full")
+    assert q is not None
+    live_peers: list[socket.socket] = []
+    extra_a, extra_b = _sock_pair()
+    try:
+        # 1. Fill the queue with live sockets owned by carrier-owner.
+        for _ in range(q.maxsize):
+            a, b = _sock_pair()
+            live_peers.extend([a, b])
+            _port, reason, entry = bridge_mod.admit_relay(
+                "svc-full", "carrier-owner", 0, a
+            )
+            assert reason is None and entry is not None
+            entry.ready.set()
+
+        gen_before = bridge_mod._lease_gens["svc-full"]
+        # 2. Existing owner hits queue.Full: its active lease and generation must stay intact.
+        _port, reason_full, _entry = bridge_mod.admit_relay(
+            "svc-full", "carrier-owner", 0, extra_a
+        )
+        assert reason_full is not None and "full" in reason_full.lower()
+        assert "svc-full" in bridge_mod._leases, "existing owner lease was wiped on queue.Full"
+        assert bridge_mod._leases["svc-full"]["id"] == "carrier-owner"
+        assert bridge_mod._lease_gens["svc-full"] == gen_before
+
+        # 3. Close one peer so one queued socket becomes dead; same-carrier admit_relay
+        # must purge the dead socket via live_queued(q) and succeed instead of failing with queue.Full.
+        live_peers[1].close()
+        live_peers[0].close()
+        _port, reason_after_purge, entry_after = bridge_mod.admit_relay(
+            "svc-full", "carrier-owner", 0, extra_a
+        )
+        assert reason_after_purge is None, f"dead socket was not purged: {reason_after_purge}"
+        assert entry_after is not None
+    finally:
+        for sock in [*live_peers, extra_a, extra_b]:
+            with contextlib.suppress(OSError):
+                sock.close()

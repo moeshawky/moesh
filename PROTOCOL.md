@@ -256,7 +256,23 @@ Separate queues ensure an encrypted v2 operator cannot be paired with a v1 tunne
 `MOESH_BRIDGE_ALLOW_V1=0` refuses the legacy v1 shell path while leaving v2 and reverse relays untouched.
 
 Environment knobs: `MOESH_BRIDGE_TUNNEL_LISTEN`, `MOESH_BRIDGE_OPERATOR_LISTEN`,
-`MOESH_BRIDGE_OPERATOR_V2_LISTEN`, `MOESH_RELAYS`, `MOESH_BRIDGE_GPU_PORTS`, `MOESH_BRIDGE_ALLOW_V1`.
+`MOESH_BRIDGE_OPERATOR_V2_LISTEN`, `MOESH_RELAYS`, `MOESH_BRIDGE_GPU_PORTS`, `MOESH_BRIDGE_ALLOW_V1`,
+`MOESH_BRIDGE_TRUSTED_PROXIES`.
+
+### 9.1 Carrier leases and generation counters
+
+The receiver tracks active carrier ownership for hosts and relay services to prevent split-brain collisions:
+
+* **Carrier Identity**: Each agent or relay daemon presents a stable carrier identifier via request headers (`X-Moesh-Carrier-Id`, `X-Moesh-Relay-Id`, `X-Moesh-Tunnel-Id`). When absent, the receiver derives identity from the verified client IP. When a carrier token is presented from a non-trusted IP, the bridge scopes the token as `<carrier>@<peer_ip>` to ensure distinct hosts sharing a cloned image or machine ID cannot collide.
+* **Lease Acquisition & Retention**: A carrier acquires an exclusive lease on a service name or numeric port when dialing standby tunnels. An existing lease remains active while either queued tunnels or active pairings exist.
+* **Generation Counters (`_lease_gens`)**: Every service or host maintains a strictly increasing monotonic generation counter. When ownership changes, the counter increments. Each queued tunnel carries the generation under which it was admitted (`entry.gen`). If a previous owner's stale socket remains in the queue when a new owner takes over, generation matching ensures the stale socket is discarded and never paired with traffic meant for the new carrier.
+* **Queue Invariant**: On `queue.Full`, admission fails cleanly without corrupting existing leases or prematurely advancing generation counters. Dead sockets belonging to the same carrier are purged during refresh.
+
+### 9.2 Proxy trust boundaries and 409 Conflict handling
+
+* **Trust Boundaries (`TRUSTED_PROXIES`)**: Forwarded client IP headers (`CF-Connecting-IP`, `X-Real-IP`, `X-Forwarded-For`) are accepted exclusively when the immediate TCP peer address is present in `TRUSTED_PROXIES` (configured via `MOESH_BRIDGE_TRUSTED_PROXIES`, defaulting to loopback `127.0.0.1,::1,::ffff:127.0.0.1`). Untrusted direct connections attempting to send spoofed IP headers are evaluated using their raw socket peer address.
+* **409 Conflict Responses**: When a carrier attempts to claim a service or port currently held by an active carrier with a different identity, the bridge refuses admission with HTTP `409 Conflict`. The response body includes diagnostic details (e.g. current lease holder, duration held, and a list of currently free relay ports).
+* **Worker Backoff**: Competing workers receiving HTTP 409 do not abort immediately; they log the collision, respect the incident claim wait window, and back off (sleeping 1.5s between retries) without evicting the legitimate incumbent. If the incumbent exits, the standby queue empties, freeing the port lease for the waiting worker.
 
 ---
 

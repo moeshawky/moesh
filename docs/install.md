@@ -196,6 +196,8 @@ server {
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection $moesh_connection_upgrade;
         proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $remote_addr;
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
     }
@@ -207,6 +209,8 @@ server {
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection $moesh_connection_upgrade;
         proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $remote_addr;
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
     }

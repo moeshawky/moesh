@@ -3,6 +3,24 @@
 All notable changes to `moesh`. The project is pre-1.0: behaviour may change
 between minor releases without a deprecation period.
 
+## 0.2.0a5 — 2026-11-02
+
+Relay tenant isolation, multi-carrier lease concurrency, trusted proxy boundaries, and dead socket purge.
+
+### Fixed — bridge relay leases, client identity, and proxy trust boundaries
+
+- **Trusted proxy boundary enforcement (`moesh-bridge.py`).** Added `TRUSTED_PROXIES` validation (`MOESH_BRIDGE_TRUSTED_PROXIES`, defaulting to `127.0.0.1,::1,::ffff:127.0.0.1`). Forwarded client IP headers (`CF-Connecting-IP`, `X-Real-IP`, `X-Forwarded-For`) are strictly ignored unless arriving directly from a verified reverse proxy, preventing client IP spoofing over external connections (`moesh-bridge.py:251-297`).
+- **Remote carrier tenant scoping (`moesh-bridge.py`).** Incoming connections from non-trusted networks automatically scope carrier tokens as `<carrier>@<peer_ip>`, preventing port and session collisions between cloned VM images or agents sharing `/etc/machine-id` (`moesh-bridge.py:277-290`).
+- **Conflict detection and port takeover rejection (`moesh-bridge.py`).** In `_claim_relay_locked`, competing carriers requesting an already-leased service or active port receive `HTTP/1.1 409 Conflict` with an available port summary rather than silently overwriting the active lease (`moesh-bridge.py:588-636`).
+- **Dead socket purge and lease rollback on full queue (`moesh-bridge.py`).** In `admit_relay`, `live_queued(q)` proactively purges dead standby sockets before admission, and failed queue insertions (`queue.Full`) restore pre-existing owner and generation snapshots rather than corrupting state (`moesh-bridge.py:648-735`).
+- **Broadened carrier ID derivation and standby backoff (`moesh_relay.py`).** `derive_carrier_id` mixes `/etc/machine-id`, `/proc/sys/kernel/random/boot_id`, `socket.gethostname()`, and service scope (`path:port:target_host:target_port`). The relay worker performs inline pairing-time target connectivity checks and enters exponential backoff (2s to 30s) when the target service is unreachable, preventing blackholing of bridge standby queues (`moesh_relay.py:64-113`, `:416-435`).
+- **Hierarchical carrier fallback cascade (`moesh_tunnel.py`).** Restructured `derive_carrier_id` to ensure machine-id presence is checked before salting with boot ID and hostname, preserving static agent key fallback (`MOESH_TUNNEL_AGENT_KEY`) when machine-id is absent (`moesh_tunnel.py:171-208`).
+
+### Added — protocol contracts and multi-carrier integration testing
+
+- **Wire protocol carrier lease specification (`PROTOCOL.md`).** Added §9.1 (*Carrier leases and generation counters*) and §9.2 (*Proxy trust boundaries and 409 Conflict handling*), detailing carrier token headers (`X-Moesh-Carrier-Id`, `X-Moesh-Relay-Id`, `X-Moesh-Tunnel-Id`), generation counters `_lease_gens`, and client backoff requirements.
+- **End-to-end multi-carrier concurrency integration test (`tests/test_relay_lifecycle.py`).** Added `test_concurrent_relay_daemons_competing_for_same_port_e2e` verifying multi-process competing worker daemons over real loopback sockets, proving 409 rejection, non-eviction of active owners, backoff, and automatic lease handover upon primary termination.
+
 ## 0.2.0a4 — 2026-10-30
 
 Engineering audit, non-interactive execution, client-perspective defect remediation, CI synchronization hardening, and documentation overhaul. Every entry below was verified against running code and reproducible test suites before release.

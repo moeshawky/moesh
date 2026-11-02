@@ -156,9 +156,9 @@ def derive_carrier_id(env_var: str = "MOESH_TUNNEL_ID") -> str:
     """Return a persistent carrier ID from env or stable host identity.
 
     When ``MOESH_TUNNEL_ID`` is not set, derives a stable 16-hex identity from
-    system machine-id (/etc/machine-id, /var/lib/dbus/machine-id) or static key
-    material so restarts on the same host do not generate alien carrier IDs that
-    collide with earlier leases.
+    system machine-id, kernel ``boot_id``, and hostname (or static key material)
+    so restarts on the same host keep the same carrier ID while cloned VM/container
+    images sharing ``/etc/machine-id`` do not collide (measured 2026-11-02).
 
     Preconditions:
         ``env_var`` is the environment variable name to inspect.
@@ -171,14 +171,32 @@ def derive_carrier_id(env_var: str = "MOESH_TUNNEL_ID") -> str:
     explicit = os.environ.get(env_var, "").strip()
     if explicit:
         return explicit
-    for path in ("/etc/machine-id", "/var/lib/dbus/machine-id"):
+    machine_id_parts: list[str] = []
+    for path in (
+        "/etc/machine-id",
+        "/var/lib/dbus/machine-id",
+    ):
         try:
             with open(path, encoding="utf-8") as f:
                 content = f.read().strip()
                 if content:
-                    return hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
+                    machine_id_parts.append(content)
         except OSError:
             pass
+    if machine_id_parts:
+        parts = list(machine_id_parts)
+        try:
+            with open("/proc/sys/kernel/random/boot_id", encoding="utf-8") as f:
+                content = f.read().strip()
+                if content:
+                    parts.append(content)
+        except OSError:
+            pass
+        with contextlib.suppress(OSError):
+            host = socket.gethostname().strip()
+            if host:
+                parts.append(host)
+        return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:16]
     key = (
         os.environ.get("MOESH_TUNNEL_AGENT_KEY", "").strip()
         or os.environ.get("MOESH_TUNNEL_V2_AGENT_KEY", "").strip()

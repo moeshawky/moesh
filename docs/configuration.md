@@ -181,6 +181,7 @@ moecp [-h] [-r] [-p] [-q] [-v] [--retry RETRY] [--compression {auto,zlib,raw}] [
 | `MOESH_BRIDGE_LEASE_GRACE` | `1.5` — seconds a relay port stays held after its carrier's last live tunnel | `moesh-bridge.py:221` |
 | `MOESH_BRIDGE_RELAY_TOKEN` | *unset* — when set, relay registration and `GET /__moesh/status` require `X-Moesh-Relay-Auth: <token>`; when unset the bridge logs that relay registration is open to anyone who can reach the tunnel listener | `moesh-bridge.py:228` |
 | `MOESH_BRIDGE_HALFCLOSE_LINGER` | `60` — seconds the surviving direction of a half-closed pair is drained before both legs are closed (bounds CLOSE-WAIT accumulation) | `moesh-bridge.py:237` |
+| `MOESH_BRIDGE_TRUSTED_PROXIES` | `127.0.0.1,::1,::ffff:127.0.0.1` — comma-separated peer IPs trusted to provide forwarded client IP headers (`CF-Connecting-IP`, `X-Real-IP`, `X-Forwarded-For`) | `moesh-bridge.py:254` |
 
 Two capacities are fixed constants rather than configuration, so that a
 sustained flood of registrations cannot grow the process without bound:
