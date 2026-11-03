@@ -69,13 +69,24 @@ moecp -r -p -q ./dataset host-3:/data/
 
 ### Accelerator service relay (`moesh-relay`)
 
-On remote GPU/TPU machines exposing background compute services:
+Manage the reverse TCP relay as a persistent service:
+
+```sh
+sudo systemctl start moesh-relay
+sudo systemctl status moesh-relay
+sudo systemctl restart moesh-relay
+journalctl -u moesh-relay -f
+```
+
+Or run interactively in the foreground on compute nodes:
 
 ```sh
 moesh-relay \
     --service vllm \
-    --target 127.0.0.1:8001 \
-    --receiver receiver.example.com
+    --target 127.0.0.1:8000 \
+    --receiver receiver.example.com \
+    --tls \
+    --session-idle 0
 ```
 
 ---
@@ -138,7 +149,25 @@ moesh-relay \
 
 ---
 
-## 3. Common failures
+## 3. Operational Observability & Resilience
+
+### Keepalive Settings & Timeout Bounds
+- **Interactive Shell Ping (`ping_every=15`)**: During active interactive sessions, `moesh_tunnel.py` emits a `Msg.PING` control record every 15 seconds (`moesh_tunnel.py:1369-1375`).
+- **Silence Detach Limit (`dead_after=45`)**: If no packets or acknowledgments arrive from the operator client for 45 seconds, the worker detaches cleanly (`moesh_tunnel.py:1376-1380`). The remote shell process and its child processes continue running untouched.
+- **Standby Tunnel Refresh (`--idle 900`)**: Standby connections held at the bridge by `moesh-relay` are cycled every 900 seconds (`moesh_relay.py:54`), preventing intermediate NAT firewalls from dropping idle sockets.
+- **Active Relay Session Timeout (`--session-idle`)**: Paired reverse TCP streams default to a 120-second idle timeout (`moesh_relay.py:57`). Setting `--session-idle 0` completely disables the idle timer for unbounded streaming inference (vLLM, llama.cpp).
+
+### Standby Worker Management
+- **Agent Shell Workers (`MOESH_TUNNEL_SESSIONS=3`)**: The agent maintains 3 independent worker threads by default (`moesh_tunnel.py:1663-1735`), each holding a pre-dialed standby tunnel at the bridge. When an operator connects, a worker serves the session and immediately re-dials a replacement standby tunnel upon completion.
+- **Relay Standby Workers (`MOESH_RELAY_WORKERS=4`)**: The relay daemon maintains 4 standby workers by default (`moesh_relay.py:455-605`). When an external consumer connects to the receiver's published port, the worker immediately hands the active splice off to a session thread and redials a new standby tunnel to preserve buffer depth.
+
+### Dead Tunnel Detection & Prompt Re-Attachment
+- **Fast Dead Tunnel Notification (`PAIR_DEAD_MARKER`)**: If an agent worker terminates or network drops while queued at the receiver, the bridge immediately sends `PAIR_DEAD_MARKER` (`\x01MOESH_DEAD_TUNNEL\n`, `moesh_wire.py:63`) upon pairing. The operator client peeks this marker after sending its first handshake frame (`moesh_shell.py:550`), avoiding 120-second deadlocks and triggering immediate re-attachment.
+- **GNU Readline Prompt Redraw**: On re-attaching to a detached PTY, `moesh_tunnel.py` replays up to 32 KiB of buffered unread terminal output and writes a prompt refresh escape sequence, ensuring the shell prompt renders cleanly without missing characters or distorted cursor positions.
+
+---
+
+## 4. Common failures
 
 ### nginx answers `502 Bad Gateway`
 
@@ -215,7 +244,7 @@ When deploying `moesh` on an agent host as standalone files rather than an insta
 
 ---
 
-## 4. Checking system health
+## 5. Checking system health
 
 Check status and listening ports without connecting to operator sockets:
 

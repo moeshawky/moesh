@@ -365,7 +365,7 @@ def _discard_on_error(
 # in framed binary packets with the local moecp client.
 
 _WORKER_CODE = """
-import os, sys, struct, json, zlib, hashlib, stat, time
+import os, sys, struct, json, zlib, hashlib, stat, time, contextlib
 
 PRECOMPRESSED_EXTS = {
     ".gz", ".tgz", ".bz2", ".tbz2", ".xz", ".txz", ".zst", ".tzst",
@@ -432,6 +432,16 @@ def sanitize_relpath(path):
     if not parts or any(p == ".." for p in parts):
         raise ValueError(f"insecure path traversal: {path!r}")
     return "/".join(parts)
+
+def file_sha(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            b = f.read(65536)
+            if not b:
+                break
+            h.update(b)
+    return h.hexdigest()
 
 def run():
     set_raw()
@@ -507,60 +517,71 @@ def run():
             mtime = msg.get("mtime", time.time())
             expected_sha = msg.get("sha256", "")
 
-            tmp_file = dest_file + ".part." + str(os.getpid())
+            nonce = os.urandom(8).hex()
+            tmp_file = dest_file + ".part." + nonce
             hasher = hashlib.sha256()
             written = 0
 
             try:
-                with open(tmp_file, "wb") as f:
-                    send_frame({"status": "READY"})
-                    while True:
-                        cmsg, cdata = recv_frame()
-                        cop = cmsg.get("op")
-                        if cop == "CHUNK":
-                            enc = cmsg.get("encoding", "zlib")
-                            if enc == "zlib":
-                                raw = decode_chunk(cdata)
-                            elif enc == "raw":
-                                raw = cdata
+                flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+                fd = os.open(tmp_file, flags, 0o600)
+                try:
+                    with os.fdopen(fd, "r+b") as f:
+                        send_frame({"status": "READY"})
+                        while True:
+                            cmsg, cdata = recv_frame()
+                            cop = cmsg.get("op")
+                            if cop == "CHUNK":
+                                enc = cmsg.get("encoding", "zlib")
+                                if enc == "zlib":
+                                    raw = decode_chunk(cdata)
+                                elif enc == "raw":
+                                    raw = cdata
+                                else:
+                                    raise ValueError(f"unsupported chunk encoding: {enc}")
+                                if written + len(raw) > size:
+                                    raise ValueError("received more than the declared file size")
+                                f.write(raw)
+                                hasher.update(raw)
+                                written += len(raw)
+                            elif cop == "FILE_END":
+                                break
                             else:
-                                raise ValueError(f"unsupported chunk encoding: {enc}")
-                            if written + len(raw) > size:
-                                raise ValueError("received more than the declared file size")
-                            f.write(raw)
-                            hasher.update(raw)
-                            written += len(raw)
-                        elif cop == "FILE_END":
-                            break
-                        else:
-                            send_frame({"status": "ERROR", "message": f"unexpected chunk op: {cop}"})
-                            if os.path.exists(tmp_file):
-                                os.remove(tmp_file)
-                            return 1
+                                raise ValueError(f"unexpected chunk op: {cop}")
+                        f.flush()
+                        os.fsync(f.fileno())
 
-                actual_sha = hasher.hexdigest()
-                if not expected_sha or actual_sha != expected_sha:
+                    actual_sha = hasher.hexdigest()
+                    if not expected_sha or actual_sha != expected_sha:
+                        raise ValueError(f"checksum mismatch: {actual_sha} vs {expected_sha}")
+
+                    if os.path.islink(dest_file):
+                        raise ValueError(f"refusing to replace symlink: {dest_file}")
+
+                    os.replace(tmp_file, dest_file)
+
+                    try:
+                        dfd = os.open(dest_dir, getattr(os, "O_RDONLY", 0))
+                        try:
+                            os.fsync(dfd)
+                        finally:
+                            os.close(dfd)
+                    except Exception:
+                        pass
+
+                    if preserve:
+                        try:
+                            os.chmod(dest_file, stat.S_IMODE(mode))
+                            os.utime(dest_file, (mtime, mtime))
+                        except Exception:
+                            pass
+
+                    send_frame({"status": "OK", "sha256": actual_sha})
+                finally:
                     if os.path.exists(tmp_file):
-                        os.remove(tmp_file)
-                    send_frame({"status": "ERROR", "message": f"checksum mismatch: {actual_sha} vs {expected_sha}"})
-                    return 1
-
-                os.replace(tmp_file, dest_file)
-
-                if preserve:
-                    try:
-                        os.chmod(dest_file, stat.S_IMODE(mode))
-                        os.utime(dest_file, (mtime, mtime))
-                    except Exception:
-                        pass
-
-                send_frame({"status": "OK", "sha256": actual_sha})
+                        with contextlib.suppress(OSError):
+                            os.unlink(tmp_file)
             except Exception as e:
-                if os.path.exists(tmp_file):
-                    try:
-                        os.remove(tmp_file)
-                    except Exception:
-                        pass
                 send_frame({"status": "ERROR", "message": str(e)})
                 return 1
 
@@ -584,20 +605,51 @@ def run():
             for root, _, files in os.walk(base_dir):
                 for fname in files:
                     full = os.path.join(root, fname)
+                    try:
+                        lst = os.lstat(full)
+                    except OSError:
+                        continue
+                    if stat.S_ISLNK(lst.st_mode):
+                        try:
+                            st = os.stat(full)
+                            if not stat.S_ISREG(st.st_mode):
+                                continue
+                        except OSError:
+                            continue
+                    elif stat.S_ISREG(lst.st_mode):
+                        st = lst
+                    else:
+                        continue
                     with contextlib.suppress(Exception):
                         rel = sanitize_relpath(os.path.relpath(full, base_dir))
-                        st = os.stat(full)
                         file_list.append({"rel": rel, "full": full, "size": st.st_size, "mode": st.st_mode, "mtime": st.st_mtime})
         else:
             try:
-                st = os.stat(source)
+                lst = os.lstat(source)
+                st = os.stat(source) if stat.S_ISLNK(lst.st_mode) else lst
+                if not stat.S_ISREG(st.st_mode):
+                    send_frame({"status": "ERROR", "message": f"{source}: Not a regular file"})
+                    return 1
                 rel = sanitize_relpath(os.path.basename(source))
                 file_list.append({"rel": rel, "full": source, "size": st.st_size, "mode": st.st_mode, "mtime": st.st_mtime})
             except Exception as e:
                 send_frame({"status": "ERROR", "message": str(e)})
                 return 1
 
-        send_frame({"status": "OK", "is_dir": is_dir, "files": [{"rel": f["rel"], "size": f["size"], "mode": f["mode"], "mtime": f["mtime"]} for f in file_list]})
+        entries = [{"rel": f["rel"], "size": f["size"], "mode": f["mode"], "mtime": f["mtime"]} for f in file_list]
+        probe = [{**e, "sha256": "0" * 64} for e in entries]
+        inline = len(json.dumps({"status": "OK", "is_dir": is_dir, "files": probe})) <= 32768
+        if inline:
+            for entry, source_entry in zip(entries, file_list):
+                try:
+                    digest = file_sha(source_entry["full"])
+                except Exception:
+                    digest = ""
+                entry["sha256"] = digest
+                source_entry["sha256"] = digest
+            send_frame({"status": "OK", "is_dir": is_dir, "files": entries})
+        else:
+            send_frame({"status": "OK", "is_dir": is_dir, "paginated": True, "count": len(file_list), "page_size": 256})
 
         file_map = {f["rel"]: f for f in file_list}
         file_iter = iter(file_list)
@@ -607,6 +659,26 @@ def run():
             if op == "DONE":
                 send_frame({"status": "DONE"})
                 break
+            if op == "LIST":
+                page = max(0, int(req.get("page", 0)))
+                start = page * 256
+                page_files = entries[start : start + 256]
+                page_sources = file_list[start : start + 256]
+                for entry, source_entry in zip(page_files, page_sources):
+                    if "sha256" not in entry:
+                        try:
+                            digest = file_sha(source_entry["full"])
+                        except Exception:
+                            digest = ""
+                        entry["sha256"] = digest
+                        source_entry["sha256"] = digest
+                send_frame({
+                    "op": "MANIFEST",
+                    "page": page,
+                    "files": page_files,
+                    "more": start + len(page_files) < len(entries),
+                })
+                continue
             if op != "PULL_FILE":
                 send_frame({"status": "ERROR", "message": f"expected PULL_FILE, got {op}"})
                 return 1
@@ -1965,13 +2037,31 @@ def run_native_agent_transfer(
             for root, _, files in os.walk(base_dir):
                 for fname in files:
                     full = os.path.join(root, fname)
+                    try:
+                        lst = os.lstat(full)
+                    except OSError:
+                        continue
+                    if stat.S_ISLNK(lst.st_mode):
+                        try:
+                            st = os.stat(full)
+                            if not stat.S_ISREG(st.st_mode):
+                                continue
+                        except OSError:
+                            continue
+                    elif stat.S_ISREG(lst.st_mode):
+                        st = lst
+                    else:
+                        continue
                     with contextlib.suppress(Exception):
                         rel = sanitize_relpath(os.path.relpath(full, base_dir))
-                        st = os.stat(full)
                         file_list.append({"rel": rel, "full": full, "size": st.st_size, "mode": st.st_mode, "mtime": st.st_mtime})
         else:
             try:
-                st = os.stat(source)
+                lst = os.lstat(source)
+                st = os.stat(source) if stat.S_ISLNK(lst.st_mode) else lst
+                if not stat.S_ISREG(st.st_mode):
+                    client.send_frame({"status": "ERROR", "message": f"{source}: Not a regular file"})
+                    return
                 rel = sanitize_relpath(os.path.basename(source))
                 file_list.append({"rel": rel, "full": source, "size": st.st_size, "mode": st.st_mode, "mtime": st.st_mtime})
             except Exception as e:

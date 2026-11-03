@@ -68,10 +68,15 @@ untrusted inputs and network tampering:
   malformed zlib stream therefore fails the transfer instead of expanding into
   unbounded memory or disk.
 
-### Atomic Staging & Rollback
-- **Staging Files:** Inbound files are written to `.part.<pid>` temporary files in the destination directory.
+### Atomic Staging, Durability & Rollback
+- **Staging Files & Permissions:** Inbound files are written to temporary nonced files created with mode `0o600` (`moecp.py:227`, `:315`, `:527`) inside the verified parent destination directory. Pre-existing destination symlinks are refused.
+- **Durable Disk Sync (fsync):** Both the file descriptor and the parent directory are synchronized to non-volatile storage via `os.fsync` before committing, ensuring crash durability.
 - **Digest Verification:** End-to-end SHA-256 digests are computed incrementally during streaming. If a digest mismatch, network drop, or corrupt zlib chunk occurs, the partial file is unlinked immediately.
 - **Atomic Commit:** Files are committed using `os.replace` only after digest verification succeeds. At no point is a partial or corrupt file visible under its target filename.
+
+### Worker Hardening & Manifest Pagination
+- **Namespace Isolation:** The remote worker runtime environment explicitly imports `contextlib` and isolates execution globals (`moecp.py:368`), eliminating `NameError` exceptions during cleanup under clean interpreter namespaces.
+- **Paginated Manifest Streaming:** Remote directory manifests enforce 32 KiB chunk bounds (`CHUNK_SIZE`), preventing 64 KiB frame buffer overflows when synchronizing large directory hierarchies.
 
 ### Session Isolation
 - `moecp` negotiates `session_type=transfer`, which the agent serves **natively
@@ -87,7 +92,10 @@ untrusted inputs and network tampering:
 
 ## 4. Accelerator Service Reverse Relays (`moesh_relay.py`)
 
-- **Outbound Egress Only:** Target accelerator nodes (GPUs/TPUs) make outbound TCP connections over HTTP port 80 to `/__relay/<service>`. No inbound listening ports are exposed on the compute nodes.
+- **Outbound Egress Only:** Target accelerator nodes (GPUs/TPUs) make outbound TCP connections over HTTP port 80 (or HTTPS 443) to `/__relay/<service>`. No inbound listening ports are exposed on the compute nodes.
+- **Carrier TLS Transport:** `moesh-relay` supports secure TLS carrier upgrade connections (`--tls`, `--tls-insecure`, `--tls-ca-cert`, `--tls-pin`) with strict certificate verification, custom enterprise CA bundles, and SHA-256 fingerprint pinning (`moesh_relay.py:690-717`).
+- **Direct Bridge TLS Listener:** The receiver bridge (`moesh-bridge.py`) supports direct TLS termination via `--tls-cert` and `--tls-key` (`moesh-bridge.py:1672-1685`), allowing HTTPS/WSS termination without requiring fronting reverse proxies.
+- **Secret & Bearer Token Masking:** Sensitive bearer tokens and shared secrets are masked across all log outputs, status reports, and exception messages (`moesh_relay.py:125-135`), preventing token leakage in telemetry.
 - **Blind Queue Splicing:** The receiver pairs reverse relays strictly by service name (e.g. `gpu`, `vllm`, `embed`) on dedicated listening ports configured via `MOESH_RELAYS`. Sockets are spliced as raw TCP streams without inspection or caching.
 - **The relay is not encrypted by `moesh`, and the documentation says so:** the
   shell tunnel is Noise-encrypted end to end, but relayed traffic is the

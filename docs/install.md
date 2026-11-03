@@ -18,17 +18,17 @@ Five core commands are provided:
 
 ### Standard User / Virtualenv Install
 ```bash
-pip install moesh
+pip install moesh==0.2.0b6
 ```
 
 ### Isolated CLI Tool Install (uv / pipx)
 For global system-wide CLI access without polluting system Python:
 ```bash
 # Using uv (fastest):
-uv tool install moesh
+uv tool install moesh==0.2.0b6
 
 # Or using pipx:
-pipx install moesh
+pipx install moesh==0.2.0b6
 ```
 
 Verify that the CLI commands are accessible in your PATH:
@@ -159,16 +159,71 @@ moecp -r host-1:/var/log/app ./logs/
 
 On compute nodes running inference servers (e.g. vLLM, Ollama, ComfyUI, FastAPI) that you want to expose to external clients:
 
+### 4.1 Ad-Hoc / Interactive Run
 ```bash
-# Expose local port 8000 onto the first free receiver port (26420..26430):
+# Expose local port 8000 onto the first free receiver port (26420..26430) over TLS:
 moesh-relay \
   --receiver receiver.example.com \
+  --tls \
   --remote-port auto \
   --service vllm-api \
-  --target 127.0.0.1:8000
+  --target 127.0.0.1:8000 \
+  --session-idle 0
 ```
 
-External consumers can connect to `http://receiver.example.com:<PORT>`.
+External consumers can connect to `https://receiver.example.com:<PORT>`.
+
+### 4.2 Systemd Persistent Service
+To run `moesh-relay` as a supervised background daemon:
+
+1. Create a service environment file `/etc/moesh/relay.env`:
+   ```bash
+   sudo mkdir -p /etc/moesh
+   sudo tee /etc/moesh/relay.env >/dev/null <<'EOF'
+   MOESH_RELAY_RECEIVER=receiver.example.com
+   MOESH_RELAY_TLS=1
+   MOESH_RELAY_REMOTE_PORT=auto
+   MOESH_RELAY_SERVICE=vllm-api
+   MOESH_RELAY_TARGET=127.0.0.1:8000
+   MOESH_RELAY_WORKERS=4
+   MOESH_RELAY_SESSION_IDLE=0
+   MOESH_RELAY_TOKEN=<RELAY_AUTH_TOKEN>
+   EOF
+   sudo chmod 0600 /etc/moesh/relay.env
+   ```
+
+2. Create `/etc/systemd/system/moesh-relay.service`:
+   ```ini
+   [Unit]
+   Description=moesh outbound reverse TCP relay
+   After=network-online.target
+   Wants=network-online.target
+
+   [Service]
+   Type=simple
+   User=ubuntu
+   EnvironmentFile=/etc/moesh/relay.env
+   ExecStart=/usr/local/bin/moesh-relay
+   Restart=on-failure
+   RestartPreventExitStatus=3
+   RestartSec=3
+   StandardOutput=append:/var/log/moesh-relay.log
+   StandardError=append:/var/log/moesh-relay.log
+   NoNewPrivileges=true
+   ProtectSystem=full
+   ProtectHome=false
+   PrivateTmp=true
+
+   [Install]
+   WantedBy=multi-user.target
+   ```
+
+3. Enable and start:
+   ```bash
+   sudo systemctl daemon-reload
+   sudo systemctl enable --now moesh-relay
+   sudo systemctl status moesh-relay
+   ```
 
 ---
 

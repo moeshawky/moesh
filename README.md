@@ -26,19 +26,30 @@ Standard tools like `ssh` and `scp` require the target machine to accept inbound
 
 ---
 
-## 2. Installation
+## 2. Feature Matrix
+
+| Capability | Component | Guarantees & Measured Characteristics |
+|---|---|---|
+| **Persistent PTY Shells** | `moesh` + `moesh-tunnel` | Survives network disconnection; GNU Readline prompt redrawn on re-attach; 3 concurrent operator sessions by default (`MOESH_TUNNEL_SESSIONS=3`) on isolated PTYs. |
+| **Native Fast File Copy** | `moecp` | Native in-process streaming (`session_type="transfer"`); 32 KiB chunking; 64 KiB JSON metadata cap; 10 MiB payload bounds; streaming SHA-256 validation; durable staging (`0o600` permissions, fsync, atomic `os.replace`). |
+| **Reverse Model-Serving Relay** | `moesh-relay` | Exposes local inference engines (vLLM, llama.cpp, Ollama) onto public receiver ports (26420–26430) over TLS carrier transport; SHA-256 certificate pinning (`--tls-pin`); `--session-idle 0` for unbounded inference streams. |
+| **Blind Receiver Bridge** | `moesh-bridge` | Socket-pair pump; zero plaintext terminal or file data held; zero crypto keys held; direct TLS listener termination (`--tls-cert`/`--tls-key`) without requiring fronting reverse proxies. |
+
+---
+
+## 3. Installation
 
 Install `moesh` directly from PyPI into your environment or user profile:
 
 ```bash
 # Using pip:
-pip install moesh
+pip install moesh==0.2.0b6
 
 # Or using uv (fastest):
-uv tool install moesh
+uv tool install moesh==0.2.0b6
 
 # Or using pipx:
-pipx install moesh
+pipx install moesh==0.2.0b6
 ```
 
 This installs five CLI tools:
@@ -56,7 +67,7 @@ print(moesh.__version__)
 
 ---
 
-## 3. Quick Start
+## 4. Quick Start
 
 ### Step 1: Generate a Fleet Master Key
 On your local machine, run:
@@ -120,14 +131,14 @@ moecp -r -p -q 1:/var/log/app ./local-logs/
 ### Step 7: Expose a Local Service Port (`moesh-relay`)
 Expose a local TCP service (e.g., vLLM or web server running on `127.0.0.1:8000`) onto a public receiver port:
 ```bash
-# Auto-claim the lowest free port in 26420..26430:
-moesh-relay --receiver receiver.example.com --remote-port auto --target 127.0.0.1:8000
+# Auto-claim the lowest free port in 26420..26430 over TLS:
+moesh-relay --receiver receiver.example.com --tls --remote-port auto --target 127.0.0.1:8000
 ```
-External clients can now connect directly to `http://receiver.example.com:<PORT>`.
+External clients can now connect directly to `https://receiver.example.com:<PORT>`.
 
 ---
 
-## 4. Architecture
+## 5. Architecture
 
 ```
 Remote Target Host (VM / Container / Notebook)             Public Receiver Bridge                     Operator / Client Host
@@ -151,26 +162,32 @@ Remote Target Host (VM / Container / Notebook)             Public Receiver Bridg
 
 ---
 
-## 5. Performance Characteristics
+## 6. Performance Characteristics
 
-Measured per stage, on a stated machine, with the command that produced each number. See [**docs/performance.md**](https://github.com/moeshawky/moesh/blob/master/docs/performance.md) for the full table, the methodology, and stage separation:
+Measured per stage, on a stated machine, with reproducible verification commands. See [**docs/performance.md**](https://github.com/moeshawky/moesh/blob/master/docs/performance.md) for the full table, the methodology, and stage separation:
 
 ```sh
-python3 bench/moesh_bench.py
+python3 bench/moesh_bench.py                 # 256 MiB per streaming stage
 ```
 
-| stage | what the number is | what it is not |
+### Measured Ratios (CPython 3.14.5 / Linux 7.0 aarch64 reference)
+
+| Measurement | Ratio / Value | Benchmark Conditions & Source |
 |---|---|---|
-| raw socket pump | bytes copied between two sockets in one process | encryption, disk, or the network |
-| Noise_XX records | encryption + framing over loopback | compression or file I/O |
-| zlib level 1 | the codec alone, on transfer buffers | framing, crypto, disk, or the network |
-| end-to-end PUSH | the real receiver committing and verifying a file over loopback | the network |
+| **Noise_XX Handshake** | p50 = 1.78 ms, p95 = 2.15 ms, p99 = 3.18 ms | 100 iterations, 3-message exchange over socketpair |
+| **Raw Socket Pump** | 1107.2 MiB/s (9.29 Gbit/s) | Loopback between two sockets via `bridge.pump` |
+| **Noise_XX Throughput** | 146.2 MiB/s (1.23 Gbit/s) | ChaCha20-Poly1305 encryption + framing over loopback |
+| **moecp Stream Chunking** | 32 KiB chunks (`CHUNK_SIZE = 32768`) | Uncompressed chunk size for streaming and manifest pagination |
+| **Frame Header Bounds** | 64 KiB cap (`MAX_FRAME_HDR = 65536`) | Upper bound on JSON metadata frame headers |
+| **Payload Chunk Bounds** | 10 MiB cap (`MAX_FRAME_PAYLOAD = 10485760`) | Upper bound on single transfer payload frame |
+| **Memory Footprint (Bridge/Relay)** | 3.1 MiB peak resident | Stdlib-only components (`moesh-bridge.py`, `moesh_relay.py`) |
+| **Memory Footprint (Agent/Client)** | 6.8 MiB peak resident | With `cryptography` + `noiseprotocol` loaded |
 
 Effective throughput over a real link is bounded by the slowest stage plus the link. On the audit host the end-to-end PUSH stage was dominated not by cipher or compression but by the per-chunk SQLite WAL ledger record (43 % of wall clock for an uncompressed 256 MiB push), documented in [docs/performance.md](https://github.com/moeshawky/moesh/blob/master/docs/performance.md).
 
 ---
 
-## 6. Complete Documentation
+## 7. Complete Documentation
 
 | Guide | Description |
 |---|---|
@@ -188,6 +205,6 @@ Effective throughput over a real link is bounded by the slowest stage plus the l
 
 ---
 
-## 7. License
+## 8. License
 
 `moesh` is open source software licensed under the [Apache License, Version 2.0](https://github.com/moeshawky/moesh/blob/master/LICENSE).

@@ -631,12 +631,8 @@ def test_reap_clears_shell_identity() -> None:
         shell.spawn(proto.DEFAULT_TERM, proto.DEFAULT_ROWS, proto.DEFAULT_COLS)
         assert shell.fd is not None
         os.write(shell.fd, b"exit\n")
-        deadline = time.time() + 5
-        while time.time() < deadline:
-            if shell.read_output() is None:
-                break
-            time.sleep(0.05)
-        shell.reap()
+        status = shell.wait_exit(timeout=5.0)
+        assert status == 0
         assert shell.pid is None
         assert shell.fd is None
         assert not shell.alive

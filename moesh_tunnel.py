@@ -743,8 +743,9 @@ class HostShell:
         The PTY reports EIO before the child becomes waitable, so a single
         ``WNOHANG`` probe can return ``(0, 0)`` and make ``exit 7`` look like
         a clean exit (measured 2026-10-22: ``exit 7`` -> agent ``status 0``).
-        Poll until the child is reapable or the deadline expires.  ``self.pid``
-        is left untouched so ``terminate()`` and the pidfile keep working.
+        Poll until the child is reapable or the deadline expires.  Reaps the
+        process, clears ``self.pid`` and ``self.fd``, removes the pidfile,
+        and transitions ``self.state`` to ``ShellState.REAPED``.
         """
         if self.pid is None:
             return self.exit_status or 0

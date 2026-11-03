@@ -3,6 +3,23 @@
 All notable changes to `moesh`. The project is pre-1.0: behaviour may change
 between minor releases without a deprecation period.
 
+## 0.2.0b6 — 2026-11-03
+
+Relay TLS carrier support, bridge direct TLS listener, moecp embedded worker durability and pagination hardening, session idle timeout controls, and documentation secret scrubbing.
+
+### Added — relay TLS carrier transport, bridge TLS listener, and session timeout controls
+
+- **TLS carrier support in relay daemon (`moesh_relay.py`).** Added `--tls`, `--tls-insecure`, `--tls-ca-cert`, and `--tls-pin` options to establish TLS-encrypted carrier upgrade tunnels with strict certificate verification, custom CA bundles, and SHA-256 fingerprint pinning. Sensitive bearer tokens are masked in logs and diagnostic outputs.
+- **Direct TLS listener support in bridge (`moesh-bridge.py`).** Added `--tls-cert` and `--tls-key` CLI options and `MOESH_BRIDGE_TLS_CERT`/`MOESH_BRIDGE_TLS_KEY` environment configuration, enabling direct HTTPS/WSS termination on the receiver without requiring a fronting reverse proxy.
+- **Session idle timeout configuration (`moesh_relay.py`).** Extended `--session-idle` configuration (default 300s); setting `--session-idle 0` or negative values disables idle disconnects, preventing connection drops during long model inference and time-to-first-token (TTFT) streaming.
+
+### Fixed — moecp embedded worker durability, pagination, and documentation security
+
+- **Embedded worker namespace isolation and import hardening (`moecp.py`).** The remote worker runtime environment explicitly imports `contextlib`, eliminating `NameError` exceptions during `contextlib.suppress` calls under clean interpreter namespaces.
+- **Paginated directory manifest streaming (`moecp.py`).** Remote directory manifest streaming enforces 32 KiB chunk bounds, eliminating 64 KiB frame buffer overflows when synchronizing directories with hundreds of files.
+- **Durable PUSH staging and abort cleanup (`moecp.py`).** Remote file uploads stage into unique nonced temporary files with 0o600 permissions, atomic rename into destination targets, directory fsync for filesystem durability, and cleanup of partial staging files upon client disconnect or integrity error. Pre-existing destination symlinks are refused.
+- **Documentation secret masking and authentication clarity (`docs/relay.md`, `docs/configuration.md`).** Replaced bearer tokens with `<MODEL_API_KEY>` placeholders across examples, preventing scanner alerts, and clarified relay carrier authentication vs application model API key boundaries.
+
 ## 0.2.0a5 — 2026-11-02
 
 Relay tenant isolation, multi-carrier lease concurrency, trusted proxy boundaries, and dead socket purge.

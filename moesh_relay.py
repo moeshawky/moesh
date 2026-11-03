@@ -28,6 +28,7 @@ import hashlib
 import json
 import os
 import socket
+import ssl
 import threading
 import time
 from typing import Any
@@ -52,7 +53,15 @@ DEFAULT_WORKERS = int(os.environ.get("MOESH_RELAY_WORKERS", "4"))
 # Reads MOESH_RELAY_IDLE and converts it to int with default 900 seconds; invalid environment text raises ValueError at import.
 DEFAULT_IDLE = int(os.environ.get("MOESH_RELAY_IDLE", "900"))
 # Idle timeout in seconds for an active paired TCP session before closing half-open keep-alive sockets.
+# Set to 0 or negative to disable timeout completely for long-running inference prefill or generation.
 DEFAULT_SESSION_IDLE = int(os.environ.get("MOESH_RELAY_SESSION_IDLE", "120"))
+# Default TLS configuration read from environment.
+DEFAULT_TLS = os.environ.get("MOESH_RELAY_TLS", "").lower() in ("1", "true", "yes")
+DEFAULT_TLS_INSECURE = os.environ.get(
+    "MOESH_RELAY_TLS_INSECURE", os.environ.get("MOESH_RELAY_INSECURE", "")
+).lower() in ("1", "true", "yes")
+DEFAULT_TLS_CA_CERT = os.environ.get("MOESH_RELAY_TLS_CA_CERT", "")
+DEFAULT_TLS_PIN = os.environ.get("MOESH_RELAY_TLS_PIN", "")
 
 _log_lock = threading.Lock()
 _port_logged = False
@@ -113,6 +122,49 @@ def derive_carrier_id(explicit_id: str = "", scope: str = "") -> str:
     return os.urandom(8).hex()
 
 
+def mask_token(token: str) -> str:
+    """Return a masked representation of a secret token for safe logging."""
+    if not token:
+        return ""
+    if len(token) <= 6:
+        return "***"
+    return f"{token[:3]}...{token[-3:]}"
+
+
+def create_ssl_context(
+    insecure: bool = False,
+    ca_cert: str = "",
+) -> ssl.SSLContext:
+    """Create a configured SSLContext for carrier TLS connections."""
+    if insecure:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    else:
+        if ca_cert:
+            ctx = ssl.create_default_context(cafile=ca_cert)
+        else:
+            ctx = ssl.create_default_context()
+    return ctx
+
+
+def verify_tls_pin(sock: socket.socket, pin: str) -> None:
+    """Verify peer TLS certificate SHA-256 fingerprint against an expected pin."""
+    if not isinstance(sock, ssl.SSLSocket):
+        raise ssl.SSLCertVerificationError("cannot verify TLS pin on non-SSL socket")
+    expected = pin.replace(":", "").replace(" ", "").lower()
+    cert_der = sock.getpeercert(binary_form=True)
+    if not cert_der:
+        raise ssl.SSLCertVerificationError(
+            "peer did not present a certificate for TLS pin verification"
+        )
+    actual = hashlib.sha256(cert_der).hexdigest().lower()
+    if actual != expected:
+        raise ssl.SSLCertVerificationError(
+            f"TLS certificate fingerprint mismatch: expected {expected}, got {actual}"
+        )
+
+
 def log(msg: str) -> None:
     """Write timestamped log message to stdout."""
     with _log_lock:
@@ -147,17 +199,25 @@ def splice(a: socket.socket, b: socket.socket, idle_timeout: int = 0) -> None:
 
     ``idle_timeout`` bounds an otherwise idle session; when either direction
     times out the session is torn down rather than parked in CLOSE_WAIT.
+    If ``idle_timeout <= 0``, socket timeouts are disabled (set to None), allowing
+    indefinite pauses for long-running inference prefill or generation.
     """
     if idle_timeout > 0:
-        a.settimeout(idle_timeout)
-        b.settimeout(idle_timeout)
+        a.settimeout(float(idle_timeout))
+        b.settimeout(float(idle_timeout))
+    else:
+        a.settimeout(None)
+        b.settimeout(None)
     done = threading.Event()
     error_occurred = threading.Event()
 
     def copy(src: socket.socket, dst: socket.socket) -> None:
         try:
             while True:
-                data = src.recv(65536)
+                try:
+                    data = src.recv(65536)
+                except ssl.SSLZeroReturnError:
+                    break
                 if not data:
                     break
                 dst.sendall(data)
@@ -196,10 +256,35 @@ class RelayRefused(Exception):
     """The receiver refused this carrier (e.g. 409: another carrier holds the port or name)."""
 
 
-def fetch_status(host: str, port: int, auth_token: str = "") -> dict[str, Any]:
+def fetch_status(
+    host: str,
+    port: int,
+    auth_token: str = "",
+    *,
+    tls: bool = False,
+    tls_insecure: bool = False,
+    tls_ca_cert: str = "",
+    tls_pin: str = "",
+    ssl_context: ssl.SSLContext | None = None,
+) -> dict[str, Any]:
     """Query ``GET /__moesh/status`` on the receiver and return the parsed JSON."""
     auth = f"X-Moesh-Relay-Auth: {auth_token}\r\n" if auth_token else ""
-    with socket.create_connection((host, port), timeout=10) as sock:
+    raw_sock = socket.create_connection((host, port), timeout=10)
+    try:
+        if tls or ssl_context is not None:
+            ctx = ssl_context or create_ssl_context(
+                insecure=tls_insecure, ca_cert=tls_ca_cert
+            )
+            sock: socket.socket = ctx.wrap_socket(raw_sock, server_hostname=host)
+            if tls_pin:
+                verify_tls_pin(sock, tls_pin)
+        else:
+            sock = raw_sock
+    except Exception:
+        raw_sock.close()
+        raise
+
+    with sock:
         req = (
             f"GET /__moesh/status HTTP/1.1\r\n"
             f"Host: {host}\r\n"
@@ -223,12 +308,32 @@ def fetch_status(host: str, port: int, auth_token: str = "") -> dict[str, Any]:
     return result
 
 
-def print_probe(host: str, port: int, auth_token: str = "") -> int:
+def print_probe(
+    host: str,
+    port: int,
+    auth_token: str = "",
+    *,
+    tls: bool = False,
+    tls_insecure: bool = False,
+    tls_ca_cert: str = "",
+    tls_pin: str = "",
+    ssl_context: ssl.SSLContext | None = None,
+) -> int:
     """Fetch and print receiver port and host status."""
     try:
-        data = fetch_status(host, port, auth_token)
+        data = fetch_status(
+            host,
+            port,
+            auth_token,
+            tls=tls,
+            tls_insecure=tls_insecure,
+            tls_ca_cert=tls_ca_cert,
+            tls_pin=tls_pin,
+            ssl_context=ssl_context,
+        )
     except Exception as exc:
-        log(f"probe failed against {host}:{port}: {exc}")
+        masked = f" (token: {mask_token(auth_token)})" if auth_token else ""
+        log(f"probe failed against {host}:{port}{masked}: {exc}")
         return 1
     print(json.dumps(data, indent=2))
     return 0
@@ -244,6 +349,11 @@ def connect_tunnel(
     auth_token: str = "",
     pairing_event: bool = True,
     header_timeout: float = 20.0,
+    tls: bool = False,
+    tls_insecure: bool = False,
+    tls_ca_cert: str = "",
+    tls_pin: str = "",
+    ssl_context: ssl.SSLContext | None = None,
 ) -> tuple[socket.socket, int, bytes, bool]:
     """Dial receiver and perform HTTP/1.1 Upgrade to enter raw pipe mode.
 
@@ -256,7 +366,20 @@ def connect_tunnel(
     ``event_mode`` is True only when the receiver acknowledged the mode; an
     older receiver keeps the legacy data-driven pairing.
     """
-    sock = socket.create_connection((host, port), timeout=20)
+    raw_sock = socket.create_connection((host, port), timeout=20)
+    try:
+        if tls or ssl_context is not None:
+            ctx = ssl_context or create_ssl_context(
+                insecure=tls_insecure, ca_cert=tls_ca_cert
+            )
+            sock: socket.socket = ctx.wrap_socket(raw_sock, server_hostname=host)
+            if tls_pin:
+                verify_tls_pin(sock, tls_pin)
+        else:
+            sock = raw_sock
+    except Exception:
+        raw_sock.close()
+        raise
     sock.settimeout(header_timeout)
     key = base64.b64encode(os.urandom(16)).decode()
     port_hdr = f"X-Moesh-Relay-Port: {remote_port}\r\n" if remote_port > 0 else ""
@@ -343,6 +466,11 @@ def worker(
     remote_port: int = 0,
     session_idle: int = DEFAULT_SESSION_IDLE,
     token: str = "",
+    tls: bool = False,
+    tls_insecure: bool = False,
+    tls_ca_cert: str = "",
+    tls_pin: str = "",
+    ssl_context: ssl.SSLContext | None = None,
 ) -> None:
     """Worker maintaining one queued standby tunnel at a time.
 
@@ -389,6 +517,11 @@ def worker(
                 remote_port=remote_port,
                 auth_token=token,
                 header_timeout=float(max(idle, 20)),
+                tls=tls,
+                tls_insecure=tls_insecure,
+                tls_ca_cert=tls_ca_cert,
+                tls_pin=tls_pin,
+                ssl_context=ssl_context,
             )
             incident_deadline = None
             if not _port_logged and assigned_port > 0:
@@ -496,13 +629,13 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument(
         "--port",
         type=int,
-        default=DEFAULT_RECEIVER_PORT,
-        help="Receiver HTTP port (default 80)",
+        default=None,
+        help="Receiver HTTP/HTTPS port (default 80, or 443 with TLS)",
     )
     ap.add_argument(
         "--url",
         default="",
-        help="Full URL override (e.g. http://receiver.example.com/__relay/26426)",
+        help="Full URL override (e.g. https://receiver.example.com/__relay/26426)",
     )
     ap.add_argument(
         "--target",
@@ -544,37 +677,74 @@ def main(argv: list[str] | None = None) -> int:
         "--session-idle",
         type=int,
         default=DEFAULT_SESSION_IDLE,
-        help="Idle timeout in seconds for active paired TCP sessions (default 120)",
+        help=(
+            "Idle timeout in seconds for active paired TCP sessions (default 120; "
+            "set to 0 or negative to disable timeout completely for long-running inference)"
+        ),
     )
     ap.add_argument(
         "--probe",
         action="store_true",
         help="Query receiver /__moesh/status for open/free/in-use ports and active hosts",
     )
+    ap.add_argument(
+        "--tls",
+        action="store_true",
+        default=DEFAULT_TLS,
+        help="Use TLS for carrier connection to receiver (default port 443)",
+    )
+    ap.add_argument(
+        "--tls-insecure",
+        action="store_true",
+        default=DEFAULT_TLS_INSECURE,
+        help="Disable TLS certificate verification for self-signed certificates in dev/test",
+    )
+    ap.add_argument(
+        "--insecure",
+        action="store_true",
+        default=False,
+        help="Alias for --tls-insecure",
+    )
+    ap.add_argument(
+        "--tls-ca-cert",
+        default=DEFAULT_TLS_CA_CERT,
+        help="Path to custom CA certificate bundle for TLS verification",
+    )
+    ap.add_argument(
+        "--tls-pin",
+        default=DEFAULT_TLS_PIN,
+        help="Expected SHA-256 fingerprint of the receiver TLS certificate (hex)",
+    )
 
     args = ap.parse_args(argv)
 
-    if args.probe:
-        host = args.receiver
-        port = args.port
-        if args.url:
-            parts = urlsplit(args.url)
-            host = parts.hostname or host
-            port = parts.port or port
-        if not host:
-            ap.error("no receiver specified: provide --receiver or set MOESH_RELAY_RECEIVER")
-        return print_probe(host, port, args.token)
+    tls_insecure = bool(args.tls_insecure or args.insecure)
+    tls_active = bool(args.tls)
 
     req_remote_port = 0
     if args.url:
         parts = urlsplit(args.url)
+        if parts.scheme.lower() == "https":
+            tls_active = True
         host = parts.hostname or DEFAULT_RECEIVER
-        port = parts.port or 80
+        if parts.port is not None:
+            port = parts.port
+        elif args.port is not None:
+            port = args.port
+        else:
+            port = 443 if tls_active else 80
         path = parts.path
         label = path.rsplit("/", 1)[-1]
     else:
         host = args.receiver
-        port = args.port
+        if args.port is not None:
+            port = args.port
+        elif "MOESH_RELAY_PORT" in os.environ:
+            port = int(os.environ["MOESH_RELAY_PORT"])
+        elif "MOESH_TUNNEL_RECEIVER_PORT" in os.environ:
+            port = int(os.environ["MOESH_TUNNEL_RECEIVER_PORT"])
+        else:
+            port = 443 if tls_active else 80
         rem = str(args.remote_port).strip("/")
         svc = str(args.service).strip("/")
         if rem.isdigit():
@@ -595,15 +765,35 @@ def main(argv: list[str] | None = None) -> int:
     if not host:
         ap.error("no receiver specified: provide --receiver or set MOESH_RELAY_RECEIVER")
 
+    ssl_context = (
+        create_ssl_context(insecure=tls_insecure, ca_cert=args.tls_ca_cert)
+        if tls_active
+        else None
+    )
+
+    if args.probe:
+        return print_probe(
+            host,
+            port,
+            args.token,
+            tls=tls_active,
+            tls_insecure=tls_insecure,
+            tls_ca_cert=args.tls_ca_cert,
+            tls_pin=args.tls_pin,
+            ssl_context=ssl_context,
+        )
+
     target_host, _, target_port_s = args.target.rpartition(":")
     if not target_host:
         target_host = "127.0.0.1"
     target_port = int(target_port_s)
     workers = max(1, args.workers)
 
+    proto_str = " (TLS)" if tls_active else ""
+    auth_str = f" [auth: {mask_token(args.token)}]" if args.token else ""
     log(
         f"starting relay: target={label!r} path={path} "
-        f"-> local {target_host}:{target_port} ({workers} standby workers) via {host}:{port}"
+        f"-> local {target_host}:{target_port} ({workers} standby workers) via {host}:{port}{proto_str}{auth_str}"
     )
 
     carrier_id = derive_carrier_id(
@@ -628,6 +818,11 @@ def main(argv: list[str] | None = None) -> int:
                 req_remote_port,
                 args.session_idle,
                 args.token,
+                tls_active,
+                tls_insecure,
+                args.tls_ca_cert,
+                args.tls_pin,
+                ssl_context,
             ),
             daemon=True,
         ).start()

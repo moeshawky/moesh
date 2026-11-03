@@ -19,7 +19,7 @@ is in [PROTOCOL.md](https://github.com/moeshawky/moesh/blob/master/PROTOCOL.md).
 | `moesh-bridge` (`moesh-bridge.py`) | **the receiver broker**: pairs an operator with an agent's tunnel and copies bytes. It is a blind socket pump holding 0 keys and decrypting 0 bytes. |
 | `moesh-bridge.service` | the systemd unit for the receiver bridge. |
 | `PROTOCOL.md` | the wire contract and framing specification. |
-| `tests/` | the verification suite: 254+ tests covering protocol core, key generation, host identity, operator outcomes, moecp file transfers, adversarial security boundaries, and automated documentation drift verification. |
+| `tests/` | the verification suite: 283 tests covering protocol core, key generation, host identity, operator outcomes, moecp file transfers, adversarial security boundaries, carrier leases, relay TLS, worker hardening, and automated documentation drift verification. |
 
 ---
 

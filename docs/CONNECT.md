@@ -10,13 +10,13 @@ Install `moesh` from PyPI on both your local machine and your remote target:
 
 ```bash
 # Standard installation:
-pip install moesh
+pip install moesh==0.2.0b6
 
 # Or using uv:
-uv tool install moesh
+uv tool install moesh==0.2.0b6
 
 # Or using pipx:
-pipx install moesh
+pipx install moesh==0.2.0b6
 ```
 
 This installs the five CLI tools: `moesh`, `moecp`, `moesh-tunnel`, `moesh-relay`, and `moesh-bridge`.
@@ -257,11 +257,13 @@ moesh-relay \
   --remote-port 26425 \
   --target 127.0.0.1:8000
 
-# Or let the receiver automatically assign the lowest free port in 26420..26430:
+# Or let the receiver automatically assign the lowest free port in 26420..26430 over TLS:
 moesh-relay \
   --receiver <RECEIVER_HOST> \
+  --tls \
   --remote-port auto \
-  --target 127.0.0.1:8000
+  --target 127.0.0.1:8000 \
+  --session-idle 0
 ```
 
 When the relay attaches, it logs the exact receiver port bound:

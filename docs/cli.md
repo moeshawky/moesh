@@ -195,58 +195,93 @@ moesh-tunnel --generate-key [--keyfile PATH] [--force]
 
 ## 4. `moesh-relay` — Outbound Reverse TCP Port Relay
 
-**Source:** `moesh_relay.py:418-577`
+**Source:** `moesh_relay.py:608-834`
 
 ### Synopsis
 
 ```sh
 # Expose local TCP service onto a specific or auto-selected receiver port
-moesh-relay --receiver HOST [-R PORT|auto] [--service LABEL] [--target HOST:PORT] [--workers N] [--id ID] [--token SECRET] [--claim-wait SEC] [--idle SEC] [--session-idle SEC]
+moesh-relay --receiver HOST [-R PORT|auto] [--service LABEL] [--target HOST:PORT] [--workers N] [--id ID] [--token SECRET] [--claim-wait SEC] [--idle SEC] [--session-idle SEC] [--tls] [--tls-insecure] [--tls-ca-cert PATH] [--tls-pin PIN]
 
 # Probe receiver relay ports and active hosts
-moesh-relay --probe --receiver HOST [--port PORT] [--token SECRET]
+moesh-relay --probe --receiver HOST [--port PORT] [--token SECRET] [--tls] [--tls-insecure] [--tls-ca-cert PATH] [--tls-pin PIN]
 ```
 
 ### Arguments & Flags
 
 | Option | Default | Source | Behavior |
 |---|---|---|---|
-| `-R`, `--remote-port PORT` | `MOESH_RELAY_REMOTE_PORT` (`auto` if `--service` unset) | `moesh_relay.py:422-427`, `:542-546` | Public TCP port on the receiver (`26420..26430`) or `auto` to claim the lowest free port. |
-| `--service SERVICE` | `MOESH_RELAY_SERVICE` or `""` | `moesh_relay.py:428-432` | Optional human-readable lease label (e.g. `vllm-api`). |
-| `--receiver RECEIVER` | `MOESH_RELAY_RECEIVER` or `MOESH_TUNNEL_RECEIVER` | `moesh_relay.py:433-437` | Receiver hostname or IP address. |
-| `--port PORT` | `MOESH_RELAY_PORT` or `MOESH_TUNNEL_RECEIVER_PORT` or `80` | `moesh_relay.py:438-443` | Receiver HTTP port for Upgrade dialouts. |
-| `--url URL` | `""` | `moesh_relay.py:444-448` | Full `http://host:port/__relay/<target>` override URL. |
-| `--target TARGET` | `MOESH_RELAY_TARGET` or `127.0.0.1:8000` | `moesh_relay.py:449-453` | Local `host:port` service to splice paired TCP streams into. |
-| `--workers WORKERS` | `MOESH_RELAY_WORKERS` or `4` | `moesh_relay.py:454-459` | Number of standby queued connections maintained at the receiver. |
-| `--id ID` | `MOESH_RELAY_ID` or `derive_carrier_id()` | `moesh_relay.py:460-464`, `:61-86` | Carrier lease identity; defaults to a deterministic 16-hex SHA-256 digest of `/etc/machine-id` so restarts reclaim the host's own lease immediately. |
-| `--token TOKEN` | `MOESH_RELAY_TOKEN` or `""` | `moesh_relay.py:465-472` | Shared secret sent as `X-Moesh-Relay-Auth` when `MOESH_BRIDGE_RELAY_TOKEN` is set on the bridge. |
-| `--claim-wait CLAIM_WAIT` | `45.0` seconds | `moesh_relay.py:473-478` | Retry window per `409 Conflict` incident before exiting with status `3`. |
-| `--idle IDLE` | `MOESH_RELAY_IDLE` or `900` seconds | `moesh_relay.py:479-484` | Standby socket refresh interval before recycling an unpaired connection. |
-| `--session-idle SESSION_IDLE` | `MOESH_RELAY_SESSION_IDLE` or `120` seconds | `moesh_relay.py:485-490` | Idle timeout on active paired TCP sessions. |
-| `--probe` | `False` | `moesh_relay.py:491-495` | Query `GET /__moesh/status`, print open/free/in-use/unavailable relay ports and active shell hosts, and exit. |
+| `-R`, `--remote-port PORT` | `MOESH_RELAY_REMOTE_PORT` (`auto` if `--service` unset) | `moesh_relay.py:613-618` | Public TCP port on the receiver (`26420..26430`) or `auto` to claim the lowest free port. |
+| `--service SERVICE` | `MOESH_RELAY_SERVICE` or `""` | `moesh_relay.py:619-623` | Optional human-readable lease label (e.g. `vllm-api`). |
+| `--receiver RECEIVER` | `MOESH_RELAY_RECEIVER` or `MOESH_TUNNEL_RECEIVER` | `moesh_relay.py:624-628` | Receiver hostname or IP address. |
+| `--port PORT` | `MOESH_RELAY_PORT` or `MOESH_TUNNEL_RECEIVER_PORT` or `80` (or `443` with TLS) | `moesh_relay.py:629-634` | Receiver HTTP/HTTPS port for Upgrade dialouts. |
+| `--url URL` | `""` | `moesh_relay.py:635-639` | Full `http://` or `https://` override URL. Auto-activates TLS when scheme is `https://`. |
+| `--target TARGET` | `MOESH_RELAY_TARGET` or `127.0.0.1:8000` | `moesh_relay.py:640-644` | Local `host:port` service to splice paired TCP streams into. |
+| `--workers WORKERS` | `MOESH_RELAY_WORKERS` or `4` | `moesh_relay.py:645-650` | Number of standby queued connections maintained at the receiver. |
+| `--id ID` | `MOESH_RELAY_ID` or `derive_carrier_id()` | `moesh_relay.py:651-655` | Carrier lease identity; derived from host markers so restarts reclaim the host's own lease immediately. |
+| `--token TOKEN` | `MOESH_RELAY_TOKEN` or `""` | `moesh_relay.py:656-663` | Shared secret sent as `X-Moesh-Relay-Auth` when `MOESH_BRIDGE_RELAY_TOKEN` is set on the bridge. |
+| `--claim-wait CLAIM_WAIT` | `45.0` seconds | `moesh_relay.py:664-669` | Retry window per `409 Conflict` incident before exiting with status `3`. |
+| `--idle IDLE` | `MOESH_RELAY_IDLE` or `900` seconds | `moesh_relay.py:670-675` | Standby socket refresh interval before recycling an unpaired connection. |
+| `--session-idle SESSION_IDLE` | `MOESH_RELAY_SESSION_IDLE` or `120` seconds | `moesh_relay.py:676-684` | Idle timeout on active paired TCP sessions (set to 0 or negative to disable timeout for long-running inference). |
+| `--probe` | `False` | `moesh_relay.py:685-689` | Query `GET /__moesh/status`, print open/free/in-use/unavailable relay ports and active shell hosts, and exit. |
+| `--tls` | `MOESH_RELAY_TLS` or `False` | `moesh_relay.py:690-695` | Use TLS for carrier connection to receiver (default port 443). |
+| `--tls-insecure` | `MOESH_RELAY_TLS_INSECURE` or `False` | `moesh_relay.py:696-701` | Disable TLS certificate verification for self-signed certificates in dev/test. |
+| `--insecure` | `False` | `moesh_relay.py:702-707` | Alias for `--tls-insecure`. |
+| `--tls-ca-cert PATH` | `MOESH_RELAY_TLS_CA_CERT` or `""` | `moesh_relay.py:708-712` | Path to custom CA certificate bundle for TLS verification. |
+| `--tls-pin PIN` | `MOESH_RELAY_TLS_PIN` or `""` | `moesh_relay.py:713-717` | Expected SHA-256 fingerprint of the receiver TLS certificate (hex). |
 
 ### Exit Codes (`moesh-relay`)
 
 | Code | Condition | Source |
 |---:|---|---|
-| `0` | Clean shutdown on `SIGINT` or successful `--probe` | `moesh_relay.py:534`, `:575` |
-| `1` | Failed `--probe` request (e.g. missing/wrong `--token` → `401`, or unreachable receiver) | `moesh_relay.py:518-521` |
-| `2` | CLI argument validation error (e.g. missing `--receiver` or invalid `--target`) | `moesh_relay.py:507`, `:538`, `:549` |
-| `3` | Requested relay port or `--service` label remained held by another carrier past `--claim-wait` (`HTTP/1.1 409 Conflict`), or `401 Unauthorized` | `moesh_relay.py:573-574` |
+| `0` | Clean shutdown on `SIGINT` or successful `--probe` | `moesh_relay.py:339`, `:775` |
+| `1` | Failed `--probe` request (e.g. missing/wrong `--token` → `401`, or unreachable receiver) | `moesh_relay.py:337` |
+| `2` | CLI argument validation error (e.g. missing `--receiver` or invalid `--target`) | `moesh_relay.py:766` |
+| `3` | Requested relay port or `--service` label remained held by another carrier past `--claim-wait` (`HTTP/1.1 409 Conflict`), or `401 Unauthorized` | `moesh_relay.py:832` |
 
 ---
 
 ## 5. `moesh-bridge` — Blind Pairing Broker
 
-**Source:** `moesh-bridge.py:33-40` → `moesh-bridge.py:1505-1643`
+**Source:** `moesh-bridge.py:1660-1745`
 
 ### Synopsis
 
 ```sh
-moesh-bridge [-h]
+# Start blind bridge with plaintext HTTP/1.1 Upgrade listener (default port 9447)
+moesh-bridge
+
+# Start blind bridge with direct TLS termination on the tunnel listener
+moesh-bridge --tls-cert /path/to/cert.pem --tls-key /path/to/key.pem
 ```
 
-`moesh-bridge` accepts `-h`/`--help` for CLI discovery and packaging verification (`moesh-bridge.py:1507-1514`); all listener addresses, port pools, capacities, and optional relay tokens are configured via `MOESH_BRIDGE_*` and `MOESH_RELAY*` environment variables so systemd unit files hold the complete runtime configuration in one place. See [configuration.md](configuration.md#the-receiver-moesh-bridgepy) for every environment variable and capacity bound.
+### Arguments & Flags
+
+| Option | Default | Source | Behavior |
+|---|---|---|---|
+| `--tls-cert PATH` | `MOESH_BRIDGE_TLS_CERT` or `""` | `moesh-bridge.py:1672-1676` | Path to TLS certificate PEM for direct TLS termination on the tunnel listener without an external reverse proxy. |
+| `--tls-key PATH` | `MOESH_BRIDGE_TLS_KEY` or `""` | `moesh-bridge.py:1677-1681` | Path to TLS private key PEM for direct TLS termination on the tunnel listener. |
+
+`moesh-bridge` accepts `-h`/`--help` for CLI discovery and `--tls-cert` / `--tls-key` for optional direct TLS termination on the tunnel listener without an external reverse proxy (`moesh-bridge.py:1664-1685`). All listener addresses, port pools, capacities, and optional relay tokens are configured via `MOESH_BRIDGE_*` and `MOESH_RELAY*` environment variables (`MOESH_BRIDGE_TLS_CERT` and `MOESH_BRIDGE_TLS_KEY` mirror the CLI flags). See [configuration.md](configuration.md#the-receiver-moesh-bridgepy) for every environment variable and capacity bound.
+
+### Verified Examples
+
+```sh
+# Standard deployment behind local nginx:
+moesh-bridge
+
+# Direct HTTPS/WSS termination without nginx:
+moesh-bridge \
+    --tls-cert /etc/letsencrypt/live/receiver.example.com/fullchain.pem \
+    --tls-key /etc/letsencrypt/live/receiver.example.com/privkey.pem
+```
+
+### Exit Codes (`moesh-bridge`)
+
+| Code | Condition | Source |
+|---:|---|---|
+| `0` | Clean shutdown on `SIGINT` or `SIGTERM` | `moesh-bridge.py:1738` |
+| `1` | Configuration error (e.g. providing `--tls-cert` without `--tls-key` or vice versa) | `moesh-bridge.py:1688-1690` |
 
 ---
 

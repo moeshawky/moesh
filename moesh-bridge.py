@@ -49,6 +49,7 @@ import os
 import queue
 import select
 import socket
+import ssl
 import sys
 import threading
 import time
@@ -917,6 +918,21 @@ def read_headers(conn: socket.socket) -> bytes:
         100% CPU busy-loop on segmented packets via 5ms backoff and enforces
         the 64KB buffer cap).
     """
+    if isinstance(conn, ssl.SSLSocket):
+        # Python SSLSocket disallows non-zero flags (MSG_PEEK raises ValueError).
+        # Read byte-by-byte into bytearray until delimiter; remaining bytes stay in
+        # OpenSSL internal memory buffer for pump().
+        buf_ssl = bytearray()
+        conn.settimeout(15)
+        while b"\r\n\r\n" not in buf_ssl:
+            ch = conn.recv(1)
+            if not ch:
+                raise ConnectionError("closed during headers")
+            buf_ssl.extend(ch)
+            if len(buf_ssl) >= 65536:
+                raise ConnectionError("header block too large")
+        return bytes(buf_ssl)
+
     buf = b""
     conn.settimeout(15)
     while b"\r\n\r\n" not in buf:
@@ -1251,7 +1267,10 @@ def pump(
     def copy(src: socket.socket, dst: socket.socket, name: str) -> None:
         try:
             while True:
-                data = src.recv(65536)
+                try:
+                    data = src.recv(65536)
+                except ssl.SSLZeroReturnError:
+                    break
                 if not data:
                     break
                 dst.sendall(data)
@@ -1540,6 +1559,7 @@ def serve(
     handler: Callable[[socket.socket, tuple[str, int]], None],
     name: str,
     relay_port: int = 0,
+    ssl_context: ssl.SSLContext | None = None,
 ) -> None:
     """Binds a TCP socket to listen with backlog 64, runs an accept loop, and invokes handler for each accepted connection; returns early if listen is None or bind fails."""
     global _listeners_up
@@ -1563,10 +1583,25 @@ def serve(
     if relay_port > 0:
         with _leases_lock:
             _bound_relay_ports.add(relay_port)
-    log(f"{name} listening on {listen[0]}:{listen[1]}")
+    proto_tag = " (TLS)" if ssl_context else ""
+    log(f"{name} listening on {listen[0]}:{listen[1]}{proto_tag}")
     while True:
-        conn, addr = srv.accept()
-        threading.Thread(target=handler, args=(conn, addr), daemon=True).start()
+        raw_conn, addr = srv.accept()
+
+        def client_worker(conn: socket.socket, client_addr: tuple[str, int]) -> None:
+            if ssl_context is not None:
+                try:
+                    conn.settimeout(10.0)
+                    conn = ssl_context.wrap_socket(conn, server_side=True)
+                    conn.settimeout(None)
+                except Exception as exc:
+                    log(f"{name} TLS handshake from {client_addr[0]}:{client_addr[1]} failed: {exc}")
+                    with contextlib.suppress(OSError):
+                        conn.close()
+                    return
+            handler(conn, client_addr)
+
+        threading.Thread(target=client_worker, args=(raw_conn, addr), daemon=True).start()
 
 
 def parse_port_spec(spec: str) -> list[int]:
@@ -1634,7 +1669,26 @@ def main(argv: list[str] | None = None) -> int:
             "the entry point for packaging smoke tests."
         ),
     )
-    parser.parse_args(argv)
+    parser.add_argument(
+        "--tls-cert",
+        default=os.environ.get("MOESH_BRIDGE_TLS_CERT", ""),
+        help="Path to TLS certificate for direct TLS termination on the tunnel listener",
+    )
+    parser.add_argument(
+        "--tls-key",
+        default=os.environ.get("MOESH_BRIDGE_TLS_KEY", ""),
+        help="Path to TLS private key for direct TLS termination on the tunnel listener",
+    )
+    args = parser.parse_args(argv)
+    tunnel_ssl_ctx: ssl.SSLContext | None = None
+    if args.tls_cert and args.tls_key:
+        tunnel_ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        tunnel_ssl_ctx.load_cert_chain(certfile=args.tls_cert, keyfile=args.tls_key)
+        log(f"direct TLS termination enabled on tunnel listener ({args.tls_cert})")
+    elif args.tls_cert or args.tls_key:
+        log("error: both --tls-cert and --tls-key must be provided for TLS termination")
+        return 1
+
     if RELAY_TOKEN:
         log("relay carrier authentication enabled (shared token)")
     else:
@@ -1644,7 +1698,10 @@ def main(argv: list[str] | None = None) -> int:
             "MOESH_BRIDGE_RELAY_TOKEN to require a shared secret"
         )
     threading.Thread(
-        target=serve, args=(TUNNEL_LISTEN, tunnel_conn, "tunnel"), daemon=True
+        target=serve,
+        args=(TUNNEL_LISTEN, tunnel_conn, "tunnel"),
+        kwargs={"ssl_context": tunnel_ssl_ctx},
+        daemon=True,
     ).start()
     threading.Thread(
         target=serve, args=(OPERATOR_LISTEN, operator_conn, "operator"), daemon=True
