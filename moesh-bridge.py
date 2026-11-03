@@ -258,6 +258,49 @@ TRUSTED_PROXIES: frozenset[str] = frozenset(
 )
 """Proxy peer addresses permitted to supply forwarded client IP headers."""
 
+# Global connection ceiling: MOESH_BRIDGE_MAX_CONNECTIONS.
+#
+# 0 or unset means no ceiling: the ordinary path stays simple and byte-for-byte
+# identical to today (no counter is touched, no lock is taken).  A positive N is
+# the maximum number of simultaneously-active accepted connections across *every*
+# listener (tunnel, operator v1, operator v2, every relay port).
+#
+# Pending-vs-established: pending CARRIERS live in the bounded queues (no worker
+# thread) once admitted, while pending OPERATORS hold one thread while waiting in
+# pair().  A single counter that counts connections whose worker is still running
+# therefore covers both honestly -- no separate pending/established accounting is
+# needed.  Review finding recorded this as "not appropriate here": the queues
+# already bound pending carriers, so adding parallel accounting would add moving
+# parts without adding safety.
+#
+# Shape: the check and the increment are one atomic critical section at the
+# accept->worker handoff in serve().  A ceiling refusal happens *before* any
+# client_worker is spawned and *before* any queue or lease is touched, so it
+# consumes zero queued tunnel slots and cannot recreate the Iron Law 4
+# probe-starvation trap.  The release runs exactly once in a finally covering
+# normal close, timeout and exception, and the increment is rolled back if the
+# worker thread never starts.
+_MAX_CONNECTIONS: int | None = None
+_connections_active = 0
+_connections_lock = threading.Lock()
+
+
+def _max_connections() -> int | None:
+    """Return the global connection ceiling from ``MOESH_BRIDGE_MAX_CONNECTIONS``.
+
+    ``0`` or unset means no ceiling (today's behavior).  A positive N caps
+    simultaneously-active accepted connections across all listeners.  Negative
+    values are treated as off: only zero and positive are meaningful.
+    """
+    try:
+        n = int(os.environ.get("MOESH_BRIDGE_MAX_CONNECTIONS", "0") or "0")
+    except ValueError:
+        n = 0
+    return None if n <= 0 else n
+
+
+_MAX_CONNECTIONS = _max_connections()
+
 
 def extract_carrier(hdrs: bytes, addr: tuple[str, int]) -> str:
     """Extract carrier identity from headers, falling back to verified client IP.
@@ -1562,7 +1605,7 @@ def serve(
     ssl_context: ssl.SSLContext | None = None,
 ) -> None:
     """Binds a TCP socket to listen with backlog 64, runs an accept loop, and invokes handler for each accepted connection; returns early if listen is None or bind fails."""
-    global _listeners_up
+    global _listeners_up, _connections_active
     if listen is None:
         log(f"{name} listener not configured — skipping")
         return
@@ -1588,20 +1631,76 @@ def serve(
     while True:
         raw_conn, addr = srv.accept()
 
-        def client_worker(conn: socket.socket, client_addr: tuple[str, int]) -> None:
-            if ssl_context is not None:
-                try:
-                    conn.settimeout(10.0)
-                    conn = ssl_context.wrap_socket(conn, server_side=True)
-                    conn.settimeout(None)
-                except Exception as exc:
-                    log(f"{name} TLS handshake from {client_addr[0]}:{client_addr[1]} failed: {exc}")
+        # Global connection ceiling: refuse at accept time, before admitting.
+        # The check and the increment are one atomic critical section, so the
+        # ceiling can never be exceeded by concurrent accept loops.  A refusal
+        # spawns no client_worker, touches no queue or lease, and consumes zero
+        # queued tunnel slots (Iron Law 4).  `counted` records whether this
+        # connection was admitted so the worker's finally releases exactly what
+        # was incremented -- and nothing when the ceiling is off.
+        counted = False
+        if _MAX_CONNECTIONS is not None:
+            with _connections_lock:
+                if _connections_active >= _MAX_CONNECTIONS:
                     with contextlib.suppress(OSError):
-                        conn.close()
-                    return
-            handler(conn, client_addr)
+                        refuse(
+                            raw_conn,
+                            "503 Service Unavailable",
+                            f"connection ceiling {_MAX_CONNECTIONS} reached "
+                            f"(active={_connections_active})",
+                        )
+                    continue
+                _connections_active += 1
+                counted = True
 
-        threading.Thread(target=client_worker, args=(raw_conn, addr), daemon=True).start()
+        def client_worker(
+            conn: socket.socket,
+            client_addr: tuple[str, int],
+            counted: bool = counted,
+        ) -> None:
+            """Handle one accepted connection, then release its connection slot.
+
+            The finally releases the slot counted at handoff on *every* exit:
+            normal return, timeout, or exception -- including a TLS handshake
+            failure that returns before the handler runs.  An exception before
+            the worker starts (thread start failure) is rolled back in serve()
+            above, so the counter never leaks.  ``counted`` is bound as a default
+            argument so each worker releases exactly the value it was admitted
+            with, not the loop variable's latest value.
+            """
+            global _connections_active
+            try:
+                if ssl_context is not None:
+                    try:
+                        conn.settimeout(10.0)
+                        conn = ssl_context.wrap_socket(conn, server_side=True)
+                        conn.settimeout(None)
+                    except Exception as exc:
+                        log(
+                            f"{name} TLS handshake from {client_addr[0]}:{client_addr[1]} failed: {exc}"
+                        )
+                        with contextlib.suppress(OSError):
+                            conn.close()
+                        return
+                handler(conn, client_addr)
+            finally:
+                if counted:
+                    with _connections_lock:
+                        _connections_active -= 1
+
+        thread = threading.Thread(target=client_worker, args=(raw_conn, addr), daemon=True)
+        try:
+            thread.start()
+        except Exception:
+            # The worker never started: roll back the increment so it cannot
+            # leak a slot, then close the connection and keep accepting.
+            if counted:
+                with _connections_lock:
+                    _connections_active -= 1
+            with contextlib.suppress(OSError):
+                raw_conn.close()
+            log(f"{name} worker start failed for {addr}; connection closed")
+            continue
 
 
 def parse_port_spec(spec: str) -> list[int]:
