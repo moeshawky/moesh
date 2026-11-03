@@ -51,6 +51,7 @@ if TYPE_CHECKING:
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from moesh_proto import (
+    MAX_CIPHERTEXT,
     MAX_DATA_PAYLOAD,
     Channel,
     Msg,
@@ -97,9 +98,110 @@ MAX_DECOMPRESSED_CHUNK: int = CHUNK_SIZE
 MANIFEST_INLINE_LIMIT: int = 32768
 """Largest manifest JSON sent as a single inline frame."""
 
-# Entries per paginated manifest frame; 256 long paths stay far below 64 KiB.
+# Maximum serialized bytes of one manifest page.  The receiver rejects a frame
+# whose JSON header exceeds MAX_FRAME_HDR (65,536) and the Noise layer caps a
+# single ciphertext at MAX_CIPHERTEXT (65,535), so a page must stay strictly
+# below MAX_CIPHERTEXT.  The headroom covers the 8-byte length prefix, the Noise
+# auth tag and JSON framing, so no page can ever approach the frame bound.
+# measured 2026-11-03: 256 entries at ~100-byte paths serialize to 66,105 bytes,
+# exceeding the 65,535-byte frame bound; pages are built against bytes, not count.
+MANIFEST_PAGE_HEADROOM: int = 4096
+"""Safety margin (bytes) below MAX_CIPHERTEXT for one manifest page."""
+
+MANIFEST_PAGE_BYTES: int = MAX_CIPHERTEXT - MANIFEST_PAGE_HEADROOM
+"""Largest serialized manifest page in bytes, strictly below MAX_CIPHERTEXT."""
+
+# Entry-count cap kept as a secondary bound; a page is closed when adding the
+# next entry would bust the byte budget, so a page never exceeds MANIFEST_PAGE_BYTES.
 MANIFEST_PAGE_SIZE: int = 256
-"""Number of manifest entries per paginated frame."""
+"""Maximum manifest entries per paginated frame (secondary to the byte budget)."""
+
+# Serialized framing around a MANIFEST page body
+# ``{"op": "MANIFEST", "page": N, "files": [...], "more": M}``, not counting the
+# entry JSON or the commas between entries.  Page-number digits and the more-flag
+# vary by a few bytes; that variance is covered by MANIFEST_PAGE_SLOP and the
+# page budget's headroom, so the running-total decision never authorizes an
+# oversized page.
+_MANIFEST_PAGE_TEMPLATE = json.dumps(
+    {"op": "MANIFEST", "page": 0, "files": [], "more": True}
+)
+_MANIFEST_PAGE_PREFIX = _MANIFEST_PAGE_TEMPLATE[: _MANIFEST_PAGE_TEMPLATE.index("[") + 1]
+_MANIFEST_PAGE_SUFFIX = _MANIFEST_PAGE_TEMPLATE[_MANIFEST_PAGE_TEMPLATE.index("]"):]
+_MANIFEST_PAGE_OVERHEAD: int = len(_MANIFEST_PAGE_PREFIX) + len(_MANIFEST_PAGE_SUFFIX)
+# Slop for the varying page-number digits (up to 3) and the more flag (1 byte).
+_MANIFEST_PAGE_SLOP: int = 16
+
+
+def _manifest_entry_bytes(entry: dict[str, Any]) -> int:
+    """Serialized bytes of one manifest entry, placeholder digest at real width."""
+    return len(json.dumps({**entry, "sha256": "0" * 64}).encode("utf-8"))
+
+
+def manifest_page_plan(
+    entries: list[dict[str, Any]],
+    is_dir: bool,
+    *,
+    inline_limit: int,
+    page_bytes: int,
+    entry_count_cap: int,
+) -> tuple[bool, list[tuple[int, int]]]:
+    """Decide inline vs paged and split entries into byte-budgeted pages.
+
+    Returns ``(is_inline, spans)``.  ``spans`` is a list of ``(start, end)``
+    index ranges into ``entries``.  When ``is_inline`` is True the whole
+    manifest fits one frame and ``spans`` is ``[(0, len(entries))]``.
+
+    Every serialized page is at most ``page_bytes`` and holds at most
+    ``entry_count_cap`` entries; a page is closed when adding the next entry
+    would bust the byte budget.  A single entry that alone exceeds the budget
+    raises :class:`ValueError` naming the path and the sizes so the caller can
+    fail fast before any bytes go on the wire.
+    """
+    sized = [{**entry, "sha256": "0" * 64} for entry in entries]
+    sizes = [_manifest_entry_bytes(entry) for entry in entries]
+    max_single = page_bytes - _MANIFEST_PAGE_OVERHEAD
+    for entry, sizeb in zip(entries, sizes, strict=True):
+        if sizeb > max_single:
+            raise ValueError(
+                f"manifest entry {entry['rel']!r} serializes to {sizeb} bytes, "
+                f"which exceeds the {page_bytes}-byte manifest page budget "
+                f"(largest entry that fits one page: {max_single} bytes)"
+            )
+    inline_size = len(
+        json.dumps({"status": "OK", "is_dir": is_dir, "files": sized}).encode("utf-8")
+    )
+    if inline_size <= inline_limit:
+        return True, [(0, len(entries))]
+    # measured 2026-11-03: gap separators counted 1 byte but json.dumps emits
+    # ", " (2 bytes), so pages ran up to 153 bytes over MANIFEST_PAGE_BYTES
+    # (61,592 > 61,439); the 4,096-byte headroom absorbed it but the budget
+    # invariant was false.  Count the real separator width (", " == 2 bytes)
+    # for every entry that has a preceding list gap; the first entry in a page
+    # has no separator, so it adds 0.  Entry cost itself (len(json.dumps(entry)))
+    # matches the serializer exactly: both use default ensure_ascii=True, so
+    # non-ascii paths escape to \uXXXX identically on both sides and sha256 is a
+    # fixed 64-char placeholder in the shadow and the wire entry.
+    effective_budget = page_bytes - _MANIFEST_PAGE_SLOP
+    spans: list[tuple[int, int]] = []
+    current_start = 0
+    current_size = _MANIFEST_PAGE_OVERHEAD
+    current_count = 0
+    for index, sizeb in enumerate(sizes):
+        add = sizeb + (2 if current_count > 0 else 0)
+        if current_count >= entry_count_cap or (
+            current_count > 0 and current_size + add > effective_budget
+        ):
+            spans.append((current_start, index))
+            current_start = index
+            current_size = _MANIFEST_PAGE_OVERHEAD + sizeb
+            current_count = 1
+        else:
+            current_size += add
+            current_count += 1
+    if current_count > 0:
+        spans.append((current_start, len(entries)))
+    return False, spans
+
 
 # Default per-frame socket read timeout in seconds (configurable via MOECP_FRAME_TIMEOUT).
 DEFAULT_FRAME_TIMEOUT: float = float(os.environ.get("MOECP_FRAME_TIMEOUT", "30.0"))
@@ -378,6 +480,64 @@ def _discard_on_error(
 
 _WORKER_CODE = """
 import os, sys, struct, json, zlib, hashlib, stat, time, contextlib
+
+MANIFEST_INLINE_LIMIT = 32768
+MANIFEST_PAGE_SIZE = 256
+MANIFEST_PAGE_BYTES = 61439
+# = MAX_CIPHERTEXT(65535) - headroom(4096).  Kept in lockstep with moecp
+# MANIFEST_PAGE_BYTES; asserted by test_worker_manifest_constants_match_moecp.
+
+_MANIFEST_PAGE_TEMPLATE = json.dumps({"op": "MANIFEST", "page": 0, "files": [], "more": True})
+_MANIFEST_PAGE_PREFIX = _MANIFEST_PAGE_TEMPLATE[:_MANIFEST_PAGE_TEMPLATE.index("[") + 1]
+_MANIFEST_PAGE_SUFFIX = _MANIFEST_PAGE_TEMPLATE[_MANIFEST_PAGE_TEMPLATE.index("]"):]
+_MANIFEST_PAGE_OVERHEAD = len(_MANIFEST_PAGE_PREFIX) + len(_MANIFEST_PAGE_SUFFIX)
+_MANIFEST_PAGE_SLOP = 16
+
+
+def _manifest_entry_bytes(entry):
+    return len(json.dumps({**entry, "sha256": "0" * 64}).encode("utf-8"))
+
+
+def _manifest_page_plan(entries, is_dir):
+    # Byte-aware manifest page plan mirroring moecp.manifest_page_plan.
+    sized = [{**e, "sha256": "0" * 64} for e in entries]
+    sizes = [_manifest_entry_bytes(e) for e in sized]
+    max_single = MANIFEST_PAGE_BYTES - _MANIFEST_PAGE_OVERHEAD
+    for entry, sizeb in zip(entries, sizes):
+        if sizeb > max_single:
+            raise ValueError(
+                "manifest entry %r serializes to %d bytes, which exceeds the %d-byte manifest page budget"
+                % (entry["rel"], sizeb, MANIFEST_PAGE_BYTES)
+            )
+    inline_size = len(
+        json.dumps({"status": "OK", "is_dir": is_dir, "files": sized}).encode("utf-8")
+    )
+    if inline_size <= MANIFEST_INLINE_LIMIT:
+        return True, [(0, len(entries))]
+    effective_budget = MANIFEST_PAGE_BYTES - _MANIFEST_PAGE_SLOP
+    spans = []
+    current_start = 0
+    current_size = _MANIFEST_PAGE_OVERHEAD
+    current_count = 0
+    # measured 2026-11-03: gap separators counted 1 byte but json.dumps emits
+    # ", " (2 bytes); mirror moecp.manifest_page_plan and count the real
+    # separator width (", " == 2 bytes) for every entry with a preceding gap.
+    for index, sizeb in enumerate(sizes):
+        add = sizeb + (2 if current_count > 0 else 0)
+        if current_count >= MANIFEST_PAGE_SIZE or (
+            current_count > 0 and current_size + add > effective_budget
+        ):
+            spans.append((current_start, index))
+            current_start = index
+            current_size = _MANIFEST_PAGE_OVERHEAD + sizeb
+            current_count = 1
+        else:
+            current_size += add
+            current_count += 1
+    if current_count > 0:
+        spans.append((current_start, len(entries)))
+    return False, spans
+
 
 PRECOMPRESSED_EXTS = {
     ".gz", ".tgz", ".bz2", ".tbz2", ".xz", ".txz", ".zst", ".tzst",
@@ -661,9 +821,15 @@ def run():
                 return 1
 
         entries = [{"rel": f["rel"], "size": f["size"], "mode": f["mode"], "mtime": f["mtime"]} for f in file_list]
-        probe = [{**e, "sha256": "0" * 64} for e in entries]
-        inline = len(json.dumps({"status": "OK", "is_dir": is_dir, "files": probe})) <= 32768
-        if inline:
+        # Decide inline vs paged before hashing: a placeholder digest has the
+        # same width as the real one, so the size decision is exact.  Pages are
+        # bounded by serialized bytes (MANIFEST_PAGE_BYTES), not entry count.
+        try:
+            is_inline, spans = _manifest_page_plan(entries, is_dir)
+        except ValueError as err:
+            send_frame({"status": "ERROR", "message": str(err)})
+            return 1
+        if is_inline:
             for entry, source_entry in zip(entries, file_list):
                 try:
                     digest = file_sha(source_entry["full"], heartbeat=send_ping)
@@ -673,7 +839,7 @@ def run():
                 source_entry["sha256"] = digest
             send_frame({"status": "OK", "is_dir": is_dir, "files": entries})
         else:
-            send_frame({"status": "OK", "is_dir": is_dir, "paginated": True, "count": len(file_list), "page_size": 256})
+            send_frame({"status": "OK", "is_dir": is_dir, "paginated": True, "count": len(file_list), "page_size": MANIFEST_PAGE_SIZE})
 
         file_map = {f["rel"]: f for f in file_list}
         file_iter = iter(file_list)
@@ -685,9 +851,12 @@ def run():
                 break
             if op == "LIST":
                 page = max(0, int(req.get("page", 0)))
-                start = page * 256
-                page_files = entries[start : start + 256]
-                page_sources = file_list[start : start + 256]
+                if page >= len(spans):
+                    send_frame({"status": "ERROR", "message": "manifest page out of range"})
+                    return 1
+                start, end = spans[page]
+                page_files = entries[start:end]
+                page_sources = file_list[start:end]
                 for entry, source_entry in zip(page_files, page_sources):
                     if "sha256" not in entry:
                         try:
@@ -700,7 +869,7 @@ def run():
                     "op": "MANIFEST",
                     "page": page,
                     "files": page_files,
-                    "more": start + len(page_files) < len(entries),
+                    "more": page < len(spans) - 1,
                 })
                 continue
             if op != "PULL_FILE":
@@ -1048,7 +1217,11 @@ class FramedStreamClient:
             raise ProtocolError("manifest page_size must be positive")
         page = 0
         seen = 0
-        max_pages = (count // page_size) + 2
+        # Every page carries at least one entry, so a manifest with ``count``
+        # entries cannot span more than ``count`` pages; bound on that plus
+        # slack so byte-budgeted pages (which may be smaller than page_size)
+        # cannot trigger a spurious "ran past" failure.
+        max_pages = count + 2
         while True:
             if page > max_pages:
                 raise ProtocolError(
@@ -2249,13 +2422,22 @@ def run_native_agent_transfer(
             for f in file_list
         ]
         # Decide inline vs paged before hashing: a placeholder digest has the
-        # same width as the real one, so the size decision is exact.
-        probe = [{**entry, "sha256": "0" * 64} for entry in entries]
-        inline = (
-            len(json.dumps({"is_dir": is_dir, "files": probe}))
-            <= MANIFEST_INLINE_LIMIT
-        )
-        if inline:
+        # same width as the real one, so the size decision is exact.  Pages are
+        # bounded by serialized bytes (MANIFEST_PAGE_BYTES), not entry count, so
+        # a page of long paths can never exceed the frame bound.  A single entry
+        # that alone exceeds the budget fails fast with a clear error.
+        try:
+            is_inline, spans = manifest_page_plan(
+                entries,
+                is_dir,
+                inline_limit=MANIFEST_INLINE_LIMIT,
+                page_bytes=MANIFEST_PAGE_BYTES,
+                entry_count_cap=MANIFEST_PAGE_SIZE,
+            )
+        except ValueError as err:
+            client.send_frame({"status": "ERROR", "message": str(err)})
+            return
+        if is_inline:
             for entry, source_entry in zip(entries, file_list, strict=True):
                 digest = compute_file_sha256(
                     source_entry["full"], heartbeat=client.send_ping
@@ -2284,9 +2466,14 @@ def run_native_agent_transfer(
                 break
             if op == "LIST":
                 page = max(0, int(req.get("page", 0)))
-                start = page * MANIFEST_PAGE_SIZE
-                page_entries = entries[start : start + MANIFEST_PAGE_SIZE]
-                page_sources = file_list[start : start + MANIFEST_PAGE_SIZE]
+                if page >= len(spans):
+                    client.send_frame(
+                        {"status": "ERROR", "message": "manifest page out of range"}
+                    )
+                    return
+                start, end = spans[page]
+                page_entries = entries[start:end]
+                page_sources = file_list[start:end]
                 for entry, source_entry in zip(
                     page_entries, page_sources, strict=True
                 ):
@@ -2300,7 +2487,7 @@ def run_native_agent_transfer(
                         "op": "MANIFEST",
                         "page": page,
                         "files": page_entries,
-                        "more": start + len(page_entries) < len(entries),
+                        "more": page < len(spans) - 1,
                     }
                 )
                 continue
