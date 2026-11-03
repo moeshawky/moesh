@@ -277,6 +277,10 @@ The bridge keeps three distinct queue structures:
 Separate queues ensure an encrypted v2 operator cannot be paired with a v1 tunnel.
 `MOESH_BRIDGE_ALLOW_V1=0` refuses the legacy v1 shell path while leaving v2 and reverse relays untouched.
 
+V1 is a compatibility path retained for existing v1 agents and deployments; its
+default (`MOESH_BRIDGE_ALLOW_V1=1`) is reconsidered only when compatibility
+costs and adoption justify it. There is no removal date and no version promise.
+
 Environment knobs: `MOESH_BRIDGE_TUNNEL_LISTEN`, `MOESH_BRIDGE_OPERATOR_LISTEN`,
 `MOESH_BRIDGE_OPERATOR_V2_LISTEN`, `MOESH_RELAYS`, `MOESH_BRIDGE_GPU_PORTS`, `MOESH_BRIDGE_ALLOW_V1`,
 `MOESH_BRIDGE_TRUSTED_PROXIES`, `MOESH_BRIDGE_TLS_CERT`, `MOESH_BRIDGE_TLS_KEY`.

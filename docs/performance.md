@@ -74,11 +74,15 @@ analyses that trade-off, not to this characterization.
 
 ### Large-Dataset Transfer Characterization (Measured 2026-11-03)
 
-Measured on a production transfer to a remote Kaggle agent (`moecp finetune_sft_qmd_format.jsonl 5:/kaggle/working --compression zlib`):
+Measured on a transfer to a remote ephemeral agent (`moecp dataset.jsonl 5:/work --compression zlib`):
 - **Payload:** 5,061,902,391 bytes (4.82 GiB / 5.06 GB) JSONL training dataset.
 - **Local Pre-Session SHA-256:** 4,823.8 MiB hashed locally in 46.04 s at 104.5 MB/s sustained (`ProgressMeter("sha256:...", ...)`).
 - **Wire Compression Ratio:** `zlib` level 1 reduced payload to 28.2% of original byte count (71.8% bandwidth reduction, ~1.42 GB wire footprint).
 - **Keepalive Durability:** Zero socket timeouts across the entire session; remote agent read deadlines continuously maintained; committed and verified end-to-end.
+
+### Manifest memory (Measured 2026-11-03)
+
+PULL manifest generation is count-unbounded in memory: the agent walks the whole tree and holds one entry dict per file before the page plan serializes it, so memory grows linearly with file count no matter how small the files are. Measured 2026-11-03 on a 4-CPU / 32 GiB ephemeral cloud agent (Python 3.13.18): **2,445 bytes/entry (~2.4 KiB)** from a least-squares fit of peak RSS against entry count at 100k, 300k and 1M entries — per-scale k within 0.5% across the 10× range, so the growth is linear; 1M entries peaked at 2.36 GiB in 166 s with no OOM. At that rate trees of up to **~220k files fit in a 512 MiB budget** (a 512 MiB-class ephemeral host exhausts its memory around ~220k files; the same box's 32 GiB covers ~13.8M). A Python 3.14.4 fit at 1k/10k entries gave 2,465 bytes/entry — same band. Reproducible via `bench/bench_manifest_memory.py` (`python3 bench/bench_manifest_memory.py --scales 100000,300000`).
 
 ## Reporting a number here
 

@@ -6,7 +6,7 @@
 [![Python Versions](https://img.shields.io/pypi/pyversions/moesh.svg)](https://pypi.org/project/moesh/)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](https://github.com/moeshawky/moesh/blob/master/LICENSE)
 
-`moesh` gives operators an interactive terminal, non-interactive command execution, bidirectional stdin/stdout streaming, transactional file transfers, and reverse TCP port forwarding on remote machines behind strict NAT, egress-only firewalls, or cloud notebooks (Google Colab, Kaggle, Lambda Labs, RunPod).
+`moesh` gives operators an interactive terminal, non-interactive command execution, bidirectional stdin/stdout streaming, transactional file transfers, and reverse TCP port forwarding on remote machines behind strict NAT, egress-only firewalls, or ephemeral cloud environments.
 
 The receiver is a **blind socket pump** — it pairs streams at the transport boundary, carries opaque ciphertext or raw TCP streams, and never holds a byte of plaintext terminal data, file contents, or cryptographic keys.
 
@@ -14,7 +14,7 @@ The receiver is a **blind socket pump** — it pairs streams at the transport bo
 
 ## 1. Why moesh Exists
 
-Standard tools like `ssh` and `scp` require the target machine to accept inbound connections. Machines behind strict NAT, ephemeral cloud notebooks, or corporate firewalls cannot open listening ports. Traditional reverse proxies often silently interleave or steal connections when multiple agents dial the same route.
+Standard tools like `ssh` and `scp` require the target machine to accept inbound connections. Machines behind strict NAT, ephemeral cloud environments, or corporate firewalls cannot open listening ports. Traditional reverse proxies often silently interleave or steal connections when multiple agents dial the same route.
 
 `moesh` inverts the connection direction and enforces strict slot ownership:
 
@@ -43,13 +43,13 @@ Install `moesh` directly from PyPI into your environment or user profile:
 
 ```bash
 # Using pip:
-pip install moesh==0.2.0b7
+pip install moesh==0.2.0b8
 
 # Or using uv (fastest):
-uv tool install moesh==0.2.0b7
+uv tool install moesh==0.2.0b8
 
 # Or using pipx:
-pipx install moesh==0.2.0b7
+pipx install moesh==0.2.0b8
 ```
 
 This installs five CLI tools:
@@ -83,7 +83,7 @@ moesh-tunnel --probe --receiver receiver.example.com
 ```
 
 ### Step 3: Start the Agent on the Remote Host
-On the remote machine (cloud VM, container, or Colab/Kaggle notebook):
+On the remote machine (cloud VM, container, or ephemeral environment):
 ```bash
 export MOESH_TUNNEL_RECEIVER="receiver.example.com"
 export MOESH_TUNNEL_MASTER="<YOUR-64-HEX-MASTER-KEY>"
@@ -180,8 +180,6 @@ python3 bench/moesh_bench.py                 # 256 MiB per streaming stage
 | **moecp Stream Chunking** | 32 KiB chunks (`CHUNK_SIZE = 32768`) | Uncompressed chunk size for streaming and manifest pagination |
 | **Frame Header Bounds** | 64 KiB cap (`MAX_FRAME_HDR = 65536`) | Upper bound on JSON metadata frame headers |
 | **Payload Chunk Bounds** | 10 MiB cap (`MAX_FRAME_PAYLOAD = 10485760`) | Upper bound on single transfer payload frame |
-| **Memory Footprint (Bridge/Relay)** | 3.1 MiB peak resident | Stdlib-only components (`moesh-bridge.py`, `moesh_relay.py`) |
-| **Memory Footprint (Agent/Client)** | 6.8 MiB peak resident | With `cryptography` + `noiseprotocol` loaded |
 
 Effective throughput over a real link is bounded by the slowest stage plus the link. On the audit host the end-to-end PUSH stage was dominated not by cipher or compression but by the per-chunk SQLite WAL ledger record (43 % of wall clock for an uncompressed 256 MiB push), documented in [docs/performance.md](https://github.com/moeshawky/moesh/blob/master/docs/performance.md).
 

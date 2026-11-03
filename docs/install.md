@@ -18,17 +18,17 @@ Five core commands are provided:
 
 ### Standard User / Virtualenv Install
 ```bash
-pip install moesh==0.2.0b7
+pip install moesh==0.2.0b8
 ```
 
 ### Isolated CLI Tool Install (uv / pipx)
 For global system-wide CLI access without polluting system Python:
 ```bash
 # Using uv (fastest):
-uv tool install moesh==0.2.0b7
+uv tool install moesh==0.2.0b8
 
 # Or using pipx:
-pipx install moesh==0.2.0b7
+pipx install moesh==0.2.0b8
 ```
 
 Verify that the CLI commands are accessible in your PATH:

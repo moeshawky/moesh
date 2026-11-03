@@ -62,14 +62,17 @@ For LLM inference workloads (e.g. vLLM, Ollama, TGI, llama.cpp), long prefill ph
 ### Example: Secure vLLM Exposure
 
 ```sh
-# 1. Launch vLLM with an API key bound to localhost
+# 1. Launch vLLM on localhost only (plaintext). The backend is reached through
+#    the relay; vLLM is not exposed on the public network.
 python3 -m vllm.entrypoints.openai.api_server \
     --model meta-llama/Llama-3-8B-Instruct \
     --host 127.0.0.1 \
     --port 8000 \
     --api-key "<MODEL_API_KEY>"
 
-# 2. Expose vLLM over TLS with carrier authentication and unbounded generation time
+# 2. Expose vLLM through the relay. --tls encrypts the carrier hop
+#    (agent -> bridge) only; the public relay port stays plaintext raw TCP.
+#    --session-idle 0 keeps long prefill/generation sessions open.
 moesh-relay \
     --receiver receiver.example.com \
     --tls \
@@ -78,8 +81,10 @@ moesh-relay \
     --target 127.0.0.1:8000 \
     --session-idle 0
 
-# 3. Client queries model through the receiver's published port
-curl https://receiver.example.com:26426/v1/chat/completions \
+# 3. Client queries through the receiver's published port.
+#    Port 26426 is plaintext raw TCP (the bridge terminates TLS only on the
+#    tunnel listener, not on relay ports), so the client URL is http://:
+curl http://receiver.example.com:26426/v1/chat/completions \
     -H "Authorization: Bearer <MODEL_API_KEY>" \
     -H "Content-Type: application/json" \
     -d '{
@@ -87,6 +92,14 @@ curl https://receiver.example.com:26426/v1/chat/completions \
         "messages": [{"role": "user", "content": "How do kernel pipes work?"}]
     }'
 ```
+
+**TLS boundaries (honest):**
+
+- **Carrier TLS (`--tls`, moesh_relay.py:134-148)**: encrypts the agent→bridge carrier hop only and is terminated at the bridge. `create_ssl_context` is called only by the outbound dial paths (`fetch_status`, `connect_tunnel`, `main`).
+- **Bridge listener TLS (`--tls-cert/--tls-key`, moesh-bridge.py:1672-1705)**: direct TLS termination on the **tunnel listener** only. The public relay ports (26420-26430, moesh-bridge.py:1714-1768) get no `ssl_context` — they are plaintext.
+- **Backend TLS**: terminates behind the relay on the agent host (e.g. vLLM behind a local TLS-terminating front). This tree does not vendor vLLM's own TLS flags, so do not invent a `vLLM --ssl` flag; use any TLS-terminating front. Note that `moesh-relay` dials its `--target` as plain TCP, so backend TLS does not ride the relay pipe itself.
+
+Because the relay port is plaintext, `curl https://receiver.example.com:26426/...` is **unsupported as written**. For true client↔backend TLS end-to-end, terminate TLS at a front in front of the relay port (e.g. nginx TLS on :443 → plaintext to :26426) and/or have the backend speak TLS; the bridge is blind and never terminates TLS for the relayed stream (moesh-bridge.py:31-32).
 
 ### Example: Exposing llama.cpp / Ollama with SHA-256 Pinning
 

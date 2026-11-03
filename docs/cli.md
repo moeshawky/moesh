@@ -9,13 +9,13 @@ Complete command-line interface reference for the five executables installed by 
 
 ## Summary of Entry Points
 
-| Executable | Entry Point (`pyproject.toml:103-108`) | Role | Runtime Dependencies |
+| Executable | Entry Point (`pyproject.toml:101-106`) | Role | Runtime Dependencies |
 |---|---|---|---|
 | `moesh` | `moesh_shell:main` | Interactive PTY client, non-interactive command runner, and stdin/stdout pipe client | `noiseprotocol==0.3.1`, `cryptography>=42.0.0` |
 | `moecp` | `moecp:main` | Transactional encrypted file and directory transfer client (`scp` equivalent) | `noiseprotocol==0.3.1`, `cryptography>=42.0.0` |
 | `moesh-tunnel` | `moesh_tunnel:main` | Outbound remote host daemon serving persistent PTY shells, `exec` commands, and native file transfers | `noiseprotocol==0.3.1`, `cryptography>=42.0.0` |
-| `moesh-relay` | `moesh_relay:main` | Outbound reverse TCP port forwarder (`frpc` equivalent) | Python standard library only |
-| `moesh-bridge` | `moesh_bridge:main` | Blind HTTP/1.1 Upgrade pairing broker on the public receiver (`frps` equivalent) | Python standard library only |
+| `moesh-relay` | `moesh_relay:main` | Outbound reverse TCP port forwarder | Python standard library only |
+| `moesh-bridge` | `moesh_bridge:main` | Blind HTTP/1.1 Upgrade pairing broker on the public receiver | Python standard library only |
 
 ---
 
@@ -58,7 +58,7 @@ moesh --generate-key [--keyfile PATH] [--force]
 ### Execution Modes
 
 1. **Interactive PTY Mode** (no `-c` and no positional `command`):
-   - Requires `stdin` and `stdout` to be a local TTY (`moesh_shell.py:1241-1243`; exits with code `2` if not a TTY).
+   - Requires `stdin` and `stdout` to be a local TTY (`moesh_shell.py:1241-1243`; when stdin is not a TTY and no command is given, the client negotiates `session_type="exec"` instead of refusing, per `moesh_shell.py:1239`).
    - Negotiates `session_type="shell"`, switches the local terminal to raw mode without `ISIG`, forwards `SIGWINCH` window resizes, and detaches cleanly on `~.` at the start of a line.
 2. **Non-Interactive Exec & Pipe Mode** (`-c COMMAND` or positional `COMMAND [ARG ...]`):
    - Works with or without a TTY and negotiates `session_type="exec"` (`moesh_shell.py:1240`).
@@ -87,10 +87,10 @@ cmp -s /tmp/in.bin /tmp/out.bin && echo "byte-identical"
 
 | Code | Condition | Source |
 |---:|---|---|
-| `0` | Remote shell or command exited with status `0`, or local detached cleanly via `~.` | `moesh_shell.py:1264-1266` |
-| `<N>` | Remote command exit code propagated verbatim (or `128 + signal` if killed by signal) | `moesh_shell.py:1104-1108` |
-| `1` | Refused to overwrite existing key file without `--force`, or remote closed without `EXIT` status | `moesh_shell.py:206`, `:1108` |
-| `2` | Configuration/key error, non-TTY `stdin` in interactive mode, authentication failure, or fatal protocol error | `moesh_shell.py:1220`, `:1243`, `:1279` |
+| `0` | Remote shell or command exited with status `0`; a broken pipe on non-interactive exec closes cleanly | `run_exec_session` `return status` (`moesh_shell.py:1098`); BrokenPipeError → `0` (`moesh_shell.py:1264-1265`) |
+| `<N>` | Remote command exit code propagated verbatim (`130` on `SIGINT`) | `def run_exec_session` (`moesh_shell.py:970`); `return status` (`moesh_shell.py:1098`) |
+| `1` | `ProtocolError`, `TransportEOF`, or `AuthenticationError` (fatal protocol/identity failure); key-file overwrite refused without `--force` | `moesh_shell.py:1390-1392`; `generate_key` refusal (`moesh_shell.py:207`) |
+| `2` | `argparse` argument/usage error only | `parser.parse_args` (`moesh_shell.py:1180`) |
 
 ---
 
@@ -189,7 +189,7 @@ moesh-tunnel --generate-key [--keyfile PATH] [--force]
 | `0` | Clean shutdown on `SIGINT`/`SIGTERM`, successful `--probe`, or successful `--generate-key` | `moesh_tunnel.py:1443`, `:1678`, `:1725` |
 | `1` | Refused to overwrite existing key file without `--force`, or failed `--probe` HTTP query | `moesh_tunnel.py:1451`, `:1676` |
 | `2` | Missing receiver address, missing/invalid cryptographic key configuration, or invalid port | `moesh_tunnel.py:1665`, `:1673`, `:1692` |
-| `3` | Host slot already leased by another live carrier (`HTTP/1.1 409 Conflict` persisted past incident retry window; set `RestartPreventExitStatus=3` in systemd) | `moesh_tunnel.py:1574-1583`, `:1723-1724` |
+| `3` | Host slot already leased by another live carrier (`HTTP/1.1 409 Conflict` persisted past incident retry window; set `RestartPreventExitStatus=3` in systemd) | `HostConflictError` sets `_conflict_refused` (`moesh_tunnel.py:1700-1708`); `main` returns `3` (`moesh_tunnel.py:1849`) |
 
 ---
 
@@ -211,7 +211,7 @@ moesh-relay --probe --receiver HOST [--port PORT] [--token SECRET] [--tls] [--tl
 
 | Option | Default | Source | Behavior |
 |---|---|---|---|
-| `-R`, `--remote-port PORT` | `MOESH_RELAY_REMOTE_PORT` (`auto` if `--service` unset) | `moesh_relay.py:613-618` | Public TCP port on the receiver (`26420..26430`) or `auto` to claim the lowest free port. |
+| `-R`, `--remote-port PORT` | `MOESH_RELAY_REMOTE_PORT` (empty/`""`, which the relay treats as `auto` to claim the lowest free port) | `moesh_relay.py:613-618` | Public TCP port on the receiver (`26420..26430`) or `auto` to claim the lowest free port. |
 | `--service SERVICE` | `MOESH_RELAY_SERVICE` or `""` | `moesh_relay.py:619-623` | Optional human-readable lease label (e.g. `vllm-api`). |
 | `--receiver RECEIVER` | `MOESH_RELAY_RECEIVER` or `MOESH_TUNNEL_RECEIVER` | `moesh_relay.py:624-628` | Receiver hostname or IP address. |
 | `--port PORT` | `MOESH_RELAY_PORT` or `MOESH_TUNNEL_RECEIVER_PORT` or `80` (or `443` with TLS) | `moesh_relay.py:629-634` | Receiver HTTP/HTTPS port for Upgrade dialouts. |

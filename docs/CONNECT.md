@@ -10,13 +10,13 @@ Install `moesh` from PyPI on both your local machine and your remote target:
 
 ```bash
 # Standard installation:
-pip install moesh==0.2.0b7
+pip install moesh==0.2.0b8
 
 # Or using uv:
-uv tool install moesh==0.2.0b7
+uv tool install moesh==0.2.0b8
 
 # Or using pipx:
-pipx install moesh==0.2.0b7
+pipx install moesh==0.2.0b8
 ```
 
 This installs the five CLI tools: `moesh`, `moecp`, `moesh-tunnel`, `moesh-relay`, and `moesh-bridge`.
@@ -43,7 +43,7 @@ Remote Host (VM / Notebook / Container)               Receiver Bridge (Public In
 
 ### Core Guarantees
 1. **One Master Key (`MOESH_TUNNEL_MASTER`):** Any agent or operator with the 32-byte hex `MOESH_TUNNEL_MASTER` can start a remote shell daemon (`moesh-tunnel`), attach an interactive shell (`moesh`), or copy files (`moecp`). Both the per-host static key (`host-<N>`) and the default operator static key are deterministically derived from `MOESH_TUNNEL_MASTER` via HKDF-SHA256.
-2. **Explicit Conflict Detection (`409 Conflict`, Like `frps`/`frpc`):**
+2. **Explicit Conflict Detection (`409 Conflict`, like a reverse proxy/relay pair):**
    - If two agents dial the same shell host slot (`host-<N>`), the second carrier receives `HTTP/1.1 409 Conflict` listing the currently active hosts and exits with code `3`.
    - If two relays request the same public relay port (`26420–26430`) or the same relay label, the second carrier receives `HTTP/1.1 409 Conflict` listing all free ports and exits with code `3`.
    - Active tunnels and relays never silently share a queue or steal traffic from one another.
@@ -104,7 +104,7 @@ Example response:
 
 ## 4. Step 2 — Expose a Remote Shell (`moesh-tunnel`)
 
-Any remote Linux machine, container, or notebook only needs `MOESH_TUNNEL_RECEIVER` and `MOESH_TUNNEL_MASTER`.
+Any remote Linux machine, container, or ephemeral environment only needs `MOESH_TUNNEL_RECEIVER` and `MOESH_TUNNEL_MASTER`.
 
 ### Minimal Environment Variables
 

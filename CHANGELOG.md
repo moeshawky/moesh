@@ -3,6 +3,30 @@
 All notable changes to `moesh`. The project is pre-1.0: behaviour may change
 between minor releases without a deprecation period.
 
+## 0.2.0b8 — 2026-11-03
+
+### Fixed — PULL manifest pagination bounded by serialized-byte budget
+
+- **Manifest pages bounded by serialized bytes, not entry count (`moecp.py`).** `MAX_CIPHERTEXT` is 65,535 (`moesh_proto.py:129`); with `MANIFEST_PAGE_HEADROOM` of 4,096 bytes (`moecp.py:108`), `MANIFEST_PAGE_BYTES` is 61,439 (`moecp.py:111`), so a page stays strictly below the Noise frame bound. Measured 2026-11-03: 256 entries at ~100-byte paths serialize to 66,105 bytes, busting the old count-only page; a single oversized entry now fails fast with a path-naming error before any bytes go on the wire. Native and embedded workers paginate identically, lockstep-tested.
+
+### Fixed — relay documentation corrected
+
+- Relay ports carry plaintext raw TCP: `--tls` encrypts the agent-to-bridge carrier hop only; `--tls-cert`/`--tls-key` terminate TLS on the tunnel listener, not the relay ports (`docs/relay.md`, `docs/configuration.md`; the three-boundary explanation in `docs/configuration.md`).
+
+### Fixed — `0.2.0b6` `--session-idle` default
+
+- Corrected to 120s; history-verified: 300 was never released.
+
+### Added — `MOESH_BRIDGE_MAX_CONNECTIONS` connection ceiling
+
+- Optional global ceiling on simultaneously-active accepted connections across all listeners (`moesh-bridge.py:288-302`). `0` or unset = off. Refusal happens at accept time (`moesh-bridge.py:1642-1652`), spawns no worker, touches no queue or lease, and consumes zero queued tunnel slots; capacity is released on close, timeout, or exception in a `finally` (`moesh-bridge.py:1686-1689`).
+
+### Notes
+
+- V1 is documented as a conditional compatibility path: `MOESH_BRIDGE_ALLOW_V1=0` refuses the legacy `/__tunnel/v1` shell path while leaving v2 and the relays untouched (PROTOCOL.md §9).
+- Test-count and citation refresh across docs (`docs/architecture.md:22`, `docs/configuration.md`, `docs/cli.md`, `TEST-PROTOCOL.md`).
+- `bench/bench_manifest_memory.py` measures PULL manifest memory: ~2.4 KiB/entry (2,445 bytes/entry measured 2026-11-03 on a 32 GiB ephemeral agent, Python 3.13.18, linear 100k–1M entries; ~220k files fit 512 MiB).
+
 ## 0.2.0b7 — 2026-11-03
 
 Large-file SHA-256 pre-session digest caching, multi-site PING heartbeat transport keepalives, configurable frame timeout, and transfer starvation resilience.
@@ -32,7 +56,7 @@ Relay TLS carrier support, bridge direct TLS listener, moecp embedded worker dur
 
 - **TLS carrier support in relay daemon (`moesh_relay.py`).** Added `--tls`, `--tls-insecure`, `--tls-ca-cert`, and `--tls-pin` options to establish TLS-encrypted carrier upgrade tunnels with strict certificate verification, custom CA bundles, and SHA-256 fingerprint pinning. Sensitive bearer tokens are masked in logs and diagnostic outputs.
 - **Direct TLS listener support in bridge (`moesh-bridge.py`).** Added `--tls-cert` and `--tls-key` CLI options and `MOESH_BRIDGE_TLS_CERT`/`MOESH_BRIDGE_TLS_KEY` environment configuration, enabling direct HTTPS/WSS termination on the receiver without requiring a fronting reverse proxy.
-- **Session idle timeout configuration (`moesh_relay.py`).** Extended `--session-idle` configuration (default 300s); setting `--session-idle 0` or negative values disables idle disconnects, preventing connection drops during long model inference and time-to-first-token (TTFT) streaming.
+- **Session idle timeout configuration (`moesh_relay.py`).** Extended `--session-idle` configuration (default 120s); setting `--session-idle 0` or negative values disables idle disconnects, preventing connection drops during long model inference and time-to-first-token (TTFT) streaming.
 
 ### Fixed — moecp embedded worker durability, pagination, and documentation security
 
