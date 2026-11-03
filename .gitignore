@@ -39,6 +39,7 @@ credentials/
 # Agentic / operator-only artifacts — never published
 AGENTS.md
 HANDOFF.md
+PROJECT-ROADMAP.md
 .opencode/
 opencode.json
 TEST-PROTOCOL.md
