@@ -242,6 +242,15 @@ When deploying `moesh` on an agent host as standalone files rather than an insta
   `moesh_wire.py`, `moesh_proto.py`, `moesh_tunnel.py`, `moecp.py`, and `moesh_shell.py`.
 * Alternatively, install `moesh` via `pip install moesh` or wheel.
 
+### `moecp` timeouts on multi-gigabyte files
+
+If transferring massive files (e.g. multi-GB datasets) on slow storage or high-latency networks:
+* Ensure both endpoints run `moesh>=0.2.0b7` to take advantage of pre-session upload digest caching and 5.0 s `PING` heartbeats.
+* If disk read latency is exceptionally degraded, increase the frame timeout via `MOECP_FRAME_TIMEOUT`:
+  ```sh
+  MOECP_FRAME_TIMEOUT=60.0 moecp dataset.jsonl 3:/workspace/
+  ```
+
 ---
 
 ## 5. Checking system health

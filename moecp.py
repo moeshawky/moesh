@@ -101,6 +101,18 @@ MANIFEST_INLINE_LIMIT: int = 32768
 MANIFEST_PAGE_SIZE: int = 256
 """Number of manifest entries per paginated frame."""
 
+# Default per-frame socket read timeout in seconds (configurable via MOECP_FRAME_TIMEOUT).
+DEFAULT_FRAME_TIMEOUT: float = float(os.environ.get("MOECP_FRAME_TIMEOUT", "30.0"))
+"""Default seconds to wait for a frame or PING heartbeat before raising TimeoutError."""
+
+# Minimum interval in seconds between PING keepalive frames emitted during long disk hashing.
+HEARTBEAT_INTERVAL: float = 5.0
+"""Minimum interval in seconds between PING heartbeats during long disk reads."""
+
+# Minimum file size in bytes before showing a dedicated SHA-256 pre-hash progress bar.
+PREHASH_PROGRESS_MIN_BYTES: int = 32 * 1024 * 1024
+"""File size threshold (32 MiB) for displaying a pre-hash progress meter."""
+
 # Suffix used for the advisory lock taken while a destination is being written.
 DESTINATION_LOCK_SUFFIX = ".moecp-lock"
 """Suffix of the per-destination advisory lock file."""
@@ -406,14 +418,20 @@ def send_frame(meta, payload=b""):
     sys.stdout.buffer.write(frame)
     sys.stdout.buffer.flush()
 
+def send_ping():
+    send_frame({"op": "PING"})
+
 def recv_frame():
-    hdr_len_b = read_exact(8)
-    hlen, dlen = struct.unpack(">II", hdr_len_b)
-    if hlen > 65536 or dlen > 10485760:
-        raise ValueError(f"frame length bounds exceeded: hdr={hlen}, data={dlen}")
-    meta = json.loads(read_exact(hlen).decode("utf-8"))
-    payload = read_exact(dlen) if dlen > 0 else b""
-    return meta, payload
+    while True:
+        hdr_len_b = read_exact(8)
+        hlen, dlen = struct.unpack(">II", hdr_len_b)
+        if hlen > 65536 or dlen > 10485760:
+            raise ValueError(f"frame length bounds exceeded: hdr={hlen}, data={dlen}")
+        meta = json.loads(read_exact(hlen).decode("utf-8"))
+        payload = read_exact(dlen) if dlen > 0 else b""
+        if meta.get("op") == "PING":
+            continue
+        return meta, payload
 
 def decode_chunk(cdata, limit=32768):
     dec = zlib.decompressobj()
@@ -433,14 +451,20 @@ def sanitize_relpath(path):
         raise ValueError(f"insecure path traversal: {path!r}")
     return "/".join(parts)
 
-def file_sha(path):
+def file_sha(path, heartbeat=None, interval=5.0):
     h = hashlib.sha256()
+    last_hb = time.monotonic()
     with open(path, "rb") as f:
         while True:
             b = f.read(65536)
             if not b:
                 break
             h.update(b)
+            if heartbeat is not None:
+                now = time.monotonic()
+                if now - last_hb >= interval:
+                    heartbeat()
+                    last_hb = now
     return h.hexdigest()
 
 def run():
@@ -642,7 +666,7 @@ def run():
         if inline:
             for entry, source_entry in zip(entries, file_list):
                 try:
-                    digest = file_sha(source_entry["full"])
+                    digest = file_sha(source_entry["full"], heartbeat=send_ping)
                 except Exception:
                     digest = ""
                 entry["sha256"] = digest
@@ -667,7 +691,7 @@ def run():
                 for entry, source_entry in zip(page_files, page_sources):
                     if "sha256" not in entry:
                         try:
-                            digest = file_sha(source_entry["full"])
+                            digest = file_sha(source_entry["full"], heartbeat=send_ping)
                         except Exception:
                             digest = ""
                         entry["sha256"] = digest
@@ -703,12 +727,17 @@ def run():
             try:
                 with open(full_path, "rb") as f:
                     if offset > 0:
+                        last_hb = time.monotonic()
                         while f.tell() < offset:
                             to_read = min(32768, offset - f.tell())
                             pbuf = f.read(to_read)
                             if not pbuf:
                                 break
                             hasher.update(pbuf)
+                            now = time.monotonic()
+                            if now - last_hb >= 5.0:
+                                send_ping()
+                                last_hb = now
                         f.seek(offset)
                     while True:
                         buf = f.read(32768)
@@ -888,6 +917,10 @@ class FramedStreamClient:
             chunk = raw[idx : idx + MAX_DATA_PAYLOAD]
             self.secure.send(Msg.DATA, chunk)
 
+    def send_ping(self) -> None:
+        """Send a lightweight keepalive frame so the peer's recv_frame timer resets."""
+        self.send_frame({"op": "PING"})
+
     def _read_more(self, deadline: float | None = None, timeout: float = 30.0) -> None:
         """Drain incoming data from SecureChannel into buffer.
 
@@ -942,7 +975,9 @@ class FramedStreamClient:
             if self._buf:
                 return
 
-    def _read_exact(self, n: int, deadline: float | None = None, timeout: float = 30.0) -> bytes:
+    def _read_exact(
+        self, n: int, deadline: float | None = None, timeout: float | None = None
+    ) -> bytes:
         """Read exactly n bytes from the accumulated buffer.
 
         Args:
@@ -953,6 +988,8 @@ class FramedStreamClient:
         Returns:
             Extracted bytes.
         """
+        if timeout is None:
+            timeout = DEFAULT_FRAME_TIMEOUT
         if deadline is None:
             deadline = time.monotonic() + timeout
         while len(self._buf) < n:
@@ -961,24 +998,31 @@ class FramedStreamClient:
         del self._buf[:n]
         return out
 
-    def recv_frame(self, timeout: float = 30.0) -> tuple[dict[str, Any], bytes]:
-        """Receive one complete framed message.
+    def recv_frame(
+        self, timeout: float | None = None
+    ) -> tuple[dict[str, Any], bytes]:
+        """Receive one complete framed message, resetting deadline on PING heartbeats.
 
         Args:
-            timeout: Seconds to wait for frame.
+            timeout: Seconds to wait for each frame or heartbeat interval.
 
         Returns:
             Tuple of (metadata_dict, payload_bytes).
         """
-        deadline = time.monotonic() + timeout
-        prefix = self._read_exact(8, deadline=deadline)
-        hlen, dlen = struct.unpack(">II", prefix)
-        if hlen > MAX_FRAME_HDR or dlen > MAX_FRAME_PAYLOAD:
-            raise ProtocolError(f"received frame exceeding safety bounds: hdr={hlen}, data={dlen}")
-        hdr_bytes = self._read_exact(hlen, deadline=deadline)
-        meta = json.loads(hdr_bytes.decode("utf-8"))
-        payload = self._read_exact(dlen, deadline=deadline) if dlen > 0 else b""
-        return meta, payload
+        if timeout is None:
+            timeout = DEFAULT_FRAME_TIMEOUT
+        while True:
+            deadline = time.monotonic() + timeout
+            prefix = self._read_exact(8, deadline=deadline)
+            hlen, dlen = struct.unpack(">II", prefix)
+            if hlen > MAX_FRAME_HDR or dlen > MAX_FRAME_PAYLOAD:
+                raise ProtocolError(f"received frame exceeding safety bounds: hdr={hlen}, data={dlen}")
+            hdr_bytes = self._read_exact(hlen, deadline=deadline)
+            meta = json.loads(hdr_bytes.decode("utf-8"))
+            payload = self._read_exact(dlen, deadline=deadline) if dlen > 0 else b""
+            if meta.get("op") == "PING":
+                continue
+            return meta, payload
 
     def iter_manifest(self, manifest: dict[str, Any]) -> Any:
         """Yield manifest entries from an inline or paginated PULL response.
@@ -1100,6 +1144,78 @@ class ProgressMeter:
 # Core Transfer Operations (Upload & Download)
 # ─────────────────────────────────────────────────────────────────────────────
 
+def prehash_upload_sources(
+    sources: list[str],
+    *,
+    recursive: bool,
+    quiet: bool = False,
+    digest_cache: dict[str, tuple[int, int, str]] | None = None,
+) -> dict[str, tuple[int, int, str]]:
+    """Pre-compute SHA-256 digests for local upload files before opening a tunnel.
+
+    Hashing a multi-gigabyte file after ``INIT`` stalls the open transfer
+    socket while the remote receiver waits in ``recv_frame()`` (measured
+    2026-11-03: a 5.06 GB JSONL file took 46.04s to hash locally, exceeding the
+    remote 30.0s frame timeout before ``FILE_START`` was sent).  Pre-hashing
+    large files (>= ``PREHASH_PROGRESS_MIN_BYTES``) or single-file uploads
+    before connecting keeps the tunnel idle time at zero and caches digests
+    across connection retries.
+
+    Args:
+        sources: Local file or directory paths to inspect.
+        recursive: Whether directory recursion is enabled.
+        quiet: Whether to suppress progress meters on stderr.
+        digest_cache: Optional existing cache mapping ``path -> (size, mtime_ns, sha256)``.
+
+    Returns:
+        Populated digest cache dictionary.
+    """
+    cache: dict[str, tuple[int, int, str]] = (
+        digest_cache if digest_cache is not None else {}
+    )
+    candidates: list[str] = []
+    is_dir_upload = len(sources) == 1 and os.path.isdir(sources[0])
+    if is_dir_upload:
+        if not recursive:
+            return cache
+        base = sources[0].rstrip("/")
+        for root, _, files in os.walk(base):
+            for fname in files:
+                candidates.append(os.path.join(root, fname))
+    else:
+        for src in sources:
+            if os.path.isdir(src):
+                if not recursive:
+                    continue
+                for root, _, files in os.walk(src.rstrip("/")):
+                    for fname in files:
+                        candidates.append(os.path.join(root, fname))
+            else:
+                candidates.append(src)
+
+    single_or_small_batch = len(candidates) <= 64
+    for full_path in candidates:
+        try:
+            st = os.stat(full_path)
+            if not stat.S_ISREG(st.st_mode):
+                continue
+            if not single_or_small_batch and st.st_size < PREHASH_PROGRESS_MIN_BYTES:
+                continue
+            cached = cache.get(full_path)
+            if cached is not None and cached[0] == st.st_size and cached[1] == st.st_mtime_ns:
+                continue
+            meter = (
+                ProgressMeter(f"sha256:{os.path.basename(full_path)}", st.st_size, quiet=quiet)
+                if st.st_size >= PREHASH_PROGRESS_MIN_BYTES
+                else None
+            )
+            digest = compute_file_sha256(full_path, meter=meter)
+            cache[full_path] = (st.st_size, st.st_mtime_ns, digest)
+        except OSError:
+            continue
+    return cache
+
+
 def upload_files(
     client: FramedStreamClient,
     sources: list[str],
@@ -1109,6 +1225,7 @@ def upload_files(
     quiet: bool,
     compression: str = "auto",
     summary: TransferSummary | None = None,
+    digest_cache: dict[str, tuple[int, int, str]] | None = None,
 ) -> int:
     """Upload local source files to remote destination path.
 
@@ -1121,6 +1238,8 @@ def upload_files(
         quiet: Whether to suppress progress bars.
         compression: Transfer compression strategy ("auto", "zlib", "raw").
         summary: Optional TransferSummary tracker for batch progress and outcome.
+        digest_cache: Optional cache mapping ``full_path -> (size, mtime_ns, sha256)``
+            so pre-hashed files are not re-hashed while the session is open or on retry.
 
     Returns:
         0 on success, non-zero exit code on failure.
@@ -1203,13 +1322,26 @@ def upload_files(
     for full_path, rel_path in file_manifest:
         try:
             st = os.stat(full_path)
-            hasher = hashlib.sha256()
-
-            # Compute SHA256 before streaming
-            with open(full_path, "rb") as f:
-                while chunk := f.read(65536):
-                    hasher.update(chunk)
-            expected_sha = hasher.hexdigest()
+            cached = digest_cache.get(full_path) if digest_cache is not None else None
+            if (
+                cached is not None
+                and cached[0] == st.st_size
+                and cached[1] == st.st_mtime_ns
+            ):
+                expected_sha = cached[2]
+            else:
+                meter_hash = (
+                    ProgressMeter(f"sha256:{rel_path}", st.st_size, quiet=quiet)
+                    if st.st_size >= PREHASH_PROGRESS_MIN_BYTES
+                    else None
+                )
+                expected_sha = compute_file_sha256(
+                    full_path,
+                    heartbeat=client.send_ping,
+                    meter=meter_hash,
+                )
+                if digest_cache is not None:
+                    digest_cache[full_path] = (st.st_size, st.st_mtime_ns, expected_sha)
         except OSError as err:
             sys.stderr.write(f"moecp: cannot access '{full_path}': {err}\n")
             summary.skipped += 1
@@ -1282,7 +1414,12 @@ def upload_files(
 
 
 def _verified_prefix(
-    ledger: TransferLedger, staged: StagedFile, transfer_id: str
+    ledger: TransferLedger,
+    staged: StagedFile,
+    transfer_id: str,
+    *,
+    heartbeat: Callable[[], None] | None = None,
+    heartbeat_interval: float | None = None,
 ) -> tuple[int, Any]:
     """Re-hash the staged prefix and return ``(resume_offset, hasher)``.
 
@@ -1290,6 +1427,8 @@ def _verified_prefix(
     re-hashed against the bytes actually on disk, and the first mismatch
     truncates the range list at that offset.
     """
+    if heartbeat_interval is None:
+        heartbeat_interval = HEARTBEAT_INTERVAL
     hasher = hashlib.sha256()
     try:
         os.stat(staged.tmp_name, dir_fd=staged.dir_fd)
@@ -1299,6 +1438,7 @@ def _verified_prefix(
     resume = 0
     rows = ledger.get_verified_range_hashes(transfer_id)
     if rows:
+        last_hb = time.monotonic()
         try:
             read_fd = os.open(
                 staged.tmp_name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=staged.dir_fd
@@ -1316,6 +1456,11 @@ def _verified_prefix(
                         break
                     hasher.update(disk_bytes)
                     resume = end_off
+                    if heartbeat is not None:
+                        now = time.monotonic()
+                        if now - last_hb >= heartbeat_interval:
+                            heartbeat()
+                            last_hb = now
         except OSError:
             ledger.truncate_ranges_after(transfer_id, 0)
             return 0, hashlib.sha256()
@@ -1356,7 +1501,9 @@ def _receive_pull_file(
             try:
                 if (
                     os.path.getsize(dest_file) == size
-                    and compute_file_sha256(dest_file) == content_sha
+                    and compute_file_sha256(
+                        dest_file, heartbeat=client.send_ping
+                    ) == content_sha
                 ):
                     return "skipped"
             except OSError:
@@ -1370,7 +1517,9 @@ def _receive_pull_file(
         stack.enter_context(staged.lock())
         ledger.record_transfer(pull_id, dest_file, size, content_sha)
         try:
-            resume_offset, hasher = _verified_prefix(ledger, staged, pull_id)
+            resume_offset, hasher = _verified_prefix(
+                ledger, staged, pull_id, heartbeat=client.send_ping
+            )
             client.send_frame(
                 {"op": "PULL_FILE", "rel": item["rel"], "offset": resume_offset}
             )
@@ -1589,12 +1738,23 @@ def download_files(
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def compute_file_sha256(path: str, block_size: int = 65536) -> str:
+def compute_file_sha256(
+    path: str,
+    block_size: int = 65536,
+    *,
+    heartbeat: Callable[[], None] | None = None,
+    heartbeat_interval: float | None = None,
+    meter: ProgressMeter | None = None,
+) -> str:
     """Compute SHA-256 digest of a local file in fixed blocks.
 
     Args:
         path: Path to the local file.
         block_size: Size of each read block in bytes.
+        heartbeat: Optional callback invoked periodically during long reads
+            to keep an active transport session from timing out.
+        heartbeat_interval: Minimum seconds between heartbeat invocations.
+        meter: Optional progress meter updated as bytes are hashed.
 
     Returns:
         Hex-encoded SHA-256 digest string.
@@ -1602,13 +1762,25 @@ def compute_file_sha256(path: str, block_size: int = 65536) -> str:
     Raises:
         OSError: If reading the file fails.
     """
+    if heartbeat_interval is None:
+        heartbeat_interval = HEARTBEAT_INTERVAL
     hasher = hashlib.sha256()
+    last_hb = time.monotonic()
     with open(path, "rb") as f:
         while True:
             chunk = f.read(block_size)
             if not chunk:
                 break
             hasher.update(chunk)
+            if meter is not None:
+                meter.update(len(chunk))
+            if heartbeat is not None:
+                now = time.monotonic()
+                if now - last_hb >= heartbeat_interval:
+                    heartbeat()
+                    last_hb = now
+    if meter is not None:
+        meter.finish()
     return hasher.hexdigest()
 
 
@@ -1845,7 +2017,9 @@ def _receive_push_file(
             try:
                 if (
                     os.path.getsize(dest_file) == size
-                    and compute_file_sha256(dest_file) == expected_sha
+                    and compute_file_sha256(
+                        dest_file, heartbeat=client.send_ping
+                    ) == expected_sha
                 ):
                     client.send_frame({"status": "COMMITTED", "sha256": expected_sha})
                     return "skipped"
@@ -1853,7 +2027,9 @@ def _receive_push_file(
                 pass
 
         ledger.record_transfer(transfer_id, dest_file, size, expected_sha)
-        resume_offset, hasher = _verified_prefix(ledger, staged, transfer_id)
+        resume_offset, hasher = _verified_prefix(
+            ledger, staged, transfer_id, heartbeat=client.send_ping
+        )
         received = resume_offset
         with staged.open(resume=resume_offset > 0) as handle:
             if resume_offset > 0:
@@ -2081,7 +2257,9 @@ def run_native_agent_transfer(
         )
         if inline:
             for entry, source_entry in zip(entries, file_list, strict=True):
-                digest = compute_file_sha256(source_entry["full"])
+                digest = compute_file_sha256(
+                    source_entry["full"], heartbeat=client.send_ping
+                )
                 entry["sha256"] = digest
                 source_entry["sha256"] = digest
             client.send_frame({"status": "OK", "is_dir": is_dir, "files": entries})
@@ -2112,7 +2290,9 @@ def run_native_agent_transfer(
                 for entry, source_entry in zip(
                     page_entries, page_sources, strict=True
                 ):
-                    digest = compute_file_sha256(source_entry["full"])
+                    digest = compute_file_sha256(
+                        source_entry["full"], heartbeat=client.send_ping
+                    )
                     entry["sha256"] = digest
                     source_entry["sha256"] = digest
                 client.send_frame(
@@ -2162,12 +2342,17 @@ def run_native_agent_transfer(
             try:
                 with open(full_path, "rb") as f:
                     if offset > 0:
+                        last_hb = time.monotonic()
                         while f.tell() < offset:
                             to_read = min(CHUNK_SIZE, offset - f.tell())
                             pbuf = f.read(to_read)
                             if not pbuf:
                                 break
                             hasher.update(pbuf)
+                            now = time.monotonic()
+                            if now - last_hb >= HEARTBEAT_INTERVAL:
+                                client.send_ping()
+                                last_hb = now
                         f.seek(offset)
                     while True:
                         buf = f.read(CHUNK_SIZE)
@@ -2402,6 +2587,11 @@ def main(argv: list[str] | None = None) -> int:
     if dst_remote:
         # Upload / Push
         remote_host = dst_spec.host
+        digest_cache = prehash_upload_sources(
+            sources_raw,
+            recursive=args.recursive,
+            quiet=args.quiet,
+        )
         return connect_and_run(
             remote_host,
             args,
@@ -2413,6 +2603,7 @@ def main(argv: list[str] | None = None) -> int:
                 preserve=args.preserve,
                 quiet=args.quiet,
                 compression=args.compression,
+                digest_cache=digest_cache,
             ),
         )
 

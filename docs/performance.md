@@ -72,6 +72,14 @@ analyses that trade-off, not to this characterization.
   (progress is never trusted on its own), so resume costs a read of what is
   already on disk rather than a free skip.
 
+### Large-Dataset Transfer Characterization (Measured 2026-11-03)
+
+Measured on a production transfer to a remote Kaggle agent (`moecp finetune_sft_qmd_format.jsonl 5:/kaggle/working --compression zlib`):
+- **Payload:** 5,061,902,391 bytes (4.82 GiB / 5.06 GB) JSONL training dataset.
+- **Local Pre-Session SHA-256:** 4,823.8 MiB hashed locally in 46.04 s at 104.5 MB/s sustained (`ProgressMeter("sha256:...", ...)`).
+- **Wire Compression Ratio:** `zlib` level 1 reduced payload to 28.2% of original byte count (71.8% bandwidth reduction, ~1.42 GB wire footprint).
+- **Keepalive Durability:** Zero socket timeouts across the entire session; remote agent read deadlines continuously maintained; committed and verified end-to-end.
+
 ## Reporting a number here
 
 If you add a figure to the documentation, add the row it came from together

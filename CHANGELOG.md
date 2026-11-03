@@ -3,6 +3,27 @@
 All notable changes to `moesh`. The project is pre-1.0: behaviour may change
 between minor releases without a deprecation period.
 
+## 0.2.0b7 — 2026-11-03
+
+Large-file SHA-256 pre-session digest caching, multi-site PING heartbeat transport keepalives, configurable frame timeout, and transfer starvation resilience.
+
+### Added — large-file SHA-256 pre-hashing cache and transport keepalive heartbeats
+
+- **Pre-session upload digest caching (`moecp.py`).** Added `prehash_upload_sources()` and wired `digest_cache` into `upload_files()` and `main()`. Local source files are hashed before opening the transport connection or consuming a bridge tunnel, displaying a dedicated progress meter (`ProgressMeter("sha256:<path>", ...)`) for files >= 32 MiB (`PREHASH_PROGRESS_MIN_BYTES`). Cached `(size, mtime_ns, sha256)` tuples allow `FILE_START` to be emitted within <1ms of `INIT_ACK`, eliminating idle wait on unpatched remote agents (`host-5`) and preventing tunnel starvation during local disk reads. Cache entries are automatically invalidated if file size or mtime changes on disk.
+- **Multi-site `PING` keepalive heartbeats (`moecp.py`).** Added `FramedStreamClient.send_ping()` and PING frame handling in `recv_frame()` (both native agent transfer and bootstrap worker `_WORKER_CODE`), resetting per-frame read deadlines whenever a `{"op": "PING"}` frame arrives. Wired rate-limited (5.0s, `HEARTBEAT_INTERVAL`) keepalive callbacks into `compute_file_sha256()`, `_verified_prefix()`, and all six PUSH/PULL hashing sites:
+  1. Client PUSH uncached upload hashing (`upload_files`)
+  2. Remote PUSH committed-skip disk-SHA check (`_receive_push_file`)
+  3. Remote PUSH resume prefix verification (`_receive_push_file`)
+  4. Remote PULL manifest and paginated LIST hashing (`run_native_agent_transfer`)
+  5. Remote PULL resume prefix seek loop (`run_native_agent_transfer`)
+  6. Client PULL committed-skip and resume prefix check (`_receive_pull_file`)
+- **Configurable socket frame timeout (`moecp.py`).** Introduced `MOECP_FRAME_TIMEOUT` environment variable (default: 30.0s, `DEFAULT_FRAME_TIMEOUT`) resolved at runtime in `recv_frame()` and `_read_exact()`, allowing operators on high-latency or slow-disk environments to tune frame read deadlines.
+
+### Fixed — large dataset transfers over slow links and adversarial timeout resistance
+
+- **Transfer starvation prevention on multi-gigabyte files (`moecp.py`).** Eliminated transport EOF and timeout disconnects when transferring multi-gigabyte archives (e.g. 5.06 GB `finetune_sft_qmd_format.jsonl` taking >45s to hash) with `--compression zlib`. Verified in production with 100% transfer completion to `5:/kaggle/working`.
+- **Adversarial timeout and pre-hash regression tests (`tests/test_moecp_engine.py`).** Added comprehensive test coverage verifying cache reuse, cache invalidation on modification, slow-hash heartbeat survival (>2.4x frame timeout across PUSH and PULL), and negative control verification of timeout behavior when heartbeats are omitted.
+
 ## 0.2.0b6 — 2026-11-03
 
 Relay TLS carrier support, bridge direct TLS listener, moecp embedded worker durability and pagination hardening, session idle timeout controls, and documentation secret scrubbing.

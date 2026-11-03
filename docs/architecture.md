@@ -19,7 +19,7 @@ is in [PROTOCOL.md](https://github.com/moeshawky/moesh/blob/master/PROTOCOL.md).
 | `moesh-bridge` (`moesh-bridge.py`) | **the receiver broker**: pairs an operator with an agent's tunnel and copies bytes. It is a blind socket pump holding 0 keys and decrypting 0 bytes. |
 | `moesh-bridge.service` | the systemd unit for the receiver bridge. |
 | `PROTOCOL.md` | the wire contract and framing specification. |
-| `tests/` | the verification suite: 283 tests covering protocol core, key generation, host identity, operator outcomes, moecp file transfers, adversarial security boundaries, carrier leases, relay TLS, worker hardening, and automated documentation drift verification. |
+| `tests/` | the verification suite: 285 tests covering protocol core, key generation, host identity, operator outcomes, moecp file transfers, adversarial security boundaries, carrier leases, relay TLS, worker hardening, large-file keepalive heartbeats, and automated documentation drift verification. |
 
 ---
 
@@ -155,6 +155,9 @@ operator terminal (moecp)                      receiver (blind bridge)          
 6. **Path Traversal Sanitization:** All relative paths are scrubbed with `sanitize_relpath`,
    strictly rejecting directory traversal sequences (`..`), null bytes (`\0`), and absolute path
    roots (`/` and `\`).
+7. **Starvation Defense & Keepalive Heartbeats:** To protect against transport timeouts on multi-gigabyte files (where SHA-256 computation exceeds the 30-second frame deadline), `moecp` implements a two-tier defense:
+   - *Pre-session digest cache:* Local upload sources are pre-hashed before opening a transport connection or consuming a bridge tunnel (`prehash_upload_sources`, `moecp.py:1147-1216`). Caching `(size, mtime_ns, sha256)` ensures `FILE_START` is transmitted in `<1ms` after `INIT_ACK`, preventing remote read deadline timeouts against unpatched remote agents.
+   - *Transport keepalives:* In-session disk operations (remote manifest scanning, resume prefix seeks, committed-skip validation, and uncached transfers) emit rate-limited `PING` keepalive frames every 5.0 s (`HEARTBEAT_INTERVAL`, `moecp.py:109`). Receiving a `PING` frame resets the peer's per-frame read deadline (`DEFAULT_FRAME_TIMEOUT = 30.0` s, configurable via `MOECP_FRAME_TIMEOUT`, `moecp.py:105`), preventing socket timeouts during heavy disk I/O.
 
 ---
 

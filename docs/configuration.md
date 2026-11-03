@@ -103,12 +103,13 @@ Legacy aliases `MOESH_TUNNEL_V2_*` and `NB_TUNNEL_V2_*` are supported for backwa
 
 | variable | default | source |
 |---|---|---|
-| `MOESH_SHELL_ADDR` | `127.0.0.1:44441` | `moecp.py:2253` |
-| `MOESH_SHELL_KEYFILE` | `~/.config/moesh/operator.key` | `moecp.py:2258` |
+| `MOESH_SHELL_ADDR` | `127.0.0.1:44441` | `moecp.py:2528` |
+| `MOESH_SHELL_KEYFILE` | `~/.config/moesh/operator.key` | `moecp.py:2533` |
 | `MOESH_SHELL_HOSTS_FILE` | `~/.config/moesh/hosts.toml` | `moesh_shell.py:68` |
-| `MOECP_LOCK_DIR` | `~/.local/state/moesh/locks` | `moecp.py:199-207` |
-| `MOECP_CLIENT_LEDGER_PATH` | `~/.local/state/moesh/ledger.db` | `moecp.py:202`, `:1413`, `:1861` |
-| `MOECP_LEDGER_TTL_DAYS` | `7` days | `moecp.py:1422`, `:1867` |
+| `MOECP_LOCK_DIR` | `~/.local/state/moesh/locks` | `moecp.py:213-221` |
+| `MOECP_CLIENT_LEDGER_PATH` | `~/.local/state/moesh/ledger.db` | `moecp.py:216`, `:1619`, `:2073` |
+| `MOECP_LEDGER_TTL_DAYS` | `7` days | `moecp.py:1628`, `:2079` |
+| `MOECP_FRAME_TIMEOUT` | `30.0` s | `moecp.py:105` |
 
 ### Flags
 
@@ -118,16 +119,16 @@ moecp [-h] [-r] [-p] [-q] [-v] [--retry RETRY] [--compression {auto,zlib,raw}] [
 
 | flag | effect | source |
 |---|---|---|
-| `paths` | Source path(s) followed by destination target | `moecp.py:2262-2265` |
-| `-r`, `--recursive` | Recursively copy entire directories | `moecp.py:2214-2218` |
-| `-p`, `--preserve` | Preserves modification times, access times, and modes | `moecp.py:2219-2223` |
-| `-q`, `--quiet` | Quiet mode: disables progress meter and non-fatal warnings | `moecp.py:2224-2228` |
-| `-v`, `--verbose` | Verbose debug logging to stderr | `moecp.py:2229-2233` |
-| `--retry RETRY` | Maximum retry attempts on connection interruption (default: 3) | `moecp.py:2234-2239` |
-| `--compression` | Transfer compression strategy (`auto`=fast zlib-1 with pre-compressed bypass, `zlib`=force zlib-1, `raw`=uncompressed) | `moecp.py:2240-2245` |
-| `-n`, `--host HOST` | Designated remote host number or name (e.g. `3` or `host-3`) | `moecp.py:2246-2250` |
-| `--addr ADDR` | Receiver operator bridge address | `moecp.py:2251-2255` |
-| `--keyfile KEYFILE` | Operator private key file path | `moecp.py:2256-2260` |
+| `paths` | Source path(s) followed by destination target | `moecp.py:2537-2540` |
+| `-r`, `--recursive` | Recursively copy entire directories | `moecp.py:2489-2493` |
+| `-p`, `--preserve` | Preserves modification times, access times, and modes | `moecp.py:2494-2498` |
+| `-q`, `--quiet` | Quiet mode: disables progress meter and non-fatal warnings | `moecp.py:2499-2503` |
+| `-v`, `--verbose` | Verbose debug logging to stderr | `moecp.py:2504-2508` |
+| `--retry RETRY` | Maximum retry attempts on connection interruption (default: 3) | `moecp.py:2509-2514` |
+| `--compression` | Transfer compression strategy (`auto`=fast zlib-1 with pre-compressed bypass, `zlib`=force zlib-1, `raw`=uncompressed) | `moecp.py:2515-2520` |
+| `-n`, `--host HOST` | Designated remote host number or name (e.g. `3` or `host-3`) | `moecp.py:2521-2525` |
+| `--addr ADDR` | Receiver operator bridge address | `moecp.py:2526-2530` |
+| `--keyfile KEYFILE` | Operator private key file path | `moecp.py:2531-2535` |
 
 ---
 

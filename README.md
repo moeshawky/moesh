@@ -43,13 +43,13 @@ Install `moesh` directly from PyPI into your environment or user profile:
 
 ```bash
 # Using pip:
-pip install moesh==0.2.0b6
+pip install moesh==0.2.0b7
 
 # Or using uv (fastest):
-uv tool install moesh==0.2.0b6
+uv tool install moesh==0.2.0b7
 
 # Or using pipx:
-pipx install moesh==0.2.0b6
+pipx install moesh==0.2.0b7
 ```
 
 This installs five CLI tools:

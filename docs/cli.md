@@ -96,7 +96,7 @@ cmp -s /tmp/in.bin /tmp/out.bin && echo "byte-identical"
 
 ## 2. `moecp` — Transactional Encrypted File Copy
 
-**Source:** `moecp.py:2202-2353`
+**Source:** `moecp.py:2476-2638`
 
 ### Synopsis
 
@@ -104,29 +104,29 @@ cmp -s /tmp/in.bin /tmp/out.bin && echo "byte-identical"
 moecp [-r] [-p] [-q] [-v] [--retry N] [--compression {auto,zlib,raw}] [-n HOST] [--addr HOST:PORT] [--keyfile PATH] SOURCE [SOURCE ...] DEST
 ```
 
-### Path Specification Formats (`moecp.py:258-300`)
+### Path Specification Formats (`moecp.py:272-314`)
 
 - `3:/remote/path` — shorthand for `host-3:/remote/path`
 - `host-3:/remote/path` or `user@host-3:/remote/path` — explicit remote host routing name (`user@` prefix is stripped before label validation)
 - `remote:/remote/path` — uses the host supplied via `-n HOST` (falls back to `host-1` if `-n` is unset)
 - `./local/path` or `/local/path` — local filesystem path (note: local paths containing `:` after `/` such as `./a:b` are treated as local)
 
-*(Remote-to-remote direct copy is rejected with exit code `1`; stage locally between hosts: `moecp.py:2288-2290`.)*
+*(Remote-to-remote direct copy is rejected with exit code `1`; stage locally between hosts: `moecp.py:2560-2562`.)*
 
 ### Arguments & Flags
 
 | Option / Argument | Default | Source | Behavior |
 |---|---|---|---|
-| `paths` (positional) | *required (≥2)* | `moecp.py:2261-2275` | One or more source paths followed by a single destination path. Multiple sources require the destination to be an existing directory (`moecp.py:1430-1435`, `:1725-1731`). |
-| `-r`, `--recursive` | `False` | `moecp.py:2214-2218` | Recursively transfer directory trees (paginated manifests of 256 entries per frame above 32 KiB; `moecp.py:97-102`). |
-| `-p`, `--preserve` | `False` | `moecp.py:2219-2223` | Preserve file modification times, access times, and POSIX permission modes. |
-| `-q`, `--quiet` | `False` | `moecp.py:2224-2228`, `:2269-2272` | Disable progress meter, transfer summary, and `[moesh ...]` connection logs on `stderr`. |
-| `-v`, `--verbose` | `False` | `moecp.py:2229-2233` | Print per-file debug diagnostics to `stderr`. |
-| `--retry RETRY` | `3` | `moecp.py:2234-2239` | Maximum connection attempts on transient `TransportEOF`, `TimeoutError`, or `OSError` (`ProtocolError` aborts immediately without retrying; `moecp.py:2189-2190`). |
-| `--compression {auto,zlib,raw}` | `auto` | `moecp.py:2240-2245` | `auto` compresses chunks with `zlib` level 1 while bypassing 29 pre-compressed extensions (`.safetensors`, `.gguf`, `.pt`, `.zst`, `.gz`, `.zip`, `.mp4`, etc.; `moecp.py:113-125`); `zlib` forces zlib-1; `raw` sends uncompressed 32 KiB chunks. |
-| `-n`, `--host HOST` | `""` | `moecp.py:2246-2250` | Default remote host when using `remote:/path` target syntax. |
-| `--addr ADDR` | `MOESH_SHELL_ADDR` or `127.0.0.1:44441` | `moecp.py:2251-2255` | Receiver operator-v2 listener `host:port`. |
-| `--keyfile PATH` | `MOESH_SHELL_KEYFILE` or `~/.config/moesh/operator.key` | `moecp.py:2256-2260` | Explicit operator private key file path. |
+| `paths` (positional) | *required (≥2)* | `moecp.py:2537-2540` | One or more source paths followed by a single destination path. Multiple sources require the destination to be an existing directory (`moecp.py:1319-1323`, `:1669-1675`). |
+| `-r`, `--recursive` | `False` | `moecp.py:2489-2493` | Recursively transfer directory trees (paginated manifests of 256 entries per frame above 32 KiB; `moecp.py:101-102`). |
+| `-p`, `--preserve` | `False` | `moecp.py:2494-2498` | Preserve file modification times, access times, and POSIX permission modes. |
+| `-q`, `--quiet` | `False` | `moecp.py:2499-2503`, `:2544-2548` | Disable progress meter, transfer summary, and `[moesh ...]` connection logs on `stderr`. |
+| `-v`, `--verbose` | `False` | `moecp.py:2504-2508` | Print per-file debug diagnostics to `stderr`. |
+| `--retry RETRY` | `3` | `moecp.py:2509-2514` | Maximum connection attempts on transient `TransportEOF`, `TimeoutError`, or `OSError` (`ProtocolError` aborts immediately without retrying; `moecp.py:2464-2467`). |
+| `--compression {auto,zlib,raw}` | `auto` | `moecp.py:2515-2520` | `auto` compresses chunks with `zlib` level 1 while bypassing 29 pre-compressed extensions (`.safetensors`, `.gguf`, `.pt`, `.zst`, `.gz`, `.zip`, `.mp4`, etc.; `moecp.py:125-137`); `zlib` forces zlib-1; `raw` sends uncompressed 32 KiB chunks. |
+| `-n`, `--host HOST` | `""` | `moecp.py:2521-2525` | Default remote host when using `remote:/path` target syntax. |
+| `--addr ADDR` | `MOESH_SHELL_ADDR` or `127.0.0.1:44441` | `moecp.py:2526-2530` | Receiver operator-v2 listener `host:port`. |
+| `--keyfile PATH` | `MOESH_SHELL_KEYFILE` or `~/.config/moesh/operator.key` | `moecp.py:2531-2535` | Explicit operator private key file path. |
 
 ### Verified Examples
 
@@ -145,9 +145,9 @@ moecp -r host-3:/var/log/app ./local-logs/
 
 | Code | Condition | Source |
 |---:|---|---|
-| `0` | All requested files transferred (or verified up-to-date via SHA-256 ledger) | `moecp.py:2353` |
-| `1` | One or more files failed, destination locked (`TransferBusyError`), path escape rejected, remote module missing (`ProtocolError`), or both endpoints remote | `moecp.py:2195`, `:2290`, `:2348` |
-| `2` | CLI argument validation failure (`argparse`) | `moecp.py:2275` |
+| `0` | All requested files transferred (or verified up-to-date via SHA-256 ledger) | `moecp.py:2638` |
+| `1` | One or more files failed, destination locked (`TransferBusyError`), path escape rejected, remote module missing (`ProtocolError`), or both endpoints remote | `moecp.py:2469`, `:2562`, `:2633` |
+| `2` | CLI argument validation failure (`argparse`) | `moecp.py:2542` |
 
 ---
 

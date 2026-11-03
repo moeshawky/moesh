@@ -258,7 +258,7 @@ def bench_end_to_end(size: int, compression: str) -> tuple[float, float, int]:
             ledger_seconds[0] += time.perf_counter() - started_at
             ledger_calls[0] += 1
 
-    TransferLedger.record_range = timed_record_range
+    TransferLedger.record_range = timed_record_range  # type: ignore[method-assign]
     payload = make_payload("text", size)
     digest = hashlib.sha256(payload).hexdigest()
     with tempfile.TemporaryDirectory() as work:

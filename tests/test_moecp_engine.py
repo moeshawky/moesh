@@ -1286,6 +1286,322 @@ def test_download_files_prunes_stale_client_transfers_via_ttl_env(
         s_client.close()
 
 
+def test_prehash_upload_sources_populates_cache_and_skips_in_session_rehash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """prehash_upload_sources caches SHA-256 before session start and invalidates on file mutation."""
+    ledger_db = tmp_path / "ledger" / "moecp_prehash.db"
+    monkeypatch.setenv("MOECP_LEDGER_PATH", str(ledger_db))
+
+    src_file = tmp_path / "dataset.jsonl"
+    initial_payload = b'{"prompt": "test", "completion": "ok"}\n' * 1024
+    src_file.write_bytes(initial_payload)
+    expected_sha1 = hashlib.sha256(initial_payload).hexdigest()
+
+    digest_cache = moecp.prehash_upload_sources(
+        sources=[str(src_file)],
+        recursive=False,
+        quiet=True,
+    )
+    resolved = os.path.abspath(str(src_file))
+    assert resolved in digest_cache
+    cached_size, cached_mtime_ns, cached_sha = digest_cache[resolved]
+    assert cached_size == len(initial_payload)
+    assert cached_mtime_ns == src_file.stat().st_mtime_ns
+    assert cached_sha == expected_sha1
+
+    # 1. Upload with valid cache: compute_file_sha256 must NOT be called by client during session
+    target_dir1 = tmp_path / "remote_dest1"
+    target_dir1.mkdir()
+
+    real_compute = moecp.compute_file_sha256
+    client_hash_calls: list[str] = []
+
+    def spy_compute(
+        path: str,
+        heartbeat: object = None,
+        heartbeat_interval: float = moecp.HEARTBEAT_INTERVAL,
+        meter: object = None,
+    ) -> str:
+        if os.path.abspath(path) == resolved:
+            client_hash_calls.append(path)
+        return real_compute(
+            path,
+            heartbeat=heartbeat,  # type: ignore[arg-type]
+            heartbeat_interval=heartbeat_interval,
+            meter=meter,  # type: ignore[arg-type]
+        )
+
+    monkeypatch.setattr(moecp, "compute_file_sha256", spy_compute)
+
+    s_agent1, s_client1 = socket.socketpair()
+
+    def run_agent1() -> None:
+        try:
+            secure = _DummySecureChannel(s_agent1)
+            moecp.run_native_agent_transfer(s_agent1, secure, {"session_type": "transfer"})  # type: ignore[arg-type]
+        finally:
+            s_agent1.close()
+
+    t1 = threading.Thread(target=run_agent1)
+    t1.start()
+    try:
+        client1 = moecp.FramedStreamClient(_DummySecureChannel(s_client1), s_client1)  # type: ignore[arg-type]
+        rc1 = moecp.upload_files(
+            client=client1,
+            sources=[str(src_file)],
+            target_spec=moecp.PathSpec(is_remote=True, host="host-5", path=str(target_dir1)),
+            recursive=False,
+            preserve=False,
+            quiet=True,
+            compression="zlib",
+            digest_cache=digest_cache,
+        )
+        assert rc1 == 0
+        t1.join(timeout=5.0)
+        assert client_hash_calls == []
+        assert (target_dir1 / "dataset.jsonl").read_bytes() == initial_payload
+    finally:
+        s_client1.close()
+
+    # 2. Mutate file on disk -> cache entry must be invalidated and recomputed in upload_files
+    mutated_payload = initial_payload + b'{"prompt": "extra", "completion": "line"}\n'
+    src_file.write_bytes(mutated_payload)
+    expected_sha2 = hashlib.sha256(mutated_payload).hexdigest()
+
+    target_dir2 = tmp_path / "remote_dest2"
+    target_dir2.mkdir()
+
+    s_agent2, s_client2 = socket.socketpair()
+
+    def run_agent2() -> None:
+        try:
+            secure = _DummySecureChannel(s_agent2)
+            moecp.run_native_agent_transfer(s_agent2, secure, {"session_type": "transfer"})  # type: ignore[arg-type]
+        finally:
+            s_agent2.close()
+
+    t2 = threading.Thread(target=run_agent2)
+    t2.start()
+    try:
+        client2 = moecp.FramedStreamClient(_DummySecureChannel(s_client2), s_client2)  # type: ignore[arg-type]
+        rc2 = moecp.upload_files(
+            client=client2,
+            sources=[str(src_file)],
+            target_spec=moecp.PathSpec(is_remote=True, host="host-5", path=str(target_dir2)),
+            recursive=False,
+            preserve=False,
+            quiet=True,
+            compression="zlib",
+            digest_cache=digest_cache,
+        )
+        assert rc2 == 0
+        t2.join(timeout=5.0)
+        assert len(client_hash_calls) == 1
+        assert digest_cache[resolved][2] == expected_sha2
+        assert (target_dir2 / "dataset.jsonl").read_bytes() == mutated_payload
+    finally:
+        s_client2.close()
+
+
+def test_slow_hashing_survives_frame_timeout_via_ping_heartbeats(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Slow SHA-256 hashing (>2.5x DEFAULT_FRAME_TIMEOUT) stays alive via PING heartbeats across PUSH and PULL."""
+    import time
+
+    ledger_db = tmp_path / "ledger" / "moecp_heartbeat.db"
+    client_ledger_db = tmp_path / "ledger" / "moecp_client_heartbeat.db"
+    monkeypatch.setenv("MOECP_LEDGER_PATH", str(ledger_db))
+    monkeypatch.setenv("MOECP_CLIENT_LEDGER_PATH", str(client_ledger_db))
+
+    # Set tight frame timeout (0.15s) and heartbeat interval (0.03s)
+    monkeypatch.setattr(moecp, "DEFAULT_FRAME_TIMEOUT", 0.15)
+    monkeypatch.setattr(moecp, "HEARTBEAT_INTERVAL", 0.03)
+
+    # Create a 5-chunk file (5 * 64 KiB = 320 KiB) so compute_file_sha256 loops 5 times
+    chunk_unit = (b"SLOW_HASH_HEARTBEAT_DATA_BLOCK_" * 2100)[:65536]
+    payload = chunk_unit * 5
+    src_file = tmp_path / "big_transfer.jsonl"
+    src_file.write_bytes(payload)
+
+    real_compute = moecp.compute_file_sha256
+
+    def slow_compute_with_heartbeats(
+        path: str,
+        heartbeat: object = None,
+        heartbeat_interval: float = 0.03,
+        meter: object = None,
+    ) -> str:
+        # Simulate a slow 0.36s disk hash (>2.4x the 0.15s frame timeout) firing heartbeats every 0.04s
+        for _ in range(9):
+            time.sleep(0.04)
+            if callable(heartbeat):
+                heartbeat()
+        return real_compute(
+            path,
+            heartbeat=heartbeat,  # type: ignore[arg-type]
+            heartbeat_interval=0.01,
+            meter=meter,  # type: ignore[arg-type]
+        )
+
+    monkeypatch.setattr(moecp, "compute_file_sha256", slow_compute_with_heartbeats)
+
+    # 1. Uncached PUSH with slow hashing (>2.4x frame timeout) must succeed via PING frames
+    push_dest_dir = tmp_path / "push_dest"
+    push_dest_dir.mkdir()
+
+    s_agent1, s_client1 = socket.socketpair()
+
+    def run_agent1() -> None:
+        try:
+            secure = _DummySecureChannel(s_agent1)
+            moecp.run_native_agent_transfer(s_agent1, secure, {"session_type": "transfer"})  # type: ignore[arg-type]
+        finally:
+            s_agent1.close()
+
+    t1 = threading.Thread(target=run_agent1)
+    t1.start()
+    try:
+        client1 = moecp.FramedStreamClient(_DummySecureChannel(s_client1), s_client1)  # type: ignore[arg-type]
+        rc_push = moecp.upload_files(
+            client=client1,
+            sources=[str(src_file)],
+            target_spec=moecp.PathSpec(is_remote=True, host="host-5", path=str(push_dest_dir)),
+            recursive=False,
+            preserve=False,
+            quiet=True,
+            compression="zlib",
+            digest_cache={},
+        )
+        assert rc_push == 0
+        t1.join(timeout=5.0)
+        assert (push_dest_dir / "big_transfer.jsonl").read_bytes() == payload
+    finally:
+        s_client1.close()
+
+    # 2. Second PUSH of same file triggers remote COMMITTED disk-SHA check (also slow-hashed via PING)
+    s_agent2, s_client2 = socket.socketpair()
+
+    def run_agent2() -> None:
+        try:
+            secure = _DummySecureChannel(s_agent2)
+            moecp.run_native_agent_transfer(s_agent2, secure, {"session_type": "transfer"})  # type: ignore[arg-type]
+        finally:
+            s_agent2.close()
+
+    t2 = threading.Thread(target=run_agent2)
+    t2.start()
+    try:
+        client2 = moecp.FramedStreamClient(_DummySecureChannel(s_client2), s_client2)  # type: ignore[arg-type]
+        summary_push2 = moecp.TransferSummary()
+        rc_push2 = moecp.upload_files(
+            client=client2,
+            sources=[str(src_file)],
+            target_spec=moecp.PathSpec(is_remote=True, host="host-5", path=str(push_dest_dir)),
+            recursive=False,
+            preserve=False,
+            quiet=True,
+            compression="zlib",
+            summary=summary_push2,
+            digest_cache={},
+        )
+        assert rc_push2 == 0
+        t2.join(timeout=5.0)
+        assert summary_push2.skipped == 1
+    finally:
+        s_client2.close()
+
+    # 3. PULL with slow remote manifest hashing (>2.4x frame timeout) must succeed via PING frames
+    pull_dest_dir = tmp_path / "pull_dest"
+    pull_dest_dir.mkdir()
+    pull_dest_file = pull_dest_dir / "big_transfer.jsonl"
+
+    s_agent3, s_client3 = socket.socketpair()
+
+    def run_agent3() -> None:
+        try:
+            secure = _DummySecureChannel(s_agent3)
+            moecp.run_native_agent_transfer(s_agent3, secure, {"session_type": "transfer"})  # type: ignore[arg-type]
+        finally:
+            s_agent3.close()
+
+    t3 = threading.Thread(target=run_agent3)
+    t3.start()
+    try:
+        client3 = moecp.FramedStreamClient(_DummySecureChannel(s_client3), s_client3)  # type: ignore[arg-type]
+        rc_pull = moecp.download_files(
+            client=client3,
+            source_spec=moecp.PathSpec(
+                is_remote=True,
+                host="host-5",
+                path=str(push_dest_dir / "big_transfer.jsonl"),
+            ),
+            local_target=str(pull_dest_file),
+            recursive=False,
+            preserve=False,
+            quiet=True,
+            compression="zlib",
+        )
+        assert rc_pull == 0
+        t3.join(timeout=5.0)
+        assert pull_dest_file.read_bytes() == payload
+    finally:
+        s_client3.close()
+
+    # 4. Negative control: if heartbeats are suppressed during the same 0.36s hash, recv_frame times out
+    def slow_compute_without_heartbeats(
+        path: str,
+        heartbeat: object = None,
+        heartbeat_interval: float = 0.03,
+        meter: object = None,
+    ) -> str:
+        time.sleep(0.36)
+        return real_compute(path)
+
+    monkeypatch.setattr(moecp, "compute_file_sha256", slow_compute_without_heartbeats)
+
+    fail_dest_dir = tmp_path / "fail_dest"
+    fail_dest_dir.mkdir()
+    s_agent4, s_client4 = socket.socketpair()
+    agent4_errors: list[BaseException] = []
+
+    def run_agent4() -> None:
+        try:
+            secure = _DummySecureChannel(s_agent4)
+            moecp.run_native_agent_transfer(s_agent4, secure, {"session_type": "transfer"})  # type: ignore[arg-type]
+        except BaseException as exc:
+            agent4_errors.append(exc)
+        finally:
+            s_agent4.close()
+
+    t4 = threading.Thread(target=run_agent4)
+    t4.start()
+    try:
+        client4 = moecp.FramedStreamClient(_DummySecureChannel(s_client4), s_client4)  # type: ignore[arg-type]
+        summary_fail = moecp.TransferSummary()
+        with pytest.raises((OSError, TimeoutError)):
+            moecp.upload_files(
+                client=client4,
+                sources=[str(src_file)],
+                target_spec=moecp.PathSpec(is_remote=True, host="host-5", path=str(fail_dest_dir)),
+                recursive=False,
+                preserve=False,
+                quiet=True,
+                compression="zlib",
+                summary=summary_fail,
+                digest_cache={},
+            )
+    finally:
+        s_client4.close()
+        t4.join(timeout=5.0)
+
+    assert len(agent4_errors) == 1
+    assert isinstance(agent4_errors[0], TimeoutError)
+    assert "timed out waiting for remote response" in str(agent4_errors[0])
+    assert not (fail_dest_dir / "big_transfer.jsonl").exists()
+
+
 
 
 
