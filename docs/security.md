@@ -69,18 +69,18 @@ untrusted inputs and network tampering:
   unbounded memory or disk.
 
 ### Atomic Staging, Durability & Rollback
-- **Staging Files & Permissions:** Inbound files are written to temporary nonced files created with mode `0o600` (`moecp.py:239`, `:327`, `:551`) inside the verified parent destination directory. Pre-existing destination symlinks are refused.
+- **Staging Files & Permissions:** Inbound files are written to temporary nonced files created with mode `0o600` (`moecp.py:341`, `:429`, `:711`) inside the verified parent destination directory. Pre-existing destination symlinks are refused.
 - **Durable Disk Sync (fsync):** Both the file descriptor and the parent directory are synchronized to non-volatile storage via `os.fsync` before committing, ensuring crash durability.
 - **Digest Verification:** End-to-end SHA-256 digests are computed incrementally during streaming. If a digest mismatch, network drop, or corrupt zlib chunk occurs, the partial file is unlinked immediately.
 - **Atomic Commit:** Files are committed using `os.replace` only after digest verification succeeds. At no point is a partial or corrupt file visible under its target filename.
 
 ### Worker Hardening & Manifest Pagination
-- **Namespace Isolation:** The remote worker runtime environment explicitly imports `contextlib` and isolates execution globals (`moecp.py:380`), eliminating `NameError` exceptions during cleanup under clean interpreter namespaces.
+- **Namespace Isolation:** The remote worker runtime environment explicitly imports `contextlib` and isolates execution globals (`moecp.py:482`), eliminating `NameError` exceptions during cleanup under clean interpreter namespaces.
 - **Paginated Manifest Streaming:** Remote directory manifests enforce 32 KiB chunk bounds (`CHUNK_SIZE`), preventing 64 KiB frame buffer overflows when synchronizing large directory hierarchies.
 
 ### Large-File Transport Starvation Protection
-- **Pre-Session Digest Caching:** Local upload sources are pre-hashed before opening a transport connection or consuming a bridge tunnel (`moecp.py:1147-1216`). Cached digests ensure `FILE_START` is transmitted in `<1ms` after `INIT_ACK`, preventing remote read deadline timeouts against unpatched remote agents.
-- **Multi-Site Keepalive Heartbeats:** During in-session disk verification (remote manifest hashing, resume prefix checks, committed-skip validation, and uncached streaming), `moecp` emits rate-limited `PING` keepalive frames every 5.0 s (`HEARTBEAT_INTERVAL`, `moecp.py:109`). Receiving a `PING` frame resets the peer's per-frame read deadline (`DEFAULT_FRAME_TIMEOUT = 30.0` s, configurable via `MOECP_FRAME_TIMEOUT`, `moecp.py:105`), eliminating transport starvation on multi-gigabyte files.
+- **Pre-Session Digest Caching:** Local upload sources are pre-hashed before opening a transport connection or consuming a bridge tunnel (`moecp.py:1320-1389`). Cached digests ensure `FILE_START` is transmitted in `<1ms` after `INIT_ACK`, preventing remote read deadline timeouts against unpatched remote agents.
+- **Multi-Site Keepalive Heartbeats:** During in-session disk verification (remote manifest hashing, resume prefix checks, committed-skip validation, and uncached streaming), `moecp` emits rate-limited `PING` keepalive frames every 5.0 s (`HEARTBEAT_INTERVAL`, `moecp.py:211`). Receiving a `PING` frame resets the peer's per-frame read deadline (`DEFAULT_FRAME_TIMEOUT = 30.0` s, configurable via `MOECP_FRAME_TIMEOUT`, `moecp.py:207`), eliminating transport starvation on multi-gigabyte files.
 
 ### Session Isolation
 - `moecp` negotiates `session_type=transfer`, which the agent serves **natively

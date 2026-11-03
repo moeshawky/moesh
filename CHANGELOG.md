@@ -93,7 +93,7 @@ Engineering audit, non-interactive execution, client-perspective defect remediat
 - **Dashed argument and quote preservation.** Command-line tokens are captured via `nargs=argparse.REMAINDER`, stripped of leading `--`, and joined via `shlex.join`, allowing complex dashed flags and quoted sub-commands (e.g. `moesh -n 3 python3 -c "print(1)"`) to pass through uncorrupted (`moesh_shell.py:1222-1234`).
 - **Bidirectional stdin/stdout streaming and pipe multiplexing.** Local `stdin` streams non-blocking to the remote child process, multiplexed with child `stdout` reads via `select.select` with a 1 MiB backpressure ceiling on unconsumed stdin buffers (`moesh_tunnel.py:991-1039`).
 - **Clean process group termination.** Remote commands execute in their own process session group (`start_new_session=True`). On client disconnect or transport loss, `moesh_tunnel.py` delivers `SIGTERM` followed by `SIGKILL` to the child process group (`os.killpg`), preventing orphaned background processes (`moesh_tunnel.py:974`, `:1085-1114`).
-- **Quiet mode logging (`-q` / `--quiet`).** Added `-q` to `moesh` and `moecp` to silence informational connection messages on `stderr`, allowing clean binary pipelines to `stdout` (`moesh_shell.py:1162-1166`, `moecp.py:2224-2228`, `:2269-2272`).
+- **Quiet mode logging (`-q` / `--quiet`).** Added `-q` to `moesh` and `moecp` to silence informational connection messages on `stderr`, allowing clean binary pipelines to `stdout` (`moesh_shell.py:1162-1166`, `moecp.py:2731-2734`).
 
 ### Fixed — bridge headers, dead tunnels, and test synchronization
 

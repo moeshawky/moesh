@@ -203,9 +203,9 @@ channel carries framed streaming transfer records (`moecp.py:FramedStreamClient`
 uint32_be(header_length) || uint32_be(payload_length) || utf8_json(metadata) || raw_payload
 ```
 
-* `MAX_FRAME_HDR = 65536` (64 KiB, `moecp.py:81`).
-* `MAX_FRAME_PAYLOAD = 10485760` (10 MiB, `moecp.py:85`).
-* Uncompressed chunk slice: `CHUNK_SIZE = 32768` (32 KiB, `moecp.py:77`).
+* `MAX_FRAME_HDR = 65536` (64 KiB, `moecp.py:82`).
+* `MAX_FRAME_PAYLOAD = 10485760` (10 MiB, `moecp.py:86`).
+* Uncompressed chunk slice: `CHUNK_SIZE = 32768` (32 KiB, `moecp.py:78`).
 
 #### Transfer Operations (`meta["op"]`)
 
@@ -213,7 +213,7 @@ uint32_be(header_length) || uint32_be(payload_length) || utf8_json(metadata) || 
 * **File Header:** `FILE_START` with relative path, size, mode, mtime, and expected SHA-256 digest. Answered with `READY` (carrying `transfer_id` and resume `offset`) or `COMMITTED` (skipping previously verified transfers).
 * **Chunk Streaming:** `CHUNK` with encoding `"raw"` or `"zlib"` containing compressed chunk payloads bounded to `MAX_DECOMPRESSED_CHUNK` (32 KiB).
 * **Completion & Manifests:** `FILE_END`, `DONE`, `LIST`, and `PULL_FILE`.
-* **Transport Keepalive (`PING`):** `{"op": "PING"}` with zero payload (`moecp.py:920-922`). Emitted at rate-limited intervals (`HEARTBEAT_INTERVAL = 5.0` s, `moecp.py:109`) during long disk reads (e.g. SHA-256 computation over multi-gigabyte files). Receiving a `PING` frame resets the peer's per-frame deadline (`DEFAULT_FRAME_TIMEOUT = 30.0` s, configurable via `MOECP_FRAME_TIMEOUT`, `moecp.py:105`), preventing socket timeouts during heavy disk I/O.
+* **Transport Keepalive (`PING`):** `{"op": "PING"}` with zero payload (`moecp.py:1089-1091`). Emitted at rate-limited intervals (`HEARTBEAT_INTERVAL = 5.0` s, `moecp.py:211`) during long disk reads (e.g. SHA-256 computation over multi-gigabyte files). Receiving a `PING` frame resets the peer's per-frame deadline (`DEFAULT_FRAME_TIMEOUT = 30.0` s, configurable via `MOECP_FRAME_TIMEOUT`, `moecp.py:207`), preventing socket timeouts during heavy disk I/O.
 * **Pre-Session Digest Caching:** Local upload sources are pre-hashed before the client establishes a transport connection or consumes a tunnel. Caching `(size, mtime_ns, sha256)` ensures `FILE_START` is transmitted in `<1ms` after `INIT_ACK`, avoiding idle wait against unpatched remote daemons and preventing redundant hashing on connection retries.
 
 ---
