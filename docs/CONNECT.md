@@ -10,13 +10,13 @@ Install `moesh` from PyPI on both your local machine and your remote target:
 
 ```bash
 # Standard installation:
-pip install moesh==0.2.0b8
+pip install moesh==0.2.0b9
 
 # Or using uv:
-uv tool install moesh==0.2.0b8
+uv tool install moesh==0.2.0b9
 
 # Or using pipx:
-pipx install moesh==0.2.0b8
+pipx install moesh==0.2.0b9
 ```
 
 This installs the five CLI tools: `moesh`, `moecp`, `moesh-tunnel`, `moesh-relay`, and `moesh-bridge`.

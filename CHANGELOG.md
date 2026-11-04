@@ -3,6 +3,12 @@
 All notable changes to `moesh`. The project is pre-1.0: behaviour may change
 between minor releases without a deprecation period.
 
+## 0.2.0b9 — 2026-11-04
+
+### Fixed — the paired-but-dead carrier (HANDOFF.md §5 failure mode)
+
+- **Pair-silence watchdog in the bridge (`moesh-bridge.py`).** The receiver could pair an operator with a tunnel whose agent-side worker had walked away while the carrier socket stayed ESTABLISHED: `alive()`-peek passes on a silent socket, `pump()` then waited forever in `done.wait()` (neither copy thread ever sees EOF), and the operator sat out the full 150 s handshake timeout with an empty buffer — the intermittently-green suite's one symptom, measured 2026-10-21 through 2026-11-04. A newly paired session now has `MOESH_BRIDGE_PAIR_SILENCE_TIMEOUT` (default 30 s, `0` disables) to move at least one byte in *each* direction; an unestablished pair has both legs shut down and the existing teardown runs unchanged. The watchdog counts *whether* bytes moved, never their content — the bridge stays blind. Once both directions have proved themselves it disarms permanently: idle established sessions are never touched. The two previously failed designs at this boundary (a plain-text dead-tunnel marker against Noise framing, a peek before the handshake) are made moot: no new wire bytes, no client change — an ordinary close is the retry signal, and the client's existing first-attempt `TransportEOF` retry (delay 0) re-attaches onto a fresh carrier. Regression: `test_paired_silent_carrier_is_closed_promptly` fails against the pre-fix tree (worktree-proved) and passes post-fix; full suite ×5 on the fix: 313 passed ×5. The race that produces a departed carrier is not claimed dead — the stranding failure mode is.
+
 ## 0.2.0b8 — 2026-11-03
 
 ### Fixed — PULL manifest pagination bounded by serialized-byte budget
