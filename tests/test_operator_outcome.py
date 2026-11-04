@@ -470,6 +470,109 @@ def test_departed_tunnel_worker_is_not_paired(tmp_path: Path) -> None:
         bridge.stop()
 
 
+def test_paired_silent_carrier_is_closed_promptly(tmp_path: Path) -> None:
+    """FUNC-009 — a paired carrier that never moves a byte is torn down at the
+    pair-silence deadline, so the operator exits instead of waiting out the
+    whole handshake timeout.
+
+    Mechanism (regression): the bridge pairs an operator with a carrier whose
+    agent-side worker walked away (SIGSTOPped here). The carrier socket is still
+    ESTABLISHED so alive()-peek passes (moesh-bridge.py:1418,1427), pump()
+    (:1284) blocks because neither copy thread ever sees EOF or OSError, and
+    done.wait() never returns — the operator sat for the full
+    HANDSHAKE_TIMEOUT=150s (moesh_proto.py:137) waiting for a prompt that never
+    came.  The pair-silence watchdog counts whether bytes moved (never their
+    content; the bridge stays blind, Iron Law 3) and shuts down both sockets at
+    MOESH_BRIDGE_PAIR_SILENCE_TIMEOUT, which surfaces OSError to the copy
+    threads and runs the existing teardown.
+
+    On pre-fix code this test cannot pass: the client waits its 30s handshake
+    timeout and the poll loop expires.  New code tears the pair down at ~3-4s.
+    Asserts on the client process state and its nonzero exit, never on a bridge
+    log line (bridge stdout is block-buffered, HANDOFF.md §7 trap 2).
+    """
+    dir_a = tmp_path / "a"
+    dir_a.mkdir()
+    keys = make_keys(tmp_path)
+    _operator_key, _agent_pubfile, agent_private, agent_public, operator_public = keys
+    pins = _write_pins(tmp_path, "alpha", agent_public)
+    tunnel_port, operator_port, operator_v2_port = next_ports()
+    bridge = Bridge(
+        tunnel_port,
+        operator_port,
+        operator_v2_port,
+        env_extra={"MOESH_BRIDGE_PAIR_SILENCE_TIMEOUT": "3"},
+    )
+    agent = None
+    op = None
+    try:
+        agent, log_a = _start_agent(
+            dir_a, tunnel_port, agent_private, operator_public, sessions=1, name="alpha"
+        )
+        _wait_log(log_a, "tunnel established; waiting for an operator")
+        os.kill(agent.pid, signal.SIGSTOP)
+        # The carrier must be demonstrably stopped (state T) before the
+        # operator is paired with its tunnel: otherwise the silence could
+        # come from an agent that is merely slow, not departed.  agent.pid is
+        # the moesh_tunnel.py process that holds the tunnel socket, so /proc
+        # reports its real state (measured 2026-11-04).
+        stopped = False
+        for _ in range(100):
+            with open(f"/proc/{agent.pid}/stat") as handle:
+                if handle.read().split()[2] == "T":
+                    stopped = True
+                    break
+            time.sleep(0.05)
+        assert stopped, f"carrier process {agent.pid} did not reach state T"
+        env = dict(os.environ)
+        env.update(
+            {
+                "MOESH_SHELL_ADDR": f"127.0.0.1:{operator_v2_port}",
+                "MOESH_SHELL_KEYFILE": keys[0],
+                "MOESH_SHELL_HOSTS_FILE": pins,
+                "MOESH_SHELL_HANDSHAKE_TIMEOUT": "30",
+                "TERM": "xterm-256color",
+            }
+        )
+        argv = [
+            AGENT_PYTHON,
+            CLIENT,
+            "--host",
+            "alpha",
+            "--addr",
+            f"127.0.0.1:{operator_v2_port}",
+            "--no-reconnect",
+        ]
+        op = OperatorSession(argv, env, rows=24, cols=80)
+        # The carrier never moves a byte: the pair must be torn down at the
+        # silence deadline and the client must exit promptly.  On pre-fix code
+        # the one-shot watchdog is disarmed by the Noise handshake frame, so
+        # the client waits its 30s handshake timeout and never exits within
+        # this ~10s poll window; new code tears the pair down at ~3-4s.
+        deadline = time.time() + 10
+        exited = False
+        while time.time() < deadline:
+            if op.proc.poll() is not None:
+                exited = True
+                break
+            time.sleep(0.1)
+        assert exited, "client did not exit within the pair-silence deadline"
+        assert op.proc.returncode is not None and op.proc.returncode != 0
+    finally:
+        if agent is not None:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(agent.pid, signal.SIGCONT)
+            agent.terminate()
+        if agent is not None:
+            with contextlib.suppress(Exception):
+                agent.wait(timeout=10)
+            if agent.poll() is None:
+                agent.kill()
+        if op is not None:
+            op.close()
+        bridge.stop()
+
+
 # ---------------------------------------------------------------------------
 # Edge / boundary
 # ---------------------------------------------------------------------------

@@ -259,6 +259,16 @@ before the session is ACTIVE.
   unbounded memory growth.
 * An abrupt transport EOF is reported as an abrupt EOF; an authenticated
   CLOSE record is reported as a graceful close.
+* A paired bridge session must **establish** within
+  `MOESH_BRIDGE_PAIR_SILENCE_TIMEOUT` (default 30 s, `0` disables): each
+  direction has to move at least one byte, or the bridge closes both legs.
+  This bounds the departed-worker carrier — a tunnel whose agent-side worker
+  walked away while its socket stayed ESTABLISHED — to the deadline instead
+  of the full 150 s handshake timeout; the client's first-attempt EOF retry
+  then re-attaches immediately. Once both directions have moved a byte the
+  watchdog disarms permanently: it never touches an established session,
+  however quiet. The bridge counts only *whether* bytes moved (blindness is
+  the property; see HANDOFF.md §5).
 * `SIGTERM` and `SIGINT` stop the agent: active shells are terminated with
   `SIGHUP` and reaped, sockets are closed, and the agent exits.
 

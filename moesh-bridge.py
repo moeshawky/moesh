@@ -55,6 +55,7 @@ import threading
 import time
 from typing import TYPE_CHECKING, Any
 
+import moesh_proto as proto
 from moesh_wire import (
     DEFAULT_HOST,
     PAIR_DEAD_MARKER,
@@ -239,6 +240,15 @@ PAIR_MARKER = RELAY_PAIR_MARKER
 
 HALFCLOSE_LINGER = float(os.environ.get("MOESH_BRIDGE_HALFCLOSE_LINGER", "60"))
 """Seconds to keep one direction open after the other reaches EOF."""
+PAIR_SILENCE_TIMEOUT = float(
+    os.environ.get("MOESH_BRIDGE_PAIR_SILENCE_TIMEOUT", str(proto.BRIDGE_PAIR_SILENCE_TIMEOUT))
+)
+"""Seconds of zero-byte silence before a paired session is torn down.
+
+0 disables the watchdog.  Default is ``BRIDGE_PAIR_SILENCE_TIMEOUT`` from
+``moesh_proto.py`` (15s).  The bridge counts *whether* bytes moved, never
+their content: the bridge stays blind (Iron Law 3).
+"""
 _leases: dict[str, dict[str, Any]] = {}
 _port_leases: dict[int, dict[str, Any]] = {}
 _host_leases: dict[str, dict[str, Any]] = {}
@@ -1270,6 +1280,44 @@ def alive(sock: socket.socket) -> bool:
         return False
 
 
+class _SilenceClock:
+    """Per-direction first-byte clocks for one paired bridge session.
+
+    Establishment semantics: a healthy pair proves itself within the first
+    round trip — the operator writes the Noise act_one, a live agent worker
+    answers within milliseconds (measured 2026-11-04: loopback, <50 ms).  A
+    carrier whose agent worker walked away never answers: the operator's
+    direction moves bytes, the carrier's direction never does (HANDOFF.md §5).
+    The watchdog therefore watches only UNTIL each direction has moved its
+    first byte, then disarms permanently: an established session may go quiet
+    for minutes (an idle terminal, a moecp prehash gap) and is never touched,
+    and a silent pair dies at the deadline instead of stranding the operator
+    for the full HANDSHAKE_TIMEOUT.  A mid-session freeze of an ESTABLISHED
+    pair is covered by the client's own liveness check (PING every 15 s,
+    dead_after 45 s, moesh_shell.run_session).  The bridge counts *whether*
+    bytes moved, never their content: it stays blind (Iron Law 3).
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._moved = {"host": False, "peer": False}
+
+    def tick(self, direction: str) -> None:
+        """Record that ``direction`` moved its first byte."""
+        with self._lock:
+            self._moved[direction] = True
+
+    def silent_directions(self) -> list[str]:
+        """Directions that have not moved a byte yet."""
+        with self._lock:
+            return [d for d, moved in self._moved.items() if not moved]
+
+    def established(self) -> bool:
+        """True once both directions have moved at least one byte."""
+        with self._lock:
+            return all(self._moved.values())
+
+
 def pump(
     a: socket.socket,
     b: socket.socket,
@@ -1306,14 +1354,19 @@ def pump(
         linger = HALFCLOSE_LINGER
     done = threading.Event()
     half_closed = threading.Lock()
+    silence = _SilenceClock()
 
-    def copy(src: socket.socket, dst: socket.socket, name: str) -> None:
+    def copy(src: socket.socket, dst: socket.socket, name: str, direction: str) -> None:
         try:
             while True:
                 try:
                     data = src.recv(65536)
                 except ssl.SSLZeroReturnError:
                     break
+                # Any recv result — data or EOF — proves this direction is
+                # alive.  The bridge counts *whether* bytes moved, never
+                # their content: the bridge stays blind (Iron Law 3).
+                silence.tick(direction)
                 if not data:
                     break
                 dst.sendall(data)
@@ -1331,11 +1384,48 @@ def pump(
                     log(f"half-close bookkeeping failed: {exc!r}")
 
     workers = [
-        threading.Thread(target=copy, args=(a, b, "host->peer"), daemon=True),
-        threading.Thread(target=copy, args=(b, a, "peer->host"), daemon=True),
+        threading.Thread(target=copy, args=(a, b, "host->peer", "host"), daemon=True),
+        threading.Thread(target=copy, args=(b, a, "peer->host", "peer"), daemon=True),
     ]
     for worker in workers:
         worker.start()
+
+    def watchdog() -> None:
+        """Tear down a pair that never establishes within the deadline.
+
+        Armed at pairing, permanently disarmed the moment both directions
+        have moved at least one byte (establishment, not reset — an
+        established session may go quiet for minutes and is never touched;
+        see _SilenceClock).  When the deadline passes while a direction is
+        still silent, both legs are shut down: each copy thread then hits
+        OSError, sets ``done``, and the existing teardown (linger,
+        force-close, ``pair closed``) runs unchanged.  The bridge counts
+        *whether* bytes moved, never their content (Iron Law 3).  0 or
+        negative timeout disables the watchdog.  The target is the departed-
+        worker carrier of HANDOFF.md §5: paired, ESTABLISHED, silent forever
+        — the operator's handshake bytes reach the bridge, nothing answers.
+        """
+        timeout = PAIR_SILENCE_TIMEOUT
+        if timeout <= 0:
+            return  # watchdog disabled
+        deadline = time.monotonic() + timeout
+        while not done.is_set() and time.monotonic() < deadline:
+            if silence.established():
+                return  # both directions proved themselves: disarm forever
+            time.sleep(0.2)
+        if done.is_set() or silence.established():
+            return
+        log(
+            f"pair unestablished for {timeout:.0f}s "
+            f"(silent: {', '.join(silence.silent_directions())}); "
+            "forcing close (pair-silence watchdog)"
+        )
+        for sock in (a, b):
+            with contextlib.suppress(OSError):
+                sock.shutdown(socket.SHUT_RDWR)
+
+    watcher = threading.Thread(target=watchdog, daemon=True)
+    watcher.start()
     done.wait()
     deadline = time.time() + linger
     for worker in workers:

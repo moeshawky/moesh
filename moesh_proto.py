@@ -147,6 +147,31 @@ attempt was thrown away by the bridge's 120s timer.
 """
 """Seconds allowed for the three-message Noise handshake."""
 
+# Seconds a PAIRED bridge session has to establish itself within: each
+# direction (carrier, operator) must move at least one byte before this
+# deadline, or the bridge tears the pair down.  0 disables the watchdog.
+# Establishment only — once both directions have moved a byte the watchdog
+# disarms permanently and an idle session is never touched (the client's own
+# PING/dead_after liveness check in run_session owns established links).
+# Measured 2026-10-21..2026-11-04 (HANDOFF.md §5): a carrier whose agent
+# worker walked away leaves the pair ESTABLISHED at TCP level (alive()-peek
+# passes), pump() blocks in done.wait(), and the operator waited the full
+# HANDSHAKE_TIMEOUT=150s for a prompt that never came.  A live agent answers
+# the Noise handshake in milliseconds (measured loopback <50 ms), so 30 s of
+# one-direction silence is pathological; and on close the client's existing
+# first-attempt TransportEOF path re-attaches with delay=0, landing a fresh
+# carrier in ~1 s — well inside the 40 s budgets the operator tests use.
+BRIDGE_PAIR_SILENCE_TIMEOUT = 30.0
+"""Bridge pair-silence watchdog deadline in seconds.
+
+A paired session that never moves a byte (a carrier whose agent worker walked
+away but whose socket is still ESTABLISHED) is torn down at this deadline so
+the operator is not left waiting out the whole handshake timeout.  The bridge
+counts *whether* bytes moved, never their content: the bridge stays blind
+(Iron Law 3).  0 disables the watchdog.  Read from
+``MOESH_BRIDGE_PAIR_SILENCE_TIMEOUT`` in ``moesh-bridge.py``.
+"""
+
 # Seconds allowed for HELLO, ACCEPT, and READY messages after the Noise handshake.
 NEGOTIATION_TIMEOUT = 30.0
 """Seconds allowed for HELLO/ACCEPT/READY."""
