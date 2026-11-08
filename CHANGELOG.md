@@ -3,6 +3,22 @@
 All notable changes to `moesh`. The project is pre-1.0: behaviour may change
 between minor releases without a deprecation period.
 
+## 0.2.0b11 — 2026-11-08
+
+### Added — ports-only relay pool with agent-named ports
+
+- **Agent-named relay pool (`moesh-bridge.py`, `moesh_relay.py`).** Added `--name` / `-n` (`MOESH_RELAY_NAME`) on `moesh-relay` and `MOESH_BRIDGE_RELAY_PORTS` on `moesh-bridge` so relay agents register named ports directly against the bridge's ports-only relay pool (`e9826ee`).
+
+### Fixed — bridge, relay, tunnel, and `moecp` boundary and reliability defects
+
+- **Dynamic relay token resolution and fallback (`moesh-bridge.py`, `moesh_relay.py`).** Resolved `MOESH_BRIDGE_RELAY_TOKEN` dynamically at request time via `get_relay_token()` instead of freezing at import time (RC-01), and added `MOESH_BRIDGE_RELAY_TOKEN` environment fallback in `moesh_relay.py` when `MOESH_RELAY_TOKEN` is unset (RC-06).
+- **Resilient auto-host fallback slot selection (`moesh_tunnel.py`).** Logged `resolve_auto_host()` status probe failures to stderr and randomized fallback slot selection across `[10, 99]` to avoid deterministic slot collisions when the bridge status endpoint is unreachable (RC-02).
+- **Signal-terminated exec exit status (`moesh_tunnel.py`).** Mapped negative subprocess returncodes in `run_exec_session()` to `128 + abs(rc)` so POSIX signal termination preserves a non-zero exit code (RC-03).
+- **Resilient integer environment parsing (`moesh_relay.py`).** Guarded integer environment variable parsing with `_env_int()` fallback on invalid non-numeric values (RC-04).
+- **Clean TCP close on binary relay connection ceiling and dead carrier (`moesh-bridge.py`, `tests/test_ap_fixes.py`).** Closed public binary relay sockets cleanly on connection ceiling exhaustion without emitting HTTP 503 text into raw TCP streams (RC-05), and gated `PAIR_DEAD_MARKER` behind `signal_dead=True` on operator sessions so public relay sockets close with a clean TCP EOF (RC-07).
+- **SQLite range write batching (`moecp.py`).** Removed the per-32 KiB chunk disk flush and batched verified range writes via `TransferLedger.batch(64)` during file transfers (RC-08).
+- **Relay lease preservation across half-close linger (`moesh-bridge.py`).** Passed `on_detach=None` to `pump()` in `relay_conn` so active relay port leases remain attached across half-close linger until the session fully closes (RC-09).
+
 ## 0.2.0b10 — 2026-11-08
 
 ### Fixed — relay carrier lease reaping and agent-defined naming
