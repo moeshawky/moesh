@@ -41,6 +41,7 @@ import sqlite3 as sqlite3
 import stat
 import struct
 import sys
+import threading
 import time
 import zlib
 from typing import TYPE_CHECKING, Any
@@ -1705,38 +1706,38 @@ def _receive_pull_file(
                     if resume_offset > 0:
                         handle.seek(resume_offset)
                         handle.truncate(resume_offset)
-                    while True:
-                        cmsg, cdata = client.recv_frame()
-                        cop = cmsg.get("op")
-                        if cop == "CHUNK":
-                            enc = cmsg.get("encoding", "zlib")
-                            if enc == "zlib":
-                                raw = decompress_chunk(cdata)
-                            elif enc == "raw":
-                                raw = cdata
+                    with ledger.batch(64):
+                        while True:
+                            cmsg, cdata = client.recv_frame()
+                            cop = cmsg.get("op")
+                            if cop == "CHUNK":
+                                enc = cmsg.get("encoding", "zlib")
+                                if enc == "zlib":
+                                    raw = decompress_chunk(cdata)
+                                elif enc == "raw":
+                                    raw = cdata
+                                else:
+                                    raise ProtocolError(
+                                        f"unsupported chunk encoding: {enc}"
+                                    )
+                                if offset + len(raw) > size:
+                                    raise ProtocolError(
+                                        f"received more than the declared {size} bytes"
+                                    )
+                                handle.write(raw)
+                                hasher.update(raw)
+                                chunk_sha = hashlib.sha256(raw).hexdigest()
+                                ledger.record_range(
+                                    pull_id, offset, offset + len(raw), chunk_sha
+                                )
+                                offset += len(raw)
+                                meter.update(len(raw))
+                            elif cop == "FILE_END":
+                                expected_sha = str(cmsg.get("sha256", ""))
+                                meter.finish()
+                                break
                             else:
-                                raise ProtocolError(
-                                    f"unsupported chunk encoding: {enc}"
-                                )
-                            if offset + len(raw) > size:
-                                raise ProtocolError(
-                                    f"received more than the declared {size} bytes"
-                                )
-                            handle.write(raw)
-                            handle.flush()
-                            hasher.update(raw)
-                            chunk_sha = hashlib.sha256(raw).hexdigest()
-                            ledger.record_range(
-                                pull_id, offset, offset + len(raw), chunk_sha
-                            )
-                            offset += len(raw)
-                            meter.update(len(raw))
-                        elif cop == "FILE_END":
-                            expected_sha = str(cmsg.get("sha256", ""))
-                            meter.finish()
-                            break
-                        else:
-                            raise ProtocolError(f"unexpected chunk op: {cop}")
+                                raise ProtocolError(f"unexpected chunk op: {cop}")
                     handle.flush()
                     os.fsync(handle.fileno())
 
@@ -1960,9 +1961,13 @@ def compute_file_sha256(
 class TransferLedger:
     """SQLite-backed transactional ledger for crash-consistent resumable transfers."""
 
-    def __init__(self, db_path: str) -> None:
+    def __init__(self, db_path: str, batch_size: int = 1) -> None:
         """Stores db_path and creates the parent directory, SQLite database, WAL mode, auto_vacuum, and transfers and verified_ranges tables."""
         self.db_path = db_path
+        self._batch_size = batch_size
+        self._in_batch = False
+        self._pending_ranges: list[tuple[str, int, int, str, float]] = []
+        self._lock = threading.Lock()
         self._init_db()
 
     @contextlib.contextmanager
@@ -2004,6 +2009,51 @@ class TransferLedger:
             with contextlib.suppress(sqlite3.OperationalError):
                 conn.execute("ALTER TABLE transfers ADD COLUMN updated_at REAL DEFAULT 0;")
 
+    @contextlib.contextmanager
+    def batch(self, size: int = 64) -> Iterator[None]:
+        """Context manager to batch verified_ranges commits during streaming transfers."""
+        with self._lock:
+            self._batch_size = size
+            self._in_batch = True
+        try:
+            yield
+        finally:
+            self.flush()
+            with self._lock:
+                self._in_batch = False
+                self._batch_size = 1
+
+    def _flush_locked(self) -> None:
+        if not self._pending_ranges:
+            return
+        batch = self._pending_ranges
+        self._pending_ranges = []
+        ranges_to_insert = [(item[0], item[1], item[2], item[3]) for item in batch]
+        with self._conn() as conn:
+            conn.executemany(
+                "INSERT OR REPLACE INTO verified_ranges (transfer_id, start_offset, end_offset, sha256) VALUES (?, ?, ?, ?)",
+                ranges_to_insert,
+            )
+            latest_by_tid: dict[str, float] = {}
+            for item in batch:
+                tid, ts = item[0], item[4]
+                if tid not in latest_by_tid or ts > latest_by_tid[tid]:
+                    latest_by_tid[tid] = ts
+            for tid, ts in latest_by_tid.items():
+                conn.execute(
+                    "UPDATE transfers SET updated_at=? WHERE transfer_id=?",
+                    (ts, tid),
+                )
+
+    def flush(self) -> None:
+        """Flushes any buffered verified ranges to SQLite in a single transaction."""
+        with self._lock:
+            self._flush_locked()
+
+    def close(self) -> None:
+        """Flushes any remaining buffered ranges to the database."""
+        self.flush()
+
     def record_transfer(
         self,
         transfer_id: str,
@@ -2027,19 +2077,27 @@ class TransferLedger:
         end: int,
         sha256: str,
     ) -> None:
-        """Inserts or replaces a verified range row for transfer_id and updates that transfer's updated_at timestamp."""
-        with self._conn() as conn:
-            conn.execute(
-                "INSERT OR REPLACE INTO verified_ranges (transfer_id, start_offset, end_offset, sha256) VALUES (?, ?, ?, ?)",
-                (transfer_id, start, end, sha256),
-            )
-            conn.execute(
-                "UPDATE transfers SET updated_at=? WHERE transfer_id=?",
-                (time.time(), transfer_id),
-            )
+        """Buffers a verified range row for transfer_id, flushing in batched transactions."""
+        with self._lock:
+            if not self._in_batch:
+                with self._conn() as conn:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO verified_ranges (transfer_id, start_offset, end_offset, sha256) VALUES (?, ?, ?, ?)",
+                        (transfer_id, start, end, sha256),
+                    )
+                    conn.execute(
+                        "UPDATE transfers SET updated_at=? WHERE transfer_id=?",
+                        (time.time(), transfer_id),
+                    )
+                return
+
+            self._pending_ranges.append((transfer_id, start, end, sha256, time.time()))
+            if len(self._pending_ranges) >= self._batch_size:
+                self._flush_locked()
 
     def mark_committed(self, transfer_id: str, sha256: str | None = None) -> None:
         """Sets committed=1 and updated_at to the current time for transfer_id; when sha256 is provided it also updates expected_sha256."""
+        self.flush()
         with self._conn() as conn:
             if sha256:
                 conn.execute(
@@ -2054,6 +2112,7 @@ class TransferLedger:
 
     def get_expected_sha256(self, transfer_id: str) -> str:
         """Returns the stored expected SHA-256 string for transfer_id, or an empty string when the row or value is missing."""
+        self.flush()
         with self._conn() as conn:
             cur = conn.execute(
                 "SELECT expected_sha256 FROM transfers WHERE transfer_id=?",
@@ -2064,6 +2123,7 @@ class TransferLedger:
 
     def get_verified_ranges(self, transfer_id: str) -> list[tuple[int, int]]:
         """Returns verified (start_offset, end_offset) tuples for transfer_id ordered by start_offset."""
+        self.flush()
         with self._conn() as conn:
             cur = conn.execute(
                 "SELECT start_offset, end_offset FROM verified_ranges WHERE transfer_id=? ORDER BY start_offset",
@@ -2073,6 +2133,7 @@ class TransferLedger:
 
     def get_verified_range_hashes(self, transfer_id: str) -> list[tuple[int, int, str]]:
         """Returns verified (start_offset, end_offset, sha256) tuples for transfer_id ordered by start_offset."""
+        self.flush()
         with self._conn() as conn:
             cur = conn.execute(
                 "SELECT start_offset, end_offset, sha256 FROM verified_ranges WHERE transfer_id=? ORDER BY start_offset",
@@ -2082,6 +2143,7 @@ class TransferLedger:
 
     def clear_ranges(self, transfer_id: str) -> None:
         """Deletes all verified_ranges rows associated with transfer_id."""
+        self.flush()
         with self._conn() as conn:
             conn.execute(
                 "DELETE FROM verified_ranges WHERE transfer_id=?",
@@ -2090,6 +2152,7 @@ class TransferLedger:
 
     def truncate_ranges_after(self, transfer_id: str, offset: int) -> None:
         """Purge chunk ranges starting at or after offset upon verification fault."""
+        self.flush()
         with self._conn() as conn:
             conn.execute(
                 "DELETE FROM verified_ranges WHERE transfer_id=? AND start_offset >= ?",
@@ -2098,6 +2161,7 @@ class TransferLedger:
 
     def purge_committed_ranges(self, transfer_id: str) -> None:
         """Purge chunk ranges for a committed transfer to prevent unbounded ledger growth."""
+        self.flush()
         with self._conn() as conn:
             conn.execute(
                 "DELETE FROM verified_ranges WHERE transfer_id=?",
@@ -2108,6 +2172,7 @@ class TransferLedger:
 
     def prune_stale_transfers(self, days: int = 7) -> int:
         """Purge uncommitted transfers and orphaned chunk ranges older than TTL days."""
+        self.flush()
         cutoff = time.time() - (days * 86400.0)
         with self._conn() as conn:
             cur = conn.execute(
@@ -2131,6 +2196,7 @@ class TransferLedger:
 
     def is_committed(self, transfer_id: str) -> bool:
         """Returns True only when a transfers row exists for transfer_id with committed equal to 1."""
+        self.flush()
         with self._conn() as conn:
             cur = conn.execute(
                 "SELECT committed FROM transfers WHERE transfer_id=?",
@@ -2215,35 +2281,35 @@ def _receive_push_file(
                     "offset": resume_offset,
                 }
             )
-            while True:
-                cmsg, cdata = client.recv_frame()
-                cop = cmsg.get("op")
-                if cop == "CHUNK":
-                    encoding = cmsg.get("encoding", "zlib")
-                    if encoding == "zlib":
-                        raw = decompress_chunk(cdata)
-                    elif encoding == "raw":
-                        raw = cdata
+            with ledger.batch(64):
+                while True:
+                    cmsg, cdata = client.recv_frame()
+                    cop = cmsg.get("op")
+                    if cop == "CHUNK":
+                        encoding = cmsg.get("encoding", "zlib")
+                        if encoding == "zlib":
+                            raw = decompress_chunk(cdata)
+                        elif encoding == "raw":
+                            raw = cdata
+                        else:
+                            raise ProtocolError(
+                                f"unsupported chunk encoding: {encoding}"
+                            )
+                        if received + len(raw) > size:
+                            raise ProtocolError(
+                                f"received more than the declared {size} bytes"
+                            )
+                        handle.write(raw)
+                        hasher.update(raw)
+                        chunk_sha = hashlib.sha256(raw).hexdigest()
+                        ledger.record_range(
+                            transfer_id, received, received + len(raw), chunk_sha
+                        )
+                        received += len(raw)
+                    elif cop == "FILE_END":
+                        break
                     else:
-                        raise ProtocolError(
-                            f"unsupported chunk encoding: {encoding}"
-                        )
-                    if received + len(raw) > size:
-                        raise ProtocolError(
-                            f"received more than the declared {size} bytes"
-                        )
-                    handle.write(raw)
-                    handle.flush()
-                    hasher.update(raw)
-                    chunk_sha = hashlib.sha256(raw).hexdigest()
-                    ledger.record_range(
-                        transfer_id, received, received + len(raw), chunk_sha
-                    )
-                    received += len(raw)
-                elif cop == "FILE_END":
-                    break
-                else:
-                    raise ProtocolError(f"unexpected chunk op: {cop}")
+                        raise ProtocolError(f"unexpected chunk op: {cop}")
             handle.flush()
             os.fsync(handle.fileno())
 

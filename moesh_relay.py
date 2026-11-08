@@ -40,21 +40,47 @@ from moesh_wire import RELAY_PAIR_MARKER, RELAY_PAIRING_EVENT
 DEFAULT_RECEIVER = os.environ.get(
     "MOESH_RELAY_RECEIVER", os.environ.get("MOESH_TUNNEL_RECEIVER", "")
 )
-# Reads MOESH_RELAY_PORT and converts it to int with default 80; an invalid value raises ValueError during import.
-DEFAULT_RECEIVER_PORT = int(
-    os.environ.get(
-        "MOESH_RELAY_PORT", os.environ.get("MOESH_TUNNEL_RECEIVER_PORT", "80")
-    )
+
+
+def _env_int(name: str, default: int, alt_name: str | None = None) -> int:
+    """Safely parse an integer environment variable with fallback defaults.
+
+    Args:
+        name: Primary environment variable name to inspect.
+        default: Fallback integer value returned when unset, empty, or unparseable.
+        alt_name: Secondary environment variable name checked if primary is unset/empty.
+
+    Returns:
+        Parsed integer value or default fallback.
+
+    Errors:
+        Never raises ValueError; malformed or non-numeric inputs return default.
+    """
+    raw = os.environ.get(name, "")
+    if not raw and alt_name:
+        raw = os.environ.get(alt_name, "")
+    raw = raw.strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+# Reads MOESH_RELAY_PORT and converts it to int with default 80; safely falls back to default on invalid values.
+DEFAULT_RECEIVER_PORT = _env_int(
+    "MOESH_RELAY_PORT", 80, alt_name="MOESH_TUNNEL_RECEIVER_PORT"
 )
 # Reads MOESH_RELAY_TARGET and defaults to 127.0.0.1:8000; used as the default upstream target address.
 DEFAULT_TARGET = os.environ.get("MOESH_RELAY_TARGET", "127.0.0.1:8000")
-# Reads MOESH_RELAY_WORKERS and converts it to int with default 4; invalid environment text raises ValueError at import.
-DEFAULT_WORKERS = int(os.environ.get("MOESH_RELAY_WORKERS", "4"))
-# Reads MOESH_RELAY_IDLE and converts it to int with default 900 seconds; invalid environment text raises ValueError at import.
-DEFAULT_IDLE = int(os.environ.get("MOESH_RELAY_IDLE", "900"))
+# Reads MOESH_RELAY_WORKERS and converts it to int with default 4; safely falls back to default on invalid values.
+DEFAULT_WORKERS = _env_int("MOESH_RELAY_WORKERS", 4)
+# Reads MOESH_RELAY_IDLE and converts it to int with default 900 seconds; safely falls back to default on invalid values.
+DEFAULT_IDLE = _env_int("MOESH_RELAY_IDLE", 900)
 # Idle timeout in seconds for an active paired TCP session before closing half-open keep-alive sockets.
 # Set to 0 or negative to disable timeout completely for long-running inference prefill or generation.
-DEFAULT_SESSION_IDLE = int(os.environ.get("MOESH_RELAY_SESSION_IDLE", "120"))
+DEFAULT_SESSION_IDLE = _env_int("MOESH_RELAY_SESSION_IDLE", 120)
 # Default TLS configuration read from environment.
 DEFAULT_TLS = os.environ.get("MOESH_RELAY_TLS", "").lower() in ("1", "true", "yes")
 DEFAULT_TLS_INSECURE = os.environ.get(
@@ -673,7 +699,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     ap.add_argument(
         "--token",
-        default=os.environ.get("MOESH_RELAY_TOKEN", ""),
+        default=os.environ.get(
+            "MOESH_RELAY_TOKEN", os.environ.get("MOESH_BRIDGE_RELAY_TOKEN", "")
+        ),
         help=(
             "Shared relay token required by the receiver when "
             "MOESH_BRIDGE_RELAY_TOKEN is set (or set MOESH_RELAY_TOKEN)"

@@ -360,14 +360,20 @@ def extract_carrier(hdrs: bytes, addr: tuple[str, int]) -> str:
     return "addr:" + peer_ip
 
 
+def get_relay_token() -> str:
+    """Return the active relay token from the environment or default."""
+    return os.environ.get("MOESH_BRIDGE_RELAY_TOKEN", RELAY_TOKEN)
+
+
 def relay_authorized(hdrs: bytes) -> bool:
     """Return True when the carrier presented the configured relay token."""
-    if not RELAY_TOKEN:
+    token = get_relay_token()
+    if not token:
         return True
     for line in hdrs.split(b"\r\n")[1:]:
         if line.lower().startswith(RELAY_AUTH_HEADER):
             presented = line.split(b":", 1)[1].strip().decode("latin-1", "replace")
-            return hmac.compare_digest(presented, RELAY_TOKEN)
+            return hmac.compare_digest(presented, token)
     return False
 
 
@@ -1054,7 +1060,7 @@ def bridge_status() -> dict[str, Any]:
 
     return {
         "ok": True,
-        "relay_auth": "token" if RELAY_TOKEN else "none",
+        "relay_auth": "token" if get_relay_token() else "none",
         "hosts": {
             "in_use": hosts_in_use,
             "details": host_details,
@@ -1594,6 +1600,7 @@ def pair(
     wait: int,
     on_detach: Callable[[], None] | None = None,
     on_pair: Callable[[], None] | None = None,
+    signal_dead: bool = False,
 ) -> None:
     """Pair one incoming connection with the oldest live tunnel in ``q``.
 
@@ -1607,6 +1614,9 @@ def pair(
     ``on_pair`` runs once when an active, live tunnel is paired with ``conn``,
     allowing callers to defer incrementing active pairing counts until an actual
     tunnel is acquired.
+    ``signal_dead`` when True sends PAIR_DEAD_MARKER to operator sessions upon
+    discarding a dead carrier; defaults to False so public relay sockets close
+    cleanly without framing corruption.
 
     Preconditions:
         ``conn`` is a connected client or peer socket.
@@ -1703,7 +1713,7 @@ def pair(
         log(f"{label} connected but no {label} tunnel within {wait}s")
         # If a dead tunnel was discarded along the way, signal the operator so
         # it retries immediately instead of waiting out its backoff.
-        if saw_dead:
+        if saw_dead and signal_dead:
             log(f"sending PAIR_DEAD_MARKER to {label} operator")
             with contextlib.suppress(OSError):
                 conn.sendall(PAIR_DEAD_MARKER)
@@ -1713,7 +1723,7 @@ def pair(
 
 def operator_conn(conn: socket.socket, addr: tuple[str, int]) -> None:
     """Pair one operator connection with the oldest v1 shell tunnel."""
-    pair(conn, _shell, "operator", 120)
+    pair(conn, _shell, "operator", 120, signal_dead=True)
 
 
 def read_host_label(conn: socket.socket) -> str:
@@ -1829,7 +1839,15 @@ def operator_v2_conn(conn: socket.socket, addr: tuple[str, int]) -> None:
             touch_host(host, -1)
 
     try:
-        pair(conn, q, f"operator-v2[{host}]", 120, on_detach=detach, on_pair=attach)
+        pair(
+            conn,
+            q,
+            f"operator-v2[{host}]",
+            120,
+            on_detach=detach,
+            on_pair=attach,
+            signal_dead=True,
+        )
     finally:
         detach()
 
@@ -1880,12 +1898,15 @@ def serve(
             with _connections_lock:
                 if _connections_active >= _MAX_CONNECTIONS:
                     with contextlib.suppress(OSError):
-                        refuse(
-                            raw_conn,
-                            "503 Service Unavailable",
-                            f"connection ceiling {_MAX_CONNECTIONS} reached "
-                            f"(active={_connections_active})",
-                        )
+                        if name == "tunnel":
+                            refuse(
+                                raw_conn,
+                                "503 Service Unavailable",
+                                f"connection ceiling {_MAX_CONNECTIONS} reached "
+                                f"(active={_connections_active})",
+                            )
+                        else:
+                            raw_conn.close()
                     continue
                 _connections_active += 1
                 counted = True
@@ -2003,7 +2024,7 @@ def main(argv: list[str] | None = None) -> int:
         log("error: both --tls-cert and --tls-key must be provided for TLS termination")
         return 1
 
-    if RELAY_TOKEN:
+    if get_relay_token():
         log("relay carrier authentication enabled (shared token)")
     else:
         log(
@@ -2062,7 +2083,7 @@ def main(argv: list[str] | None = None) -> int:
                         queue_ref,
                         f"relay:{port_num}",
                         20,
-                        on_detach=detach,
+                        on_detach=None,
                         on_pair=attach,
                     )
                 finally:

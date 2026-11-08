@@ -50,6 +50,8 @@ def test_operator_v2_touch_host_deferred_until_paired() -> None:
         wait: int,
         on_detach: Any = None,
         on_pair: Any = None,
+        signal_dead: bool = False,
+        **kwargs: Any,
     ) -> None:
         nonlocal observed_active_during_wait
         observed_active_during_wait = bridge._host_active.get(host, 0)
@@ -93,6 +95,8 @@ def test_operator_v2_timeout_does_not_leak_active() -> None:
         wait: int,
         on_detach: Any = None,
         on_pair: Any = None,
+        signal_dead: bool = False,
+        **kwargs: Any,
     ) -> None:
         raise queue.Empty()
 

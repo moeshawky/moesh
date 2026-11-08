@@ -1095,7 +1095,7 @@ def run_exec_session(
         Noise handshake is complete; accepted dictionary carries optional "command".
     Postconditions:
         Child process terminates; all stdout is sent as Msg.DATA;
-        Msg.EXIT is transmitted with child exit code; returns "closed".
+        Msg.EXIT is transmitted with child exit code or decoded signal status; returns "closed".
     Failure Modes:
         Catches BrokenPipeError/OSError on child writes and handles child timeout.
         Raises RuntimeError if standard pipes fail to allocate.
@@ -1262,8 +1262,13 @@ def run_exec_session(
             status = proc.wait()
 
     log(f"exec session finished: exit_code={status}")
+    exit_status = status
+    exit_signal = None
+    if status < 0:
+        exit_signal = -status
+        exit_status = 128 + exit_signal
     with contextlib.suppress(Exception):
-        secure.send_control(Msg.EXIT, {"status": status, "signal": None})
+        secure.send_control(Msg.EXIT, {"status": exit_status, "signal": exit_signal})
         secure.send_control(Msg.CLOSE, {"reason": "exec finished"})
     return "closed"
 
@@ -1665,7 +1670,11 @@ def fetch_status(host: str, port: int) -> dict[str, Any]:
 
 
 def resolve_auto_host(host: str, port: int) -> str:
-    """Query receiver status and return the lowest free ``<prefix>-<N>`` host name."""
+    """Query receiver status and return the lowest free ``<prefix>-<N>`` host name.
+
+    If status probe fails, logs a warning to stderr and selects a
+    non-deterministic fallback slot to avoid deterministic slot-1 collisions.
+    """
     prefix = (
         os.environ.get("MOESH_TUNNEL_PREFIX", "").strip()
         or os.environ.get("MOESH_TUNNEL_V2_PREFIX", "").strip()
@@ -1674,8 +1683,14 @@ def resolve_auto_host(host: str, port: int) -> str:
     try:
         data = fetch_status(host, port)
         in_use = set(data.get("hosts", {}).get("in_use", []))
-    except Exception:
-        in_use = set()
+    except Exception as exc:
+        sys.stderr.write(
+            f"[moesh-tunnel {time.strftime('%H:%M:%S')}] WARNING: auto-host status probe to "
+            f"{host}:{port} failed ({exc}); choosing fallback slot\n"
+        )
+        sys.stderr.flush()
+        fallback_slot = int.from_bytes(os.urandom(1), "big") % 90 + 10
+        return f"{prefix}-{fallback_slot}"
     for n in range(1, 256):
         cand = f"{prefix}-{n}"
         if cand not in in_use:
