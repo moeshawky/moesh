@@ -3,6 +3,12 @@
 All notable changes to `moesh`. The project is pre-1.0: behaviour may change
 between minor releases without a deprecation period.
 
+## 0.2.0b12 — 2026-11-08
+
+### Changed — release increment and roll-forward
+
+- **Release roll-forward (`pyproject.toml`, `moesh/__init__.py`).** Incremented version to `0.2.0b12` following verified `0.2.0b11` PyPI release.
+
 ## 0.2.0b11 — 2026-11-08
 
 ### Added — ports-only relay pool with agent-named ports
