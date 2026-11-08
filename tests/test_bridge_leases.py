@@ -652,3 +652,51 @@ def test_stale_host_lease_reaped_after_carrier_socket_closed(
         with contextlib.suppress(OSError):
             b.close()
 
+
+def test_moesh_relays_env_is_ignored_and_ports_only_pool_governs(
+    bridge_mod: Any, monkeypatch: Any
+) -> None:
+    """MOESH_RELAYS static mapping is ignored; pure ports-only pool governs and agent names its port."""
+    monkeypatch.setenv("MOESH_RELAYS", "gpu:26500,vllm:26503")
+    monkeypatch.setenv("MOESH_RELAY_PORTS", "26500-26505")
+
+    # 1. bridge_mod has no relay_services attribute
+    assert not hasattr(bridge_mod, "relay_services"), (
+        "relay_services() must be removed from moesh-bridge"
+    )
+
+    # 2. gpu_ports() returns strictly parsed port spec from MOESH_RELAY_PORTS, ignoring MOESH_RELAYS
+    ports = bridge_mod.gpu_ports()
+    assert ports == (26500, 26501, 26502, 26503, 26504, 26505)
+
+    # 3. Bind ports into _bound_relay_ports
+    for p in ports:
+        bridge_mod._bound_relay_ports.add(p)
+
+    a1, b1 = _sock_pair()
+    a2, b2 = _sock_pair()
+    try:
+        # Agent claims 'auto': gets 26500 without 'gpu' reserving it
+        assigned_port, reason, entry = bridge_mod.admit_relay(
+            "auto", "carrier-auto", 0, a1
+        )
+        assert reason is None, f"admission failed: {reason}"
+        assert assigned_port == 26500
+        assert entry is not None
+        entry.ready.set()
+
+        # Another agent claims 'vllm' on port 26501: binds 'vllm' to agent-chosen port 26501
+        # (not hijacked to 26503 by legacy MOESH_RELAYS static mapping)
+        assigned_port2, reason2, entry2 = bridge_mod.admit_relay(
+            "vllm", "carrier-vllm", 26501, a2
+        )
+        assert reason2 is None, f"admission failed: {reason2}"
+        assert assigned_port2 == 26501
+        assert entry2 is not None
+        entry2.ready.set()
+        assert bridge_mod._port_leases[26501]["name"] == "vllm"
+    finally:
+        for s in (a1, b1, a2, b2):
+            with contextlib.suppress(OSError):
+                s.close()
+

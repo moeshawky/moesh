@@ -15,15 +15,17 @@ Postconditions:
     Once a 101 is sent, the connection becomes a raw byte pipe and is queued
     by path.  The operator socket on 127.0.0.1:44440 pops only the v1 shell
     queue; the operator socket on 127.0.0.1:44441 pops only the v2 shell
-    queue; each connection on a public port named in ``MOESH_RELAYS`` only
-    sees the ``/__relay/<service>`` queue mapped to that port and is spliced
-    to it.  A second carrier dialing a service that a live carrier holds is
-    refused with ``409 Conflict`` and a reason.  Bytes are relayed both ways
-    until either side closes.
+    queue; each connection on a public relay port in ``MOESH_RELAY_PORTS``
+    (default ``26420-26430``) pops the port-keyed ``_relays[str(port)]``
+    queue where the agent optionally names its leased port.  A second carrier
+    dialing a service or port that a live carrier holds is refused with
+    ``409 Conflict`` and a reason.  Bytes are relayed both ways until either
+    side closes.
 Side effects:
     Listens on 127.0.0.1:9447 (tunnel), 127.0.0.1:44440 (operator v1),
-    127.0.0.1:44441 (operator v2) and the public ports named in
-    ``MOESH_RELAYS`` (relay; none by default).  Writes one log line per
+    127.0.0.1:44441 (operator v2) and the public relay ports configured via
+    ``MOESH_RELAY_PORTS`` (default ``26420-26430``; fallback
+    ``MOESH_BRIDGE_GPU_PORTS``).  Writes one log line per
     transition.  A port that is already bound is logged and skipped; the
     remaining listeners stay up.
 Notes:
@@ -707,7 +709,6 @@ def _resolve_relay_locked(
     requested_port: int,
     bound: list[int],
     unavail: dict[int, str],
-    static_map: dict[str, int],
 ) -> tuple[int, str, str | None]:
     """Resolve a relay request to ``(port, lease_name, reason)`` under the lock."""
     if not bound and not unavail:
@@ -742,16 +743,12 @@ def _resolve_relay_locked(
                         f"no free relay ports available; open ports: "
                         f"{', '.join(str(p) for p in bound)}",
                     )
-                static_ports = set(static_map.values())
-                unreserved = [p for p in free if p not in static_ports]
-                port = unreserved[0] if unreserved else free[0]
+                port = free[0]
         lease_name = str(port)
     elif svc.isdigit():
         port = int(svc)
     elif requested_port > 0:
         port = requested_port
-    elif svc in static_map:
-        port = static_map[svc]
     else:
         existing = _leases.get(svc)
         if existing is not None and int(existing.get("port", 0)) in bound:
@@ -765,9 +762,7 @@ def _resolve_relay_locked(
                     f"no free relay ports available for {svc!r}; open ports: "
                     f"{', '.join(str(p) for p in bound)}",
                 )
-            static_ports = set(static_map.values())
-            unreserved = [p for p in free if p not in static_ports]
-            port = unreserved[0] if unreserved else free[0]
+            port = free[0]
 
     summary = _free_ports_summary_locked(bound)
     if port in unavail:
@@ -889,12 +884,11 @@ def resolve_and_claim_relay(
 
     Returns ``(queue, assigned_port, error_reason)``.
     """
-    static_map = relay_services()
     with _leases_lock:
         bound = sorted(_bound_relay_ports)
         unavail = dict(_unavailable_ports)
         port, lease_name, reason = _resolve_relay_locked(
-            svc, carrier, requested_port, bound, unavail, static_map
+            svc, carrier, requested_port, bound, unavail
         )
         key = str(port) if port > 0 else svc
         q = _relay_queue_locked(key)
@@ -939,12 +933,11 @@ def admit_relay(
         Returns error reason if relay registry is full, port/service is in use by
         another carrier, or the relay queue is full.
     """
-    static_map = relay_services()
     with _leases_lock:
         bound = sorted(_bound_relay_ports)
         unavail = dict(_unavailable_ports)
         port, lease_name, reason = _resolve_relay_locked(
-            svc, carrier, requested_port, bound, unavail, static_map
+            svc, carrier, requested_port, bound, unavail
         )
         key = str(port) if port > 0 else svc
         q = _relay_queue_locked(key)
@@ -1967,24 +1960,6 @@ def parse_port_spec(spec: str) -> list[int]:
     return sorted(ports)
 
 
-def relay_services() -> dict[str, int]:
-    """Return optional static ``name:port`` aliases from ``MOESH_RELAYS``."""
-    if os.environ.get("MOESH_BRIDGE_GPU_PORTS") == "" and "MOESH_RELAYS" not in os.environ:
-        return {}
-    raw = os.environ.get("MOESH_RELAYS", "")
-    services: dict[str, int] = {}
-    for item in raw.split(","):
-        item = item.strip()
-        if not item or ":" not in item:
-            continue
-        name, _, port_str = item.partition(":")
-        try:
-            services[name.strip()] = int(port_str.strip())
-        except ValueError:
-            continue
-    return services
-
-
 def gpu_ports() -> tuple[int, ...]:
     """Return the public relay ports configured for the bridge."""
     if "MOESH_RELAY_PORTS" in os.environ:
@@ -1993,11 +1968,7 @@ def gpu_ports() -> tuple[int, ...]:
         raw = os.environ["MOESH_BRIDGE_GPU_PORTS"]
     else:
         raw = DEFAULT_RELAY_PORTS
-    ports = set(parse_port_spec(raw))
-    for p in relay_services().values():
-        if 0 < p <= 65535:
-            ports.add(p)
-    return tuple(sorted(ports))
+    return tuple(parse_port_spec(raw))
 
 
 def main(argv: list[str] | None = None) -> int:

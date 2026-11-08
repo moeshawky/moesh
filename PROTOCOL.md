@@ -36,7 +36,7 @@ operator terminal ──TCP 127.0.0.1:44441──▶ moesh-bridge.py ──TCP/8
   no nginx code changes. The *route* requires proxy configuration: an nginx
   fronting a deployment proxies `/__moesh/tunnel` to the bridge's tunnel port,
   and `/__relay/<service>` routes to the same bridge port.
-* The reverse service relays (`/__relay/<service>`, configured via `MOESH_RELAYS`)
+* The reverse service relays (`/__relay/<port>` or `/__relay/auto`, configured via `MOESH_RELAY_PORTS`)
   allow remote compute sidecars (vLLM, GPU runners, embeddings) to expose TCP
   listeners on the receiver without inbound ports on the accelerator machine.
 
@@ -282,7 +282,7 @@ The bridge keeps three distinct queue structures:
 |---|---|---|
 | `_shell` | `Upgrade: websocket` on `/__tunnel/v1` (legacy v1) | operator port 44440 |
 | `_shell_v2` | `Upgrade: moesh-tunnel-v2` on `/__moesh/tunnel` | operator port 44441 (used by `moesh_shell` and `moecp`) |
-| `_relays[service]` | `Upgrade: moesh-tunnel-v2` or `websocket` on `/__relay/<service>` | Dedicated TCP listening ports configured via `MOESH_RELAYS` |
+| `_relays[service]` | `Upgrade: moesh-tunnel-v2` or `websocket` on `/__relay/<service>` or `/__relay/<port>` | Public TCP listening ports configured via `MOESH_RELAY_PORTS` |
 
 Separate queues ensure an encrypted v2 operator cannot be paired with a v1 tunnel.
 `MOESH_BRIDGE_ALLOW_V1=0` refuses the legacy v1 shell path while leaving v2 and reverse relays untouched.
@@ -292,7 +292,7 @@ default (`MOESH_BRIDGE_ALLOW_V1=1`) is reconsidered only when compatibility
 costs and adoption justify it. There is no removal date and no version promise.
 
 Environment knobs: `MOESH_BRIDGE_TUNNEL_LISTEN`, `MOESH_BRIDGE_OPERATOR_LISTEN`,
-`MOESH_BRIDGE_OPERATOR_V2_LISTEN`, `MOESH_RELAYS`, `MOESH_BRIDGE_GPU_PORTS`, `MOESH_BRIDGE_ALLOW_V1`,
+`MOESH_BRIDGE_OPERATOR_V2_LISTEN`, `MOESH_RELAY_PORTS`, `MOESH_BRIDGE_GPU_PORTS`, `MOESH_BRIDGE_ALLOW_V1`,
 `MOESH_BRIDGE_TRUSTED_PROXIES`, `MOESH_BRIDGE_TLS_CERT`, `MOESH_BRIDGE_TLS_KEY`.
 
 ### 9.1 Carrier leases and generation counters

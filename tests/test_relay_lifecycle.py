@@ -543,3 +543,158 @@ def test_relay_bare_domain_url_synthesizes_routing_path(monkeypatch: Any) -> Non
     logs.clear()
     moesh_relay.main(["--url", "http://127.0.0.1:8080/__relay/custom", "--workers", "1"])
     assert any("path=/__relay/custom" in line for line in logs)
+
+
+def test_relay_name_flags_and_env_set_service_label(monkeypatch: Any) -> None:
+    """--name, -n, and MOESH_RELAY_NAME set the relay service label identically to --service."""
+    logs: list[str] = []
+    monkeypatch.setattr(moesh_relay, "log", logs.append)
+    monkeypatch.setattr(threading.Thread, "start", lambda self: None)
+    monkeypatch.setattr(threading.Event, "wait", lambda self: True)
+
+    # 1. --name sets path=/__relay/<name>
+    moesh_relay.main(["--url", "http://127.0.0.1:8080", "--name", "vllm-llama", "--workers", "1"])
+    assert any("path=/__relay/vllm-llama" in line for line in logs)
+
+    # 2. -n sets path=/__relay/<name>
+    logs.clear()
+    moesh_relay.main(["--url", "http://127.0.0.1:8080", "-n", "embed-svc", "--workers", "1"])
+    assert any("path=/__relay/embed-svc" in line for line in logs)
+
+    # 3. MOESH_RELAY_NAME env var sets label when flags omitted
+    logs.clear()
+    monkeypatch.setenv("MOESH_RELAY_NAME", "env-named-svc")
+    moesh_relay.main(["--url", "http://127.0.0.1:8080", "--workers", "1"])
+    assert any("path=/__relay/env-named-svc" in line for line in logs)
+
+    # 4. Backward compatibility: --service still works
+    logs.clear()
+    monkeypatch.delenv("MOESH_RELAY_NAME", raising=False)
+    moesh_relay.main(["--url", "http://127.0.0.1:8080", "--service", "legacy-svc", "--workers", "1"])
+    assert any("path=/__relay/legacy-svc" in line for line in logs)
+
+    # 5. Backward compatibility: MOESH_RELAY_SERVICE env var works
+    logs.clear()
+    monkeypatch.setenv("MOESH_RELAY_SERVICE", "legacy-env-svc")
+    moesh_relay.main(["--url", "http://127.0.0.1:8080", "--workers", "1"])
+    assert any("path=/__relay/legacy-env-svc" in line for line in logs)
+
+
+def test_relay_registers_with_name_flag_and_bridge_status_reports_label_e2e(
+    tmp_path: Path,
+) -> None:
+    """moesh-relay registering with --name or -n exposes the label in GET /__moesh/status."""
+    def dummy_handler(conn: socket.socket) -> None:
+        while conn.recv(4096):
+            pass
+
+    server = Server(dummy_handler).start()
+    relay_port1 = free_port()
+    relay_port2 = free_port()
+
+    tunnel_port, operator_port, operator_v2_port = next_ports()
+    bridge = Bridge(
+        tunnel_port,
+        operator_port,
+        operator_v2_port,
+        env_extra={"MOESH_RELAY_PORTS": f"{relay_port1},{relay_port2}"},
+    )
+    bridge._wait_for_line(f"relay-{relay_port1} listening")
+    bridge._wait_for_line(f"relay-{relay_port2} listening")
+
+    root = Path(__file__).resolve().parent.parent
+    relay_py = root / "moesh_relay.py"
+
+    log1_path = tmp_path / "relay_name1.log"
+    log2_path = tmp_path / "relay_name2.log"
+
+    proc1: subprocess.Popen[bytes] | None = None
+    proc2: subprocess.Popen[bytes] | None = None
+    try:
+        with (
+            open(log1_path, "w+", encoding="utf-8") as log1,
+            open(log2_path, "w+", encoding="utf-8") as log2,
+        ):
+            # 1. Start worker 1 registering with --name
+            proc1 = subprocess.Popen(
+                [
+                    AGENT_PYTHON,
+                    str(relay_py),
+                    "--receiver",
+                    "127.0.0.1",
+                    "--port",
+                    str(tunnel_port),
+                    "-R",
+                    str(relay_port1),
+                    "--name",
+                    "vllm-llama3-svc",
+                    "--target",
+                    f"127.0.0.1:{server.port}",
+                    "--id",
+                    "carrier-name1",
+                    "--workers",
+                    "1",
+                ],
+                stdout=log1,
+                stderr=subprocess.STDOUT,
+            )
+
+            # 2. Start worker 2 registering with -n
+            proc2 = subprocess.Popen(
+                [
+                    AGENT_PYTHON,
+                    str(relay_py),
+                    "--receiver",
+                    "127.0.0.1",
+                    "--port",
+                    str(tunnel_port),
+                    "-R",
+                    str(relay_port2),
+                    "-n",
+                    "embed-mini-svc",
+                    "--target",
+                    f"127.0.0.1:{server.port}",
+                    "--id",
+                    "carrier-name2",
+                    "--workers",
+                    "1",
+                ],
+                stdout=log2,
+                stderr=subprocess.STDOUT,
+            )
+
+            bridge._wait_for_line(f"path /__relay/vllm-llama3-svc port {relay_port1}")
+            bridge._wait_for_line(f"path /__relay/embed-mini-svc port {relay_port2}")
+
+            # 3. Query bridge GET /__moesh/status over HTTP
+            status = moesh_relay.fetch_status("127.0.0.1", tunnel_port)
+            assert status["ok"] is True
+
+            ports_in_use = status["relay"]["ports_in_use"]
+            names_in_use = status["relay"]["names_in_use"]
+
+            # Assert --name registered cleanly
+            assert str(relay_port1) in ports_in_use, (
+                f"port {relay_port1} missing from ports_in_use: {ports_in_use}"
+            )
+            assert ports_in_use[str(relay_port1)]["name"] == "vllm-llama3-svc"
+            assert names_in_use.get("vllm-llama3-svc") == relay_port1
+
+            # Assert -n registered cleanly
+            assert str(relay_port2) in ports_in_use, (
+                f"port {relay_port2} missing from ports_in_use: {ports_in_use}"
+            )
+            assert ports_in_use[str(relay_port2)]["name"] == "embed-mini-svc"
+            assert names_in_use.get("embed-mini-svc") == relay_port2
+    finally:
+        if proc1 is not None and proc1.poll() is None:
+            proc1.terminate()
+            with contextlib.suppress(Exception):
+                proc1.wait(timeout=2.0)
+        if proc2 is not None and proc2.poll() is None:
+            proc2.terminate()
+            with contextlib.suppress(Exception):
+                proc2.wait(timeout=2.0)
+        bridge.stop()
+        server.stop()
+

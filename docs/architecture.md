@@ -81,9 +81,9 @@ agent host                                  receiver                    operator
   `MOESH_TUNNEL_SESSIONS`, three by default (`moesh_tunnel.py:1694`).
   Each worker holds one connection to the receiver and serves whoever claims
   it (`moesh_tunnel.py:1210-1280`).
-* The receiver keeps one queue per host name (`moesh-bridge.py:84-100`) and
+* The receiver keeps one queue per host name (`moesh-bridge.py:95-120`) and
   pairs an operator with the oldest **live** tunnel in that queue
-  (`moesh-bridge.py:1240-1340`). A tunnel that died while queued is discarded
+  (`moesh-bridge.py:1590-1712`). A tunnel that died while queued is discarded
   rather than paired.
 * The agent's shell pool hands out one shell per session (`moesh_tunnel.py:738-868`).
   A detached shell is kept and given to the next operator; `--fresh` asks for a

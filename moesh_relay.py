@@ -629,9 +629,15 @@ def main(argv: list[str] | None = None) -> int:
         help="Remote port on receiver to expose (e.g. 26426, or 'auto' for any free port)",
     )
     ap.add_argument(
+        "--name",
+        "-n",
         "--service",
-        default=os.environ.get("MOESH_RELAY_SERVICE", ""),
-        help="Optional relay label/name (e.g. 'web' or port number; default: auto)",
+        dest="service",
+        default=(
+            os.environ.get("MOESH_RELAY_NAME")
+            or os.environ.get("MOESH_RELAY_SERVICE", "")
+        ),
+        help="Optional agent-defined name for the leased relay port (default: port number or auto)",
     )
     ap.add_argument(
         "--receiver",
