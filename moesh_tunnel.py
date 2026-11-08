@@ -518,8 +518,17 @@ class HostShell:
     buffer for the next operator.
     """
 
-    def __init__(self, max_buffer: int = DETACHED_BUFFER) -> None:
-        """Initializes a shell with no process (pid/fd None), CREATED state, empty output buffer, zero dropped bytes, given max_buffer (default DETACHED_BUFFER), and default terminal dimensions from proto; no process is spawned until spawn()."""
+    def __init__(
+        self,
+        max_buffer: int = DETACHED_BUFFER,
+        owner_key: bytes | None = None,
+    ) -> None:
+        """Initializes a shell with CREATED state, bounded buffer, and optional owner key.
+
+        Args:
+            max_buffer: Maximum bytes held in memory while detached (default DETACHED_BUFFER).
+            owner_key: Optional 32-byte static public key of the owning operator.
+        """
         self.pid: int | None = None
         self.fd: int | None = None
         self.proc: subprocess.Popen[bytes] | None = None
@@ -528,6 +537,7 @@ class HostShell:
         self.buffer = bytearray()
         self.dropped = 0
         self.max_buffer = max_buffer
+        self.owner_key: bytes | None = owner_key
         self.term = proto.DEFAULT_TERM
         self.rows = proto.DEFAULT_ROWS
         self.cols = proto.DEFAULT_COLS
@@ -929,12 +939,19 @@ class ShellPool:
         self._busy.discard(id(shell))
         shell.terminate()
 
-    def acquire(self, fresh: bool) -> HostShell:
+    def acquire(self, fresh: bool, owner_key: bytes | None = None) -> HostShell:
         """Return a shell for a new session.
 
         A fresh session always gets its own shell.  Otherwise the most
-        recently used idle shell is re-attached to, the way tmux does on
-        attach; if there is none, a new one is created.
+        recently used idle shell matching owner_key is re-attached to,
+        the way tmux does on attach; if there is none, a new one is created.
+
+        Args:
+            fresh: When True, allocates an unattached fresh shell.
+            owner_key: Optional 32-byte operator static public key for identity matching.
+
+        Returns:
+            The acquired HostShell instance bound to the caller.
         """
         with self._cond:
             if not fresh:
@@ -943,9 +960,13 @@ class ShellPool:
                         continue
                     if not shell.alive:
                         continue
+                    if shell.owner_key is not None and shell.owner_key != owner_key:
+                        continue
+                    if shell.owner_key is None and owner_key is not None:
+                        shell.owner_key = owner_key
                     self._busy.add(id(shell))
                     return shell
-            shell = HostShell()
+            shell = HostShell(owner_key=owner_key)
             self._shells.append(shell)
             self._busy.add(id(shell))
             return shell
@@ -1077,6 +1098,7 @@ def run_exec_session(
         Msg.EXIT is transmitted with child exit code; returns "closed".
     Failure Modes:
         Catches BrokenPipeError/OSError on child writes and handles child timeout.
+        Raises RuntimeError if standard pipes fail to allocate.
     """
     command = accepted.get("command")
     log(f"exec session active: command={command!r}")
@@ -1100,8 +1122,8 @@ def run_exec_session(
         env=child_env,
         start_new_session=True,
     )
-    assert proc.stdout is not None
-    assert proc.stdin is not None
+    if proc.stdout is None or proc.stdin is None:
+        raise RuntimeError("exec session failed: subprocess pipe allocation failed")
 
     stdout_fd = proc.stdout.fileno()
     os.set_blocking(stdout_fd, False)
@@ -1285,7 +1307,8 @@ def negotiate(
     fresh = bool(hello.get("fresh_session"))
     # The shell is chosen only now: the HELLO is what says whether this
     # session wants a fresh shell or the running one.
-    shell = pool.acquire(fresh)
+    owner_key = secure.session.peer_static
+    shell = pool.acquire(fresh, owner_key=owner_key)
     success = False
     try:
         resumed = bool(shell.alive and not fresh)

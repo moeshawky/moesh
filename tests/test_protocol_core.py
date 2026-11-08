@@ -749,3 +749,92 @@ def test_sigwinch_restoration_in_run_session() -> None:
         os.close(w_out)
         signal.signal(signal.SIGWINCH, old_handler)
 
+
+def test_verify_agent_key_single_and_tuple_pins() -> None:
+    """verify_agent_key matches single pins and tuple candidate sets (RC-04)."""
+    key = b"A" * 32
+    other_key = b"B" * 32
+
+    # Single pin match and mismatch
+    assert proto.verify_agent_key(key, key) is True
+    assert proto.verify_agent_key(key, other_key) is False
+
+    # Bytearray support
+    assert proto.verify_agent_key(key, bytearray(key)) is True
+
+    # Candidate tuple match and mismatch
+    pin_tuple = (b"C" * 32, key, b"D" * 32)
+    assert proto.verify_agent_key(key, pin_tuple) is True
+    assert proto.verify_agent_key(other_key, pin_tuple) is False
+    assert proto.verify_agent_key(key, ()) is False
+
+
+def test_verify_operator_key_matches_agent_key_semantics() -> None:
+    """verify_operator_key validates operator public keys using identical pin semantics (RC-04)."""
+    key = b"X" * 32
+    other_key = b"Y" * 32
+
+    assert proto.verify_operator_key(key, key) is True
+    assert proto.verify_operator_key(key, other_key) is False
+    assert proto.verify_operator_key(key, (other_key, key)) is True
+    assert proto.verify_operator_key(key, (other_key,)) is False
+
+
+def test_noise_session_peer_static_learned_key() -> None:
+    """NoiseSession.peer_static exposes the verified peer public key upon handshake completion (RC-03)."""
+    left, right = socket.socketpair()
+    try:
+        init_session = proto.NoiseSession("initiator", PRIVATE_A, PUBLIC_B)
+        resp_session = proto.NoiseSession("responder", PRIVATE_B, PUBLIC_A)
+
+        # Before handshake completes, peer_static raises AuthenticationError
+        with pytest.raises(AuthenticationError, match="peer static key unavailable"):
+            _ = init_session.peer_static
+
+        with pytest.raises(AuthenticationError, match="peer static key unavailable"):
+            _ = resp_session.peer_static
+
+        # Complete the handshake
+        t1 = threading.Thread(target=_initiator, args=(left, init_session), daemon=True)
+        t2 = threading.Thread(target=_responder, args=(right, resp_session), daemon=True)
+        t1.start()
+        t2.start()
+        t1.join(timeout=5.0)
+        t2.join(timeout=5.0)
+
+        assert init_session.authenticated is True
+        assert resp_session.authenticated is True
+        assert init_session.peer_static == PUBLIC_B
+        assert resp_session.peer_static == PUBLIC_A
+    finally:
+        left.close()
+        right.close()
+
+
+def test_shell_pool_acquire_owner_key_isolation() -> None:
+    """ShellPool isolates shells between distinct operator keys on re-attach (RC-03)."""
+    pool = agent.ShellPool(max_idle=5)
+    key_alice = b"A" * 32
+    key_bob = b"B" * 32
+
+    try:
+        # Alice acquires a shell and releases it
+        shell_alice = pool.acquire(fresh=True, owner_key=key_alice)
+        shell_alice.state = agent.ShellState.RUNNING
+        shell_alice.pid = 12345
+        shell_alice.fd = 99
+        pool.release(shell_alice)
+
+        # Bob attempts non-fresh acquire: must NOT hijack Alice's idle shell
+        shell_bob = pool.acquire(fresh=False, owner_key=key_bob)
+        assert shell_bob is not shell_alice
+        assert shell_bob.owner_key == key_bob
+        pool.release(shell_bob)
+
+        # Alice re-attaches: gets her own shell back
+        shell_alice_reconnect = pool.acquire(fresh=False, owner_key=key_alice)
+        assert shell_alice_reconnect is shell_alice
+        pool.release(shell_alice_reconnect)
+    finally:
+        pool.terminate_all()
+

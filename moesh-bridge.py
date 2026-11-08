@@ -223,6 +223,11 @@ RELAY_PORT_HEADER = b"x-moesh-relay-port:"
 RELAY_AUTH_HEADER = b"x-moesh-relay-auth:"
 RELAY_PAIRING_HEADER = b"x-moesh-relay-pairing:"
 RELAY_LEASE_GRACE = float(os.environ.get("MOESH_BRIDGE_LEASE_GRACE", "1.5"))
+LEASE_TTL = float(os.environ.get("MOESH_BRIDGE_LEASE_TTL", "0"))
+"""Maximum lease lifetime in seconds (0 = disabled). Leases older than this with no active pairings are reaped."""
+
+REAPER_INTERVAL = float(os.environ.get("MOESH_BRIDGE_REAPER_INTERVAL", "5.0"))
+"""Interval in seconds between background sweeps for stale leases (0 = disabled)."""
 
 # Relay carriers are admitted by name, and until now any client that could
 # reach the tunnel listener could claim one.  When this token is set, a relay
@@ -258,6 +263,8 @@ _lease_gens: dict[str, int] = {}
 _leases_lock = threading.Lock()
 _relay_active: dict[str, int] = {}
 _host_active: dict[str, int] = {}
+_reaper_stop = threading.Event()
+_reaper_thread: threading.Thread | None = None
 
 TRUSTED_PROXIES: frozenset[str] = frozenset(
     ip.strip()
@@ -451,6 +458,135 @@ def _busy_locked(
     return time.time() - float(lease["seen"]) < RELAY_LEASE_GRACE
 
 
+def reap_stale_leases() -> int:
+    """Purge dead carrier sockets and reap unbusy or expired relay and host leases.
+
+    Measured 2026-11-08: a carrier dying without clean TCP FIN or abandoning its
+    registered relay slot previously left _leases and _port_leases held forever
+    (Ticket TICKET-relay-stale-lease-port-26500.md), stranding the port until
+    bridge restart. This sweep purges dead sockets via live_queued() and pops
+    stale leases whose grace period has expired or whose age exceeds LEASE_TTL.
+    Healthy standby carriers currently queued are preserved: a lease is only
+    reaped via LEASE_TTL when both queued and active carrier counts are zero.
+
+    Returns:
+        The total count of reaped leases.
+    """
+    reaped = 0
+    now = time.time()
+    with _leases_lock:
+        # 1. Sweep relay port leases
+        for port, port_lease in list(_port_leases.items()):
+            key = str(port)
+            q = _relays.get(key)
+            queued = live_queued(q) if q is not None else 0
+            active = _relay_active.get(key, 0)
+            seen = float(port_lease.get("seen", port_lease.get("since", 0)))
+            ttl_expired = (
+                LEASE_TTL > 0
+                and (now - seen >= LEASE_TTL)
+                and queued == 0
+                and active == 0
+            )
+            unbusy = not _busy_locked(key, q, port_lease)
+            if ttl_expired or unbusy:
+                if q is not None and not q.empty():
+                    with q.mutex:
+                        items = list(q.queue)
+                        q.queue.clear()
+                    for it in items:
+                        with contextlib.suppress(OSError):
+                            _sock_of(it).close()
+                _port_leases.pop(port, None)
+                svc_name = str(port_lease.get("name", ""))
+                if (
+                    svc_name
+                    and svc_name in _leases
+                    and _leases[svc_name].get("port") == port
+                ):
+                    _leases.pop(svc_name, None)
+                reaped += 1
+                log(f"reaped stale relay lease on port {port} (service {svc_name!r})")
+
+        # 2. Sweep orphan or unassigned relay service leases
+        for svc, svc_lease in list(_leases.items()):
+            p = int(svc_lease.get("port", 0))
+            if p > 0:
+                if p not in _port_leases:
+                    _leases.pop(svc, None)
+                    reaped += 1
+            else:
+                key = svc
+                q = _relays.get(key)
+                if q is not None:
+                    live_queued(q)
+                if not _busy_locked(key, q, svc_lease):
+                    _leases.pop(svc, None)
+                    reaped += 1
+
+        # 3. Sweep host leases (v2 shell tunnels)
+        for host, host_lease in list(_host_leases.items()):
+            with _registry_lock:
+                hq = _shell_v2.get(host)
+            queued = live_queued(hq) if hq is not None else 0
+            active = _host_active.get(host, 0)
+            seen = float(host_lease.get("seen", host_lease.get("since", 0)))
+            ttl_expired = (
+                LEASE_TTL > 0
+                and (now - seen >= LEASE_TTL)
+                and queued == 0
+                and active == 0
+            )
+            if (queued == 0 and active == 0 and now - seen >= RELAY_LEASE_GRACE) or ttl_expired:
+                if hq is not None and not hq.empty():
+                    with hq.mutex:
+                        items = list(hq.queue)
+                        hq.queue.clear()
+                    for it in items:
+                        with contextlib.suppress(OSError):
+                            _sock_of(it).close()
+                _host_leases.pop(host, None)
+                reaped += 1
+                log(f"reaped stale host lease for {host!r}")
+
+    return reaped
+
+
+def _reaper_loop(interval: float) -> None:
+    """Background worker loop executing reap_stale_leases on a periodic interval."""
+    while not _reaper_stop.wait(interval):
+        try:
+            reap_stale_leases()
+        except Exception as exc:
+            log(f"reaper error: {exc!r}")
+
+
+def start_reaper(interval: float | None = None) -> threading.Thread | None:
+    """Start background daemon reaper thread if not already running."""
+    global _reaper_thread
+    iv = REAPER_INTERVAL if interval is None else interval
+    if iv <= 0:
+        return None
+    with _leases_lock:
+        if _reaper_thread is not None and _reaper_thread.is_alive():
+            return _reaper_thread
+        _reaper_stop.clear()
+        t = threading.Thread(
+            target=_reaper_loop,
+            args=(iv,),
+            name="moesh-lease-reaper",
+            daemon=True,
+        )
+        _reaper_thread = t
+        t.start()
+        return t
+
+
+def stop_reaper() -> None:
+    """Signal background reaper thread to stop."""
+    _reaper_stop.set()
+
+
 def _free_ports_locked(bound: list[int]) -> list[int]:
     """Return bound ports with no live owner; caller holds the lock."""
     free: list[int] = []
@@ -587,17 +723,28 @@ def _resolve_relay_locked(
                 port = candidate
                 break
         if port == 0:
-            free = _free_ports_locked(bound)
-            if not free:
-                return (
-                    0,
-                    svc,
-                    f"no free relay ports available; open ports: "
-                    f"{', '.join(str(p) for p in bound)}",
-                )
-            static_ports = set(static_map.values())
-            unreserved = [p for p in free if p not in static_ports]
-            port = unreserved[0] if unreserved else free[0]
+            if requested_port > 0 and requested_port in bound:
+                req_lease = _port_leases.get(requested_port)
+                if (
+                    req_lease is None
+                    or req_lease["id"] == carrier
+                    or not _busy_locked(
+                        str(requested_port), _relays.get(str(requested_port)), req_lease
+                    )
+                ):
+                    port = requested_port
+            if port == 0:
+                free = _free_ports_locked(bound)
+                if not free:
+                    return (
+                        0,
+                        svc,
+                        f"no free relay ports available; open ports: "
+                        f"{', '.join(str(p) for p in bound)}",
+                    )
+                static_ports = set(static_map.values())
+                unreserved = [p for p in free if p not in static_ports]
+                port = unreserved[0] if unreserved else free[0]
         lease_name = str(port)
     elif svc.isdigit():
         port = int(svc)
@@ -712,6 +859,10 @@ def _claim_relay_locked(
         name_lease["seen"] = now
         name_lease["port"] = port
     if port > 0:
+        if port_lease is not None and port_lease.get("name") and port_lease["name"] != svc:
+            prev_svc = str(port_lease["name"])
+            if prev_svc in _leases and _leases[prev_svc].get("port") == port:
+                _leases.pop(prev_svc, None)
         if port_lease is None or port_lease["id"] != carrier:
             _port_leases[port] = {
                 "id": carrier,
@@ -1521,7 +1672,10 @@ def pair(
                     nb.close()
                 continue
             paired = True
-        assert nb is not None and item is not None
+        if nb is None or item is None:
+            raise RuntimeError(
+                f"pairing failed: expected valid tunnel socket and item for {label}"
+            )
         nb = _sock_of(item)
         log(f"pairing {label} with a host")
         if on_pair is not None:
@@ -1957,6 +2111,7 @@ def main(argv: list[str] | None = None) -> int:
         ).start()
     # No listener owns the main thread: a bind conflict on one port must not
     # take down the other ten. SIGTERM still ends the process.
+    start_reaper()
     time.sleep(0.25)
     with _listeners_lock:
         up = _listeners_up

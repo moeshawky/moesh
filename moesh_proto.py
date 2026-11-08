@@ -489,6 +489,7 @@ class NoiseSession:
         # Keep our own reference: the library deletes handshake_state once the
         # handshake completes, and the learned peer static lives there.
         self._handshake_state = self._conn.noise_protocol.handshake_state
+        self._learned_peer_static: bytes | None = None
         self._pin_checked = False
         self._authenticated = False
 
@@ -506,6 +507,20 @@ class NoiseSession:
     def authenticated(self) -> bool:
         """True once the peer static key matched the pin."""
         return self._authenticated
+
+    @property
+    def peer_static(self) -> bytes:
+        """The 32-byte static public key of the remote peer learned during handshake.
+
+        Returns:
+            The raw 32-byte public key verified against the pinned identities.
+
+        Raises:
+            AuthenticationError: if the session has not completed mutual key authentication.
+        """
+        if not self._authenticated or self._learned_peer_static is None:
+            raise AuthenticationError("peer static key unavailable: session unauthenticated")
+        return self._learned_peer_static
 
     def handshake_hash(self) -> bytes:
         """The 32-byte Noise handshake hash; both peers must agree on it."""
@@ -557,6 +572,7 @@ class NoiseSession:
             raise AuthenticationError(
                 f"peer static key mismatch: pinned [{expected}], learned {hashlib.sha256(learned_bytes).hexdigest()[:16]}"
             )
+        self._learned_peer_static = learned_bytes
         self._pin_checked = True
         self._authenticated = True
 
@@ -948,12 +964,14 @@ def generate_keypair() -> tuple[bytes, bytes]:
     return generate_static_keypair()
 
 
-def verify_agent_key(peer_static: bytes, pin: bytes | tuple[bytes, ...]) -> bool:
+def verify_agent_key(
+    peer_static: bytes, pin: bytes | bytearray | tuple[bytes | bytearray, ...]
+) -> bool:
     """Verify an agent static public key against the expected pin.
 
     Args:
         peer_static: 32 raw bytes of learned peer public key.
-        pin: 32 raw bytes, or tuple of 32-byte candidates.
+        pin: 32 raw bytes, bytearray, or tuple of 32-byte candidates.
 
     Returns:
         True if peer_static matches pin (or any candidate in pin), False otherwise.
@@ -966,12 +984,14 @@ def verify_agent_key(peer_static: bytes, pin: bytes | tuple[bytes, ...]) -> bool
     return bytes(peer_static) in tuple(bytes(k) for k in pin)
 
 
-def verify_operator_key(peer_static: bytes, pin: bytes | tuple[bytes, ...]) -> bool:
+def verify_operator_key(
+    peer_static: bytes, pin: bytes | bytearray | tuple[bytes | bytearray, ...]
+) -> bool:
     """Verify an operator static public key against the expected pin.
 
     Args:
         peer_static: 32 raw bytes of learned operator public key.
-        pin: 32 raw bytes, or tuple of 32-byte candidates.
+        pin: 32 raw bytes, bytearray, or tuple of 32-byte candidates.
 
     Returns:
         True if peer_static matches pin (or any candidate in pin), False otherwise.

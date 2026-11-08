@@ -606,7 +606,19 @@ def worker(
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Parses argv with environment-backed defaults, configures the relay, runs its process loop, and returns an integer exit status."""
+    """Parse CLI arguments, configure outbound reverse TCP relay, and run workers.
+
+    Args:
+        argv: Optional command-line argument list; defaults to sys.argv[1:].
+
+    Returns:
+        Exit code (0 on clean shutdown, non-zero on configuration or runtime error).
+
+    Invariants:
+        When --url is passed with a bare host (empty or root path), synthesizes
+        the HTTP upgrade route from --service and --remote-port (/__relay/<svc>
+        or /__relay/auto), matching the --receiver fallback contract.
+    """
     ap = argparse.ArgumentParser(
         description="moesh outbound TCP reverse port relay"
     )
@@ -734,7 +746,25 @@ def main(argv: list[str] | None = None) -> int:
         else:
             port = 443 if tls_active else 80
         path = parts.path
-        label = path.rsplit("/", 1)[-1]
+        rem = str(args.remote_port).strip("/")
+        svc = str(args.service).strip("/")
+        if rem.isdigit():
+            req_remote_port = int(rem)
+        if not path or path == "/":
+            if svc and rem:
+                label = svc
+                path = f"/__relay/{svc}"
+            elif rem:
+                label = rem
+                path = f"/__relay/{rem}"
+            elif svc:
+                label = svc
+                path = f"/__relay/{svc}"
+            else:
+                label = "auto"
+                path = "/__relay/auto"
+        else:
+            label = path.rsplit("/", 1)[-1] or "auto"
     else:
         host = args.receiver
         if args.port is not None:

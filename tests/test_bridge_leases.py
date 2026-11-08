@@ -38,6 +38,7 @@ def _bridge_module() -> Any:
 def bridge_mod() -> Any:
     """A bridge module with fresh in-process registries."""
     mod = _bridge_module()
+    mod.stop_reaper()
     for name in (
         "_relays",
         "_leases",
@@ -447,3 +448,207 @@ def test_admit_relay_queue_full_preserves_existing_owner_and_generation_and_purg
         for sock in [*live_peers, extra_a, extra_b]:
             with contextlib.suppress(OSError):
                 sock.close()
+
+
+# ---------------------------------------------------------------------------
+# TICKET-relay-agent-defined-naming-frpc-style & TICKET-relay-stale-lease-port-26500
+# ---------------------------------------------------------------------------
+
+
+def test_agent_defined_name_port_pair_is_accepted_without_static_map(
+    bridge_mod: Any,
+) -> None:
+    """Agent specifies an arbitrary service name and remote port without static map configuration."""
+    port_num = 26505
+    bridge_mod._bound_relay_ports.add(port_num)
+    a1, b1 = _sock_pair()
+    a2, b2 = _sock_pair()
+    try:
+        # 1. Agent admits a relay with custom name and port
+        assigned_port, reason, entry = bridge_mod.admit_relay(
+            "custom-vllm", "carrier-agent", port_num, a1
+        )
+        assert reason is None, f"admission failed: {reason}"
+        assert assigned_port == port_num
+        assert entry is not None
+        entry.ready.set()
+
+        # 2. Verify bridge registries reflect the agent-defined pair
+        assert bridge_mod._leases["custom-vllm"]["port"] == port_num
+        assert bridge_mod._leases["custom-vllm"]["id"] == "carrier-agent"
+        assert bridge_mod._port_leases[port_num]["name"] == "custom-vllm"
+        assert bridge_mod._port_leases[port_num]["id"] == "carrier-agent"
+
+        # 3. Verify status endpoint reports the agent-defined name
+        status = bridge_mod.bridge_status()
+        assert status["relay"]["names_in_use"]["custom-vllm"] == port_num
+        assert status["relay"]["ports_in_use"][str(port_num)]["name"] == "custom-vllm"
+
+        # 4. Another carrier cannot steal either the same port or same service name
+        _p_fail1, reason1, _e1 = bridge_mod.admit_relay(
+            "other-name", "carrier-intruder", port_num, a2
+        )
+        assert reason1 is not None and "already in use" in reason1
+
+        _p_fail2, reason2, _e2 = bridge_mod.admit_relay(
+            "custom-vllm", "carrier-intruder", 0, a2
+        )
+        assert reason2 is not None and "already held" in reason2
+    finally:
+        for sock in (a1, b1, a2, b2):
+            with contextlib.suppress(OSError):
+                sock.close()
+
+
+def test_stale_relay_lease_reaped_after_carrier_socket_closed(
+    bridge_mod: Any, monkeypatch: Any
+) -> None:
+    """A dead carrier's lease is reaped and its port released once grace expires."""
+    port_num = 26500
+    bridge_mod._bound_relay_ports.add(port_num)
+    monkeypatch.setattr(bridge_mod, "RELAY_LEASE_GRACE", 0.05)
+    a, b = _sock_pair()
+    try:
+        _assigned_port, reason, entry = bridge_mod.admit_relay(
+            "mimo", "carrier-dead", port_num, a
+        )
+        assert reason is None and entry is not None
+        entry.ready.set()
+        assert port_num in bridge_mod._port_leases
+        assert "mimo" in bridge_mod._leases
+
+        # Carrier dies and closes its socket
+        b.close()
+        a.close()
+
+        # Wait out grace
+        time.sleep(0.1)
+
+        # Reaper sweeps
+        reaped = bridge_mod.reap_stale_leases()
+        assert reaped >= 1
+        assert port_num not in bridge_mod._port_leases
+        assert "mimo" not in bridge_mod._leases
+
+        # Port is immediately returned to free ports
+        status = bridge_mod.bridge_status()
+        assert port_num in status["relay"]["ports_free"]
+        assert str(port_num) not in status["relay"]["ports_in_use"]
+        assert "mimo" not in status["relay"]["names_in_use"]
+    finally:
+        with contextlib.suppress(OSError):
+            a.close()
+        with contextlib.suppress(OSError):
+            b.close()
+
+
+def test_stale_relay_lease_reaped_by_ttl(
+    bridge_mod: Any, monkeypatch: Any
+) -> None:
+    """A lease whose age exceeds MOESH_BRIDGE_LEASE_TTL is not reaped while standby carriers are queued, and is reaped once queued=0 and active=0."""
+    port_num = 26503
+    bridge_mod._bound_relay_ports.add(port_num)
+    monkeypatch.setattr(bridge_mod, "LEASE_TTL", 0.1)
+    a, b = _sock_pair()
+    try:
+        _assigned_port, reason, entry = bridge_mod.admit_relay(
+            "ttl-svc", "carrier-ttl", port_num, a
+        )
+        assert reason is None and entry is not None
+        entry.ready.set()
+
+        # Wait until TTL expires
+        time.sleep(0.15)
+
+        # Standby carrier is healthy and queued: TTL expiration does not reap it
+        reaped_while_queued = bridge_mod.reap_stale_leases()
+        assert reaped_while_queued == 0
+        assert port_num in bridge_mod._port_leases
+        assert "ttl-svc" in bridge_mod._leases
+
+        # Once carrier closes its socket, queued becomes 0 and TTL expiration reaps it
+        b.close()
+        a.close()
+        time.sleep(0.05)
+
+        reaped = bridge_mod.reap_stale_leases()
+        assert reaped >= 1
+        assert port_num not in bridge_mod._port_leases
+        assert "ttl-svc" not in bridge_mod._leases
+        # Queued socket was drained and closed
+        q = bridge_mod._relays.get(str(port_num))
+        assert q is None or q.empty()
+    finally:
+        with contextlib.suppress(OSError):
+            a.close()
+        with contextlib.suppress(OSError):
+            b.close()
+
+
+def test_stale_host_lease_not_reaped_by_ttl_while_queued(
+    bridge_mod: Any, monkeypatch: Any
+) -> None:
+    """A host tunnel lease is not reaped by TTL while healthy standby carrier is queued."""
+    host = "host-ttl-test"
+    q = bridge_mod.host_queue(host)
+    assert q is not None
+    monkeypatch.setattr(bridge_mod, "LEASE_TTL", 0.1)
+    a, b = _sock_pair()
+    try:
+        reason, entry = bridge_mod.admit_host(host, "carrier-ttl-host", q, a)
+        assert reason is None and entry is not None
+        entry.ready.set()
+        assert host in bridge_mod._host_leases
+
+        # Wait until TTL expires
+        time.sleep(0.15)
+
+        # Host carrier is queued: must not be reaped
+        reaped = bridge_mod.reap_stale_leases()
+        assert reaped == 0
+        assert host in bridge_mod._host_leases
+
+        # Once carrier disconnects, queued=0 and TTL reaps it
+        b.close()
+        a.close()
+        time.sleep(0.05)
+
+        reaped = bridge_mod.reap_stale_leases()
+        assert reaped >= 1
+        assert host not in bridge_mod._host_leases
+    finally:
+        with contextlib.suppress(OSError):
+            a.close()
+        with contextlib.suppress(OSError):
+            b.close()
+
+
+def test_stale_host_lease_reaped_after_carrier_socket_closed(
+    bridge_mod: Any, monkeypatch: Any
+) -> None:
+    """A dead host tunnel lease is reaped once its socket closes and grace expires."""
+    host = "host-reap-test"
+    q = bridge_mod.host_queue(host)
+    assert q is not None
+    monkeypatch.setattr(bridge_mod, "RELAY_LEASE_GRACE", 0.05)
+    a, b = _sock_pair()
+    try:
+        reason, entry = bridge_mod.admit_host(host, "carrier-dead", q, a)
+        assert reason is None and entry is not None
+        entry.ready.set()
+        assert host in bridge_mod._host_leases
+
+        # Carrier dies
+        b.close()
+        a.close()
+        time.sleep(0.1)
+
+        reaped = bridge_mod.reap_stale_leases()
+        assert reaped >= 1
+        assert host not in bridge_mod._host_leases
+    finally:
+        with contextlib.suppress(OSError):
+            a.close()
+        with contextlib.suppress(OSError):
+            b.close()
+

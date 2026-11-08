@@ -16,7 +16,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import moesh_relay
 from tests.harness import AGENT_PYTHON, Bridge, next_ports
@@ -511,3 +511,35 @@ def test_concurrent_relay_daemons_competing_for_same_port_e2e(
             bridge.stop()
             server_alpha.stop()
             server_beta.stop()
+
+
+def test_relay_bare_domain_url_synthesizes_routing_path(monkeypatch: Any) -> None:
+    """When --url has a bare domain (path is empty or '/'), path is synthesized from --service/--remote-port."""
+    logs: list[str] = []
+    monkeypatch.setattr(moesh_relay, "log", logs.append)
+    monkeypatch.setattr(threading.Thread, "start", lambda self: None)
+    monkeypatch.setattr(threading.Event, "wait", lambda self: True)
+
+    # 1. Bare domain without trailing slash + --service
+    moesh_relay.main(["--url", "http://127.0.0.1:8080", "--service", "web", "--workers", "1"])
+    assert any("path=/__relay/web" in line for line in logs)
+
+    # 2. Bare domain with trailing slash + --service
+    logs.clear()
+    moesh_relay.main(["--url", "http://127.0.0.1:8080/", "--service", "api", "--workers", "1"])
+    assert any("path=/__relay/api" in line for line in logs)
+
+    # 3. Bare domain with -R remote port
+    logs.clear()
+    moesh_relay.main(["--url", "http://127.0.0.1:8080", "-R", "26500", "--workers", "1"])
+    assert any("path=/__relay/26500" in line for line in logs)
+
+    # 4. Bare domain with neither -> /__relay/auto
+    logs.clear()
+    moesh_relay.main(["--url", "http://127.0.0.1:8080", "--workers", "1"])
+    assert any("path=/__relay/auto" in line for line in logs)
+
+    # 5. Explicit path preserved verbatim
+    logs.clear()
+    moesh_relay.main(["--url", "http://127.0.0.1:8080/__relay/custom", "--workers", "1"])
+    assert any("path=/__relay/custom" in line for line in logs)

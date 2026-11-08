@@ -46,6 +46,9 @@ TEST-PROTOCOL.md
 .workflows/
 maintaince.md
 .maat/
+.relay/
+TICKET-*.md
+notes-to-handle.md
 
 # Local code intelligence & search index caches
 .codegraph/

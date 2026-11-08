@@ -3,6 +3,16 @@
 All notable changes to `moesh`. The project is pre-1.0: behaviour may change
 between minor releases without a deprecation period.
 
+## 0.2.0b10 — 2026-11-08
+
+### Fixed — relay carrier lease reaping and agent-defined naming
+
+- **Carrier preservation in bridge lease reaper (`moesh-bridge.py`).** Guarded `ttl_expired` with `queued == 0 and active == 0` so that healthy idle standby carriers in host and relay queues are not evicted or closed when `MOESH_BRIDGE_LEASE_TTL` is enabled.
+- **Relay bare domain URL path synthesis (`moesh_relay.py`).** When `--url` specifies a bare domain without a path or with `'/'`, synthesizes canonical `/__relay/<svc>` or `/__relay/auto` routes instead of emitting malformed `GET  HTTP/1.1` requests.
+- **Operator key isolation in shell pool (`moesh_tunnel.py`, `moesh_proto.py`).** Added `owner_key` tracking to `HostShell` and `ShellPool.acquire(fresh=False)`, ensuring that re-attachment is cryptographically isolated by the operator's authenticated static public key.
+- **Static key verification testing (`moesh_proto.py`).** Added unit test coverage for `verify_agent_key` and `verify_operator_key` across single pins, bytearrays, and candidate tuples.
+- **Production assertion replacement (`moesh-bridge.py`, `moesh_tunnel.py`).** Replaced non-defensive bare `assert` statements in production control paths with explicit `RuntimeError` checks.
+
 ## 0.2.0b9 — 2026-11-04
 
 ### Fixed — the paired-but-dead carrier (HANDOFF.md §5 failure mode)
