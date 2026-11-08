@@ -1307,7 +1307,7 @@ def negotiate(
     fresh = bool(hello.get("fresh_session"))
     # The shell is chosen only now: the HELLO is what says whether this
     # session wants a fresh shell or the running one.
-    owner_key = secure.session.peer_static
+    owner_key = getattr(secure.session, "peer_static", None)
     shell = pool.acquire(fresh, owner_key=owner_key)
     success = False
     try:

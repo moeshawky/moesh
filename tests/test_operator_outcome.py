@@ -766,6 +766,8 @@ def test_reaped_shell_is_not_reacquired() -> None:
 
 
 class _FakeSession:
+    peer_static: bytes | None = b"p" * 32
+
     def handshake_hash(self) -> bytes:
         return b"h" * 32
 
