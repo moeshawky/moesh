@@ -219,7 +219,7 @@ moesh-relay --probe --receiver HOST [--port PORT] [--token SECRET] [--tls] [--tl
 | `--target TARGET` | `MOESH_RELAY_TARGET` or `127.0.0.1:8000` | `moesh_relay.py:658-662` | Local `host:port` service to splice paired TCP streams into. |
 | `--workers WORKERS` | `MOESH_RELAY_WORKERS` or `4` | `moesh_relay.py:663-668` | Number of standby queued connections maintained at the receiver. |
 | `--id ID` | `MOESH_RELAY_ID` or `derive_carrier_id()` | `moesh_relay.py:669-673` | Carrier lease identity; derived from host markers so restarts reclaim the host's own lease immediately. |
-| `--token TOKEN` | `MOESH_RELAY_TOKEN` or `""` | `moesh_relay.py:674-681` | Shared secret sent as `X-Moesh-Relay-Auth` when `MOESH_BRIDGE_RELAY_TOKEN` is set on the bridge. |
+| `--token TOKEN` | `MOESH_RELAY_TOKEN` or `MOESH_BRIDGE_RELAY_TOKEN` or `""` | `moesh_relay.py:674-681` | Shared secret sent as `X-Moesh-Relay-Auth` when `MOESH_BRIDGE_RELAY_TOKEN` is set on the bridge. |
 | `--claim-wait CLAIM_WAIT` | `45.0` seconds | `moesh_relay.py:682-687` | Retry window per `409 Conflict` incident before exiting with status `3`. |
 | `--idle IDLE` | `MOESH_RELAY_IDLE` or `900` seconds | `moesh_relay.py:688-693` | Standby socket refresh interval before recycling an unpaired connection. |
 | `--session-idle SESSION_IDLE` | `MOESH_RELAY_SESSION_IDLE` or `120` seconds | `moesh_relay.py:694-702` | Idle timeout on active paired TCP sessions (set to 0 or negative to disable timeout for long-running inference). |

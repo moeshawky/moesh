@@ -2,7 +2,7 @@
 
 `moesh-relay` is a zero-dependency outbound TCP reverse port relay. It allows an agent machine located behind NAT, firewalls, or ephemeral environments (e.g. Kaggle, Vast.ai, RunPod) to expose a local TCP port back through the public receiver machine without opening inbound firewall ports or running SSH daemons.
 
-**Source:** `moesh_relay.py:1-872`
+**Source:** `moesh_relay.py:1-877`
 
 ---
 

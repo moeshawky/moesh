@@ -43,13 +43,13 @@ Install `moesh` directly from PyPI into your environment or user profile:
 
 ```bash
 # Using pip:
-pip install moesh==0.2.0b9
+pip install moesh==0.2.0b12
 
 # Or using uv (fastest):
-uv tool install moesh==0.2.0b9
+uv tool install moesh==0.2.0b12
 
 # Or using pipx:
-pipx install moesh==0.2.0b9
+pipx install moesh==0.2.0b12
 ```
 
 This installs five CLI tools:
@@ -134,7 +134,7 @@ Expose a local TCP service (e.g., vLLM or web server running on `127.0.0.1:8000`
 # Auto-claim the lowest free port in 26420..26430 over TLS:
 moesh-relay --receiver receiver.example.com --tls --remote-port auto --target 127.0.0.1:8000
 ```
-External clients can now connect directly to `https://receiver.example.com:<PORT>`.
+External clients can now connect directly to the published receiver port (e.g. `http://receiver.example.com:<PORT>` or raw TCP socket).
 
 ---
 
