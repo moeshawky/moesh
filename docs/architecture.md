@@ -19,7 +19,7 @@ is in [PROTOCOL.md](https://github.com/moeshawky/moesh/blob/master/PROTOCOL.md).
 | `moesh-bridge` (`moesh-bridge.py`) | **the receiver broker**: pairs an operator with an agent's tunnel and copies bytes. It is a blind socket pump holding 0 keys and decrypting 0 bytes. |
 | `moesh-bridge.service` | the systemd unit for the receiver bridge. |
 | `PROTOCOL.md` | the wire contract and framing specification. |
-| `tests/` | the verification suite: 326 tests covering protocol core, key generation, host identity, operator outcomes, moecp file transfers, adversarial security boundaries, carrier leases, relay TLS, worker hardening, large-file keepalive heartbeats, and automated documentation drift verification. |
+| `tests/` | the verification suite: 332 tests covering protocol core, key generation, host identity, operator outcomes, moecp file transfers, adversarial security boundaries, carrier leases, relay TLS, worker hardening, standby refresh reliability, large-file keepalive heartbeats, and automated documentation drift verification. |
 
 ---
 
@@ -83,7 +83,7 @@ agent host                                  receiver                    operator
   it (`moesh_tunnel.py:1210-1280`).
 * The receiver keeps one queue per host name (`moesh-bridge.py:95-120`) and
   pairs an operator with the oldest **live** tunnel in that queue
-  (`moesh-bridge.py:1590-1712`). A tunnel that died while queued is discarded
+  (`moesh-bridge.py:1617-1745`). A tunnel that died while queued is discarded
   rather than paired.
 * The agent's shell pool hands out one shell per session (`moesh_tunnel.py:738-868`).
   A detached shell is kept and given to the next operator; `--fresh` asks for a

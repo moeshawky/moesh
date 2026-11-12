@@ -153,11 +153,30 @@ class QueuedTunnel:
         self.response = response
         self.pairing = pairing
         self.ready = threading.Event()
+        self.queued_at: float = time.time()
 
 
 def _sock_of(item: Any) -> socket.socket:
     """Return the socket held by a queue entry (raw or wrapped)."""
     return item.sock if isinstance(item, QueuedTunnel) else item
+
+
+def _oldest_queued_age(
+    q: queue.Queue[Any] | None, now: float | None = None
+) -> float | None:
+    """Return age in seconds of the oldest queued tunnel, or None if empty."""
+    if q is None:
+        return None
+    ts_now = time.time() if now is None else now
+    with q.mutex:
+        ages = [
+            it.queued_at
+            for it in q.queue
+            if isinstance(it, QueuedTunnel) and it.queued_at > 0
+        ]
+    if not ages:
+        return None
+    return round(max(0.0, ts_now - min(ages)), 1)
 
 
 _relays: dict[str, queue.Queue[Any]] = {}
@@ -1047,12 +1066,14 @@ def bridge_status() -> dict[str, Any]:
                 queue_ref = _relays.get(key)
                 q_cnt = live_queued(queue_ref) if queue_ref is not None else 0
                 a_cnt = _relay_active.get(key, 0)
+                oldest_age = _oldest_queued_age(queue_ref)
                 svc_name = str(port_lease.get("name", port)) if port_lease else key
                 ports_in_use[key] = {
                     "name": svc_name,
                     "queued": q_cnt,
                     "active": a_cnt,
                     "since": int(port_lease["since"]) if port_lease else 0,
+                    "oldest_queued_age": oldest_age,
                 }
                 names_in_use[svc_name] = port
             else:
@@ -1674,6 +1695,20 @@ def pair(
                 with contextlib.suppress(OSError):
                     nb.close()
                 continue
+            # Deferred handshake must succeed before claiming this tunnel paired;
+            # if the standby socket died right before handoff, discard it and
+            # keep searching ``q`` rather than resetting the waiting peer.
+            if isinstance(item, QueuedTunnel) and item.response:
+                try:
+                    nb.sendall(item.response)
+                    if item.pairing == PAIRING_EVENT:
+                        nb.sendall(PAIR_MARKER)
+                except OSError:
+                    saw_dead = True
+                    log(f"discarding dead {label} tunnel before handshake delivery")
+                    with contextlib.suppress(OSError):
+                        nb.close()
+                    continue
             paired = True
         if nb is None or item is None:
             raise RuntimeError(
@@ -1695,22 +1730,10 @@ def pair(
         # socket options are transport-level, not decrypting.
         for _sock in (conn, nb):
             set_tcp_keepalive(_sock)
-        if isinstance(item, QueuedTunnel) and item.response:
-            # Deferred handshake: the carrier has been waiting for this 101 so
-            # it can open its backend connection before any peer byte exists.
-            try:
-                nb.sendall(item.response)
-                if item.pairing == PAIRING_EVENT:
-                    nb.sendall(PAIR_MARKER)
-            except OSError:
-                with contextlib.suppress(OSError):
-                    nb.close()
-                with contextlib.suppress(OSError):
-                    conn.close()
-                return
         pump(nb, conn, on_half_close=on_detach)
     except queue.Empty:
-        log(f"{label} connected but no {label} tunnel within {wait}s")
+        reason_suffix = " (discarded dead queued tunnel(s))" if saw_dead else ""
+        log(f"{label} connected but no {label} tunnel within {wait}s{reason_suffix}")
         # If a dead tunnel was discarded along the way, signal the operator so
         # it retries immediately instead of waiting out its backoff.
         if saw_dead and signal_dead:
@@ -2076,6 +2099,20 @@ def main(argv: list[str] | None = None) -> int:
                     """Stop counting this pairing as attached; safe to call twice."""
                     if paired.is_set() and detached.acquire(blocking=False):
                         touch_relay(label, -1)
+
+                with _leases_lock:
+                    has_live = live_queued(queue_ref) > 0
+                    has_lease = _busy_locked(
+                        label, queue_ref, _port_leases.get(port_num)
+                    )
+                if not has_live and not has_lease:
+                    log(
+                        f"relay:{port_num} closing peer from {addr}: "
+                        "no active carrier lease"
+                    )
+                    with contextlib.suppress(OSError):
+                        conn.close()
+                    return
 
                 try:
                     pair(

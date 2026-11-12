@@ -27,6 +27,8 @@ import contextlib
 import hashlib
 import json
 import os
+import random
+import selectors
 import socket
 import ssl
 import threading
@@ -365,6 +367,163 @@ def print_probe(
     return 0
 
 
+def _set_tcp_keepalive(sock: socket.socket) -> None:
+    """Enable TCP keepalive probes on standby relay sockets.
+
+    Keeps NAT/firewall conntrack mappings active across idle windows and lets the
+    client detect ungraceful proxy/receiver drops within ~30s instead of holding
+    ghost ESTABLISHED sockets.
+    """
+    with contextlib.suppress(OSError):
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    for opt_name, val in (
+        ("TCP_KEEPIDLE", 15),
+        ("TCP_KEEPINTVL", 5),
+        ("TCP_KEEPCNT", 3),
+    ):
+        opt = getattr(socket, opt_name, None)
+        if opt is not None:
+            with contextlib.suppress(OSError):
+                sock.setsockopt(socket.IPPROTO_TCP, opt, val)
+
+
+def _standby_wait_timeout(
+    idle: int, index: int, workers: int, cycle: int
+) -> float | None:
+    """Compute staggered standby refresh deadlines across workers.
+
+    Cycle 0 spreads initial deadlines evenly across ``(0, idle]`` so a fresh
+    worker pool never expires in lockstep; later cycles retain per-worker phase
+    separation plus small jitter so traffic bursts cannot re-synchronize them.
+    """
+    if idle <= 0:
+        return None
+    w = max(1, workers)
+    i = max(0, min(index, w - 1))
+    if w == 1:
+        return float(idle)
+    if cycle == 0:
+        step = float(idle) / float(w)
+        floor = 0.25 if idle <= 2 else min(float(idle), max(0.5, step * 0.5))
+        return min(float(idle), max(floor, float(idle) - i * step))
+    phase = float(i) / float(w)
+    jitter = random.uniform(-0.05, 0.05)  # noqa: S311 - scheduling jitter, not cryptographic
+    return min(
+        float(idle), max(0.25, float(idle) * (0.85 + 0.10 * (1.0 - phase) + jitter))
+    )
+
+
+def _wait_readable(
+    socks: list[socket.socket], timeout: float | None
+) -> list[socket.socket]:
+    """Return subset of ``socks`` ready to read without missing TLS-buffered bytes."""
+    buffered: list[socket.socket] = [
+        s for s in socks if isinstance(s, ssl.SSLSocket) and s.pending() > 0
+    ]
+    if buffered:
+        return buffered
+    sel = selectors.DefaultSelector()
+    try:
+        for sock in socks:
+            sel.register(sock, selectors.EVENT_READ)
+        events = sel.select(timeout=timeout)
+        return [s for s in socks if any(key.fileobj is s for key, _ in events)]
+    finally:
+        sel.close()
+
+
+def _dial_relay_upgrade(
+    host: str,
+    port: int,
+    path: str,
+    carrier_id: str = "",
+    remote_port: int = 0,
+    *,
+    auth_token: str = "",
+    pairing_event: bool = True,
+    connect_timeout: float = 20.0,
+    tls: bool = False,
+    tls_insecure: bool = False,
+    tls_ca_cert: str = "",
+    tls_pin: str = "",
+    ssl_context: ssl.SSLContext | None = None,
+) -> socket.socket:
+    """Open TCP/TLS socket to receiver, apply keepalive, and send HTTP/1.1 Upgrade GET."""
+    raw_sock = socket.create_connection((host, port), timeout=connect_timeout)
+    _set_tcp_keepalive(raw_sock)
+    try:
+        if tls or ssl_context is not None:
+            ctx = ssl_context or create_ssl_context(
+                insecure=tls_insecure, ca_cert=tls_ca_cert
+            )
+            sock: socket.socket = ctx.wrap_socket(raw_sock, server_hostname=host)
+            if tls_pin:
+                verify_tls_pin(sock, tls_pin)
+        else:
+            sock = raw_sock
+    except Exception:
+        raw_sock.close()
+        raise
+    key = base64.b64encode(os.urandom(16)).decode()
+    port_hdr = f"X-Moesh-Relay-Port: {remote_port}\r\n" if remote_port > 0 else ""
+    pairing_hdr = "X-Moesh-Relay-Pairing: event\r\n" if pairing_event else ""
+    auth_hdr = f"X-Moesh-Relay-Auth: {auth_token}\r\n" if auth_token else ""
+    req = (
+        f"GET {path} HTTP/1.1\r\n"
+        f"Host: {host}\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        f"Sec-WebSocket-Key: {key}\r\n"
+        "Sec-WebSocket-Version: 13\r\n"
+        f"X-Moesh-Relay-Id: {carrier_id}\r\n"
+        f"{port_hdr}{pairing_hdr}{auth_hdr}\r\n"
+    ).encode()
+    try:
+        sock.settimeout(connect_timeout)
+        sock.sendall(req)
+    except Exception:
+        with contextlib.suppress(OSError):
+            sock.close()
+        raise
+    return sock
+
+
+def _read_upgrade_response(
+    sock: socket.socket, remote_port: int
+) -> tuple[int, bytes, bool]:
+    """Read and validate receiver's HTTP/1.1 101 Upgrade headers, closing on error."""
+    try:
+        headers = read_headers(sock)
+        head, leftover = headers.split(b"\r\n\r\n", 1)
+        if not head.startswith(b"HTTP/1.1 101"):
+            first_line = head.split(b"\r\n", 1)[0].decode("latin-1", "replace")
+            body = leftover.decode("latin-1", "replace").strip()
+            sock.settimeout(1.0)
+            with contextlib.suppress(OSError):
+                more = sock.recv(4096)
+                if more:
+                    body = (leftover + more).decode("latin-1", "replace").strip()
+            if b" 409 " in head.split(b"\r\n", 1)[0] + b" ":
+                raise RelayRefused(body or first_line)
+            raise ConnectionError(f"upgrade refused by receiver: {body or first_line}")
+        assigned = remote_port
+        event_mode = False
+        for line in head.split(b"\r\n")[1:]:
+            low = line.lower()
+            if low.startswith(b"x-moesh-relay-port:"):
+                val = line.split(b":", 1)[1].strip().decode("latin-1", "replace")
+                if val.isdigit():
+                    assigned = int(val)
+            elif low.startswith(b"x-moesh-relay-pairing:"):
+                value = line.split(b":", 1)[1].strip().decode("latin-1", "replace")
+                event_mode = value == RELAY_PAIRING_EVENT
+        return assigned, leftover, event_mode
+    except Exception:
+        with contextlib.suppress(OSError):
+            sock.close()
+        raise
+
+
 def connect_tunnel(
     host: str,
     port: int,
@@ -392,62 +551,31 @@ def connect_tunnel(
     ``event_mode`` is True only when the receiver acknowledged the mode; an
     older receiver keeps the legacy data-driven pairing.
     """
-    raw_sock = socket.create_connection((host, port), timeout=20)
+    sock = _dial_relay_upgrade(
+        host,
+        port,
+        path,
+        carrier_id,
+        remote_port=remote_port,
+        auth_token=auth_token,
+        pairing_event=pairing_event,
+        tls=tls,
+        tls_insecure=tls_insecure,
+        tls_ca_cert=tls_ca_cert,
+        tls_pin=tls_pin,
+        ssl_context=ssl_context,
+    )
     try:
-        if tls or ssl_context is not None:
-            ctx = ssl_context or create_ssl_context(
-                insecure=tls_insecure, ca_cert=tls_ca_cert
-            )
-            sock: socket.socket = ctx.wrap_socket(raw_sock, server_hostname=host)
-            if tls_pin:
-                verify_tls_pin(sock, tls_pin)
-        else:
-            sock = raw_sock
+        sock.settimeout(header_timeout)
+        assigned, leftover, event_mode = _read_upgrade_response(sock, remote_port)
+        return sock, assigned, leftover, event_mode
     except Exception:
-        raw_sock.close()
-        raise
-    sock.settimeout(header_timeout)
-    key = base64.b64encode(os.urandom(16)).decode()
-    port_hdr = f"X-Moesh-Relay-Port: {remote_port}\r\n" if remote_port > 0 else ""
-    pairing_hdr = "X-Moesh-Relay-Pairing: event\r\n" if pairing_event else ""
-    auth_hdr = f"X-Moesh-Relay-Auth: {auth_token}\r\n" if auth_token else ""
-    req = (
-        f"GET {path} HTTP/1.1\r\n"
-        f"Host: {host}\r\n"
-        "Upgrade: websocket\r\n"
-        "Connection: Upgrade\r\n"
-        f"Sec-WebSocket-Key: {key}\r\n"
-        "Sec-WebSocket-Version: 13\r\n"
-        f"X-Moesh-Relay-Id: {carrier_id}\r\n"
-        f"{port_hdr}{pairing_hdr}{auth_hdr}\r\n"
-    ).encode()
-    sock.sendall(req)
-    headers = read_headers(sock)
-    head, leftover = headers.split(b"\r\n\r\n", 1)
-    if not head.startswith(b"HTTP/1.1 101"):
-        first_line = head.split(b"\r\n", 1)[0].decode("latin-1", "replace")
-        body = leftover.decode("latin-1", "replace").strip()
-        sock.settimeout(1.0)
         with contextlib.suppress(OSError):
-            more = sock.recv(4096)
-            if more:
-                body = (leftover + more).decode("latin-1", "replace").strip()
-        sock.close()
-        if b" 409 " in head.split(b"\r\n", 1)[0] + b" ":
-            raise RelayRefused(body or first_line)
-        raise ConnectionError(f"upgrade refused by receiver: {body or first_line}")
-    assigned = remote_port
-    event_mode = False
-    for line in head.split(b"\r\n")[1:]:
-        low = line.lower()
-        if low.startswith(b"x-moesh-relay-port:"):
-            val = line.split(b":", 1)[1].strip().decode("latin-1", "replace")
-            if val.isdigit():
-                assigned = int(val)
-        elif low.startswith(b"x-moesh-relay-pairing:"):
-            value = line.split(b":", 1)[1].strip().decode("latin-1", "replace")
-            event_mode = value == RELAY_PAIRING_EVENT
-    return sock, assigned, leftover, event_mode
+            sock.close()
+        raise
+
+
+_ORIG_CONNECT_TUNNEL = connect_tunnel
 
 
 def _serve_session(
@@ -497,8 +625,14 @@ def worker(
     tls_ca_cert: str = "",
     tls_pin: str = "",
     ssl_context: ssl.SSLContext | None = None,
+    workers: int = 1,
 ) -> None:
-    """Worker maintaining one queued standby tunnel at a time.
+    """Worker maintaining one queued standby tunnel with make-before-break refresh.
+
+    Staggers standby expiry lifetimes across ``workers`` and dials each
+    replacement standby carrier before closing the retiring socket so the
+    receiver queue never dips empty during refresh and peers paired in flight
+    complete cleanly without a handshake reset.
 
     As soon as a standby tunnel is paired and receives its first peer bytes,
     the local target connection is verified before handing the active session
@@ -528,27 +662,174 @@ def worker(
     global _port_logged
     incident_deadline: float | None = None
     target_key = (target_host, target_port)
+    standby_sock: socket.socket | None = None
+    standby_dialed_at = 0.0
+    upgraded_meta: tuple[int, bytes, bool] | None = None
+    cycle = 0
+
+    def _close_quiet(s: socket.socket | None) -> None:
+        if s is not None:
+            with contextlib.suppress(OSError):
+                s.close()
+
     while True:
         with _target_lock:
             wait_sec = _target_backoff_until.get(target_key, 0.0) - time.time()
         if wait_sec > 0:
+            _close_quiet(standby_sock)
+            standby_sock = None
+            upgraded_meta = None
             time.sleep(wait_sec)
-        sock = None
+        sock: socket.socket | None = None
+        wait_timeout = _standby_wait_timeout(idle, index, workers, cycle)
         try:
-            sock, assigned_port, leftover, event_mode = connect_tunnel(
-                host,
-                port,
-                path,
-                carrier_id,
-                remote_port=remote_port,
-                auth_token=token,
-                header_timeout=float(max(idle, 20)),
-                tls=tls,
-                tls_insecure=tls_insecure,
-                tls_ca_cert=tls_ca_cert,
-                tls_pin=tls_pin,
-                ssl_context=ssl_context,
-            )
+            if connect_tunnel is not _ORIG_CONNECT_TUNNEL:
+                hdr_timeout = float(wait_timeout) if wait_timeout is not None else 20.0
+                sock, assigned_port, leftover, event_mode = connect_tunnel(
+                    host,
+                    port,
+                    path,
+                    carrier_id,
+                    remote_port=remote_port,
+                    auth_token=token,
+                    header_timeout=hdr_timeout,
+                    tls=tls,
+                    tls_insecure=tls_insecure,
+                    tls_ca_cert=tls_ca_cert,
+                    tls_pin=tls_pin,
+                    ssl_context=ssl_context,
+                )
+            else:
+                if standby_sock is None:
+                    standby_sock = _dial_relay_upgrade(
+                        host,
+                        port,
+                        path,
+                        carrier_id,
+                        remote_port=remote_port,
+                        auth_token=token,
+                        tls=tls,
+                        tls_insecure=tls_insecure,
+                        tls_ca_cert=tls_ca_cert,
+                        tls_pin=tls_pin,
+                        ssl_context=ssl_context,
+                    )
+                    standby_dialed_at = time.monotonic()
+                    upgraded_meta = None
+
+                remaining_wait = (
+                    None
+                    if wait_timeout is None
+                    else max(0.05, wait_timeout - (time.monotonic() - standby_dialed_at))
+                )
+                ready = _wait_readable([standby_sock], remaining_wait)
+                if not ready:
+                    elapsed = time.monotonic() - standby_dialed_at
+                    log(
+                        f"worker {index}: standby carrier idle for {elapsed:.1f}s; "
+                        "dialing replacement"
+                    )
+                    repl_sock = _dial_relay_upgrade(
+                        host,
+                        port,
+                        path,
+                        carrier_id,
+                        remote_port=remote_port,
+                        auth_token=token,
+                        tls=tls,
+                        tls_insecure=tls_insecure,
+                        tls_ca_cert=tls_ca_cert,
+                        tls_pin=tls_pin,
+                        ssl_context=ssl_context,
+                    )
+                    repl_dialed_at = time.monotonic()
+                    handoff_grace = min(0.25, max(0.05, (wait_timeout or 1.0) * 0.1))
+                    grace_ready = _wait_readable(
+                        [standby_sock, repl_sock], handoff_grace
+                    )
+                    if standby_sock in grace_ready:
+                        if upgraded_meta is None:
+                            try:
+                                standby_sock.settimeout(20.0)
+                                assigned_port, leftover, event_mode = (
+                                    _read_upgrade_response(standby_sock, remote_port)
+                                )
+                            except RelayRefused:
+                                _close_quiet(repl_sock)
+                                raise
+                            except ConnectionError:
+                                standby_sock = repl_sock
+                                standby_dialed_at = repl_dialed_at
+                                upgraded_meta = None
+                                cycle += 1
+                                incident_deadline = None
+                                continue
+                        else:
+                            assigned_port, leftover, event_mode = upgraded_meta
+                        sock = standby_sock
+                        standby_sock = repl_sock
+                        standby_dialed_at = repl_dialed_at
+                        upgraded_meta = None
+                    elif repl_sock in grace_ready:
+                        try:
+                            repl_sock.settimeout(20.0)
+                            r_assigned, r_leftover, r_event = _read_upgrade_response(
+                                repl_sock, remote_port
+                            )
+                        except RelayRefused:
+                            _close_quiet(standby_sock)
+                            standby_sock = None
+                            upgraded_meta = None
+                            raise
+                        except ConnectionError as err:
+                            log(
+                                f"worker {index}: replacement standby dial rejected ({err}); "
+                                "retaining current standby carrier"
+                            )
+                            standby_dialed_at = time.monotonic()
+                            time.sleep(0.5)
+                            continue
+                        _close_quiet(standby_sock)
+                        standby_sock = None
+                        upgraded_meta = None
+                        if r_event or r_leftover:
+                            sock = repl_sock
+                            assigned_port = r_assigned
+                            leftover = r_leftover
+                            event_mode = r_event
+                        else:
+                            standby_sock = repl_sock
+                            standby_dialed_at = repl_dialed_at
+                            upgraded_meta = (r_assigned, r_leftover, False)
+                            cycle += 1
+                            incident_deadline = None
+                            continue
+                    else:
+                        _close_quiet(standby_sock)
+                        standby_sock = repl_sock
+                        standby_dialed_at = repl_dialed_at
+                        upgraded_meta = None
+                        cycle += 1
+                        incident_deadline = None
+                        continue
+                else:
+                    sock = standby_sock
+                    standby_sock = None
+                    if upgraded_meta is None:
+                        sock.settimeout(20.0)
+                        assigned_port, leftover, event_mode = _read_upgrade_response(
+                            sock, remote_port
+                        )
+                        if not event_mode and not leftover:
+                            standby_sock = sock
+                            standby_dialed_at = time.monotonic()
+                            upgraded_meta = (assigned_port, leftover, False)
+                            incident_deadline = None
+                            continue
+                    else:
+                        assigned_port, leftover, event_mode = upgraded_meta
+                        upgraded_meta = None
+
             incident_deadline = None
             if not _port_logged and assigned_port > 0:
                 _port_logged = True
@@ -556,7 +837,7 @@ def worker(
                     f"bound receiver port {host}:{assigned_port} -> "
                     f"local {target_host}:{target_port}"
                 )
-            sock.settimeout(idle)
+            sock.settimeout(float(idle) if idle > 0 else None)
             if event_mode:
                 # The bridge sends the 101 only when a peer is paired, then a
                 # fixed marker.  On that signal the backend is connected before
@@ -579,9 +860,11 @@ def worker(
                 target = socket.create_connection((target_host, target_port), timeout=10)
             except OSError as err:
                 log(f"worker {index}: target {target_host}:{target_port} refused: {err}")
-                with contextlib.suppress(OSError):
-                    sock.close()
+                _close_quiet(sock)
                 sock = None
+                _close_quiet(standby_sock)
+                standby_sock = None
+                upgraded_meta = None
                 with _target_lock:
                     streak = _target_failures.get(target_key, 0) + 1
                     _target_failures[target_key] = streak
@@ -595,6 +878,7 @@ def worker(
             with _target_lock:
                 _target_failures.pop(target_key, None)
                 _target_backoff_until.pop(target_key, None)
+            cycle += 1
             threading.Thread(
                 target=_serve_session,
                 args=(index, sock, first, target_host, target_port, session_idle, target),
@@ -602,11 +886,18 @@ def worker(
             ).start()
             sock = None
         except TimeoutError:
-            # Idle timeout without peer — redial fresh socket to keep queue alive
-            if sock:
-                with contextlib.suppress(OSError):
-                    sock.close()
+            # Fallback idle path when connect_tunnel is externally mocked or read timed out.
+            log(f"worker {index}: standby carrier idle after {idle}s; redialing")
+            _close_quiet(sock)
+            _close_quiet(standby_sock)
+            standby_sock = None
+            upgraded_meta = None
+            cycle += 1
         except RelayRefused as err:
+            _close_quiet(sock)
+            _close_quiet(standby_sock)
+            standby_sock = None
+            upgraded_meta = None
             log(f"ERROR: refused by receiver (409 Conflict): {err}")
             now = time.time()
             if incident_deadline is None:
@@ -625,9 +916,10 @@ def worker(
         except Exception as err:
             incident_deadline = None
             log(f"worker {index}: {type(err).__name__}: {err}; redialing in 2s")
-            if sock:
-                with contextlib.suppress(OSError):
-                    sock.close()
+            _close_quiet(sock)
+            _close_quiet(standby_sock)
+            standby_sock = None
+            upgraded_meta = None
             time.sleep(2)
 
 
@@ -887,6 +1179,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.tls_ca_cert,
                 args.tls_pin,
                 ssl_context,
+                workers,
             ),
             daemon=True,
         ).start()

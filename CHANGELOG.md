@@ -3,6 +3,14 @@
 All notable changes to `moesh`. The project is pre-1.0: behaviour may change
 between minor releases without a deprecation period.
 
+## 0.2.0b13 — 2026-11-13
+
+### Fixed — public relay standby refresh, handoff recovery, and observability
+
+- **Staggered make-before-break standby refresh (`moesh_relay.py`).** Enabled TCP `SO_KEEPALIVE` on carrier sockets, respected short `--idle` values without 20 s clamping (`_standby_wait_timeout`), closed timed-out/errored sockets inside `connect_tunnel`, staggered initial worker lifetimes across `--workers`, logged standby refresh transitions per worker, and dialed replacement standby carriers before closing retiring sockets so queue depth stays `>= 1` and in-flight pairings complete without mid-TLS resets.
+- **Deferred handshake retry, fast unleased close, and queue age (`moesh-bridge.py`).** Delivered deferred `101` + `RELAY_PAIR_MARKER` before committing `on_pair()` and retried the next queued carrier on `OSError`, closed unleased public relay ports immediately with clean TCP EOF without a 20 s hang (`RC-05`/`RC-07` and bridge blindness preserved), and exposed `oldest_queued_age` per leased port in `GET /__moesh/status`.
+- **Documentation and regression coverage (`docs/`, `PROTOCOL.md`, `tests/test_relay_standby_refresh.py`).** Added 6 regression tests and synced CLI, configuration, operations, relay, protocol, and architecture docs.
+
 ## 0.2.0b12 — 2026-11-08
 
 ### Changed — release increment and roll-forward

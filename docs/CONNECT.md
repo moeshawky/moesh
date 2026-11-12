@@ -86,8 +86,8 @@ Example response:
     "ports_open": [26420, 26421, 26422, 26423, 26425, 26426, 26427, 26428, 26429, 26430],
     "ports_free": [26420, 26421, 26422, 26423, 26425, 26427, 26428, 26429],
     "ports_in_use": {
-      "26426": {"name": "26426", "queued": 4, "active": 0, "since": 1793031512},
-      "26430": {"name": "26430", "queued": 4, "active": 1, "since": 1793031400}
+      "26426": {"name": "26426", "queued": 4, "active": 0, "since": 1793031512, "oldest_queued_age": 0.4},
+      "26430": {"name": "26430", "queued": 4, "active": 1, "since": 1793031400, "oldest_queued_age": 1.2}
     },
     "ports_unavailable": {
       "26424": "Address already in use"
@@ -268,7 +268,7 @@ moesh-relay \
 
 When the relay attaches, it logs the exact receiver port bound:
 ```
-[2026-10-26 19:20:00] moesh-relay: bound receiver port <RECEIVER_HOST>:26425 -> local 127.0.0.1:8000
+19:20:00 [relay] bound receiver port <RECEIVER_HOST>:26425 -> local 127.0.0.1:8000
 ```
 
 External clients can now connect directly to `<RECEIVER_HOST>:26425`.

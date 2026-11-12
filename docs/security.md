@@ -97,9 +97,9 @@ untrusted inputs and network tampering:
 ## 4. Accelerator Service Reverse Relays (`moesh_relay.py`)
 
 - **Outbound Egress Only:** Target accelerator nodes (GPUs/TPUs) make outbound TCP connections over HTTP port 80 (or HTTPS 443) to `/__relay/<service>`. No inbound listening ports are exposed on the compute nodes.
-- **Carrier TLS Transport:** `moesh-relay` supports secure TLS carrier upgrade connections (`--tls`, `--tls-insecure`, `--tls-ca-cert`, `--tls-pin`) with strict certificate verification, custom enterprise CA bundles, and SHA-256 fingerprint pinning (`moesh_relay.py:708-735`).
-- **Direct Bridge TLS Listener:** The receiver bridge (`moesh-bridge.py`) supports direct TLS termination via `--tls-cert` and `--tls-key` (`moesh-bridge.py:1986-2005`), allowing HTTPS/WSS termination without requiring fronting reverse proxies.
-- **Secret & Bearer Token Masking:** Sensitive bearer tokens and shared secrets are masked across all log outputs, status reports, and exception messages (`moesh_relay.py:125-135`), preventing token leakage in telemetry.
+- **Carrier TLS Transport:** `moesh-relay` supports secure TLS carrier upgrade connections (`--tls`, `--tls-insecure`, `--tls-ca-cert`, `--tls-pin`) with strict certificate verification, custom enterprise CA bundles, and SHA-256 fingerprint pinning (`moesh_relay.py:1028-1055`).
+- **Direct Bridge TLS Listener:** The receiver bridge (`moesh-bridge.py`) supports direct TLS termination via `--tls-cert` and `--tls-key` (`moesh-bridge.py:2030-2048`), allowing HTTPS/WSS termination without requiring fronting reverse proxies.
+- **Secret & Bearer Token Masking:** Sensitive bearer tokens and shared secrets are masked across all log outputs, status reports, and exception messages (`moesh_relay.py:153-159`), preventing token leakage in telemetry.
 - **Blind Queue Splicing:** The receiver pairs reverse relays strictly by numeric port or agent-defined service name on public listening ports configured via `MOESH_RELAY_PORTS` (`26420-26430` by default). Sockets are spliced as raw TCP streams without inspection or caching.
 - **The relay is not encrypted by `moesh`, and the documentation says so:** the
   shell tunnel is Noise-encrypted end to end, but relayed traffic is the

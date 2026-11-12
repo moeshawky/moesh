@@ -2,16 +2,16 @@
 
 `moesh-relay` is a zero-dependency outbound TCP reverse port relay. It allows an agent machine located behind NAT, firewalls, or ephemeral environments (e.g. Kaggle, Vast.ai, RunPod) to expose a local TCP port back through the public receiver machine without opening inbound firewall ports or running SSH daemons.
 
-**Source:** `moesh_relay.py:1-877`
+**Source:** `moesh_relay.py:1-1193`
 
 ---
 
 ## Architecture & How It Works
 
-1. **Carrier Dialout**: The relay daemon dials outbound to the receiver's HTTP/HTTPS port with an `HTTP/1.1` Upgrade request on `/__relay/<port>` (or `/__relay/auto` / `/__relay/<service>`).
-2. **Lease Admission & Standby Queue**: The receiver bridge (`moesh-bridge.py`) verifies that no conflicting carrier holds the requested port or name. It grants admission and queues the socket in a standby pool.
-3. **Connection Pairing**: When an external client connects to the published TCP port on the receiver (e.g. `:26426`), the bridge pairs the connection with the oldest standby tunnel.
-4. **Immediate Replenishment**: The worker hands the active session off to a dedicated worker thread and dials a replacement standby tunnel immediately, preventing HTTP keep-alive connection pools from depleting standby capacity.
+1. **Carrier Dialout**: The relay daemon dials outbound to the receiver's HTTP/HTTPS port with an `HTTP/1.1` Upgrade request on `/__relay/<port>` (or `/__relay/auto` / `/__relay/<service>`). TCP keepalive (`SO_KEEPALIVE`) is enabled on carrier sockets so half-open firewall/NAT drops are detected promptly.
+2. **Lease Admission & Standby Queue**: The receiver bridge (`moesh-bridge.py`) verifies that no conflicting carrier holds the requested port or name. It grants admission and queues the socket in a standby pool. `GET /__moesh/status` reports `oldest_queued_age` per leased port so stale queues are observable.
+3. **Connection Pairing & Unleased Fast Close**: When an external client connects to the published TCP port on the receiver (e.g. `:26426`), the bridge verifies whether an active lease or live standby tunnel exists; if unleased, it closes the TCP peer immediately instead of stalling 20 s without injecting application bytes. Otherwise, `pair()` selects the oldest live standby tunnel, retries the next queued entry if delivering the deferred handshake fails, and splices opaque bytes cleanly.
+4. **Staggered Refresh & Immediate Replenishment**: Standby deadlines are staggered across `--workers` and refreshed using make-before-break replacement (dialing and queuing a new standby socket before closing the retiring one, logged per worker), keeping queue depth non-zero across `--idle` boundaries. When a carrier pairs with a peer, the worker hands the active session off to a dedicated session thread and dials a replacement standby tunnel immediately.
 5. **Bidirectional Splice**: Data is pumped bidirectionally between the receiver socket and the local target, preserving TCP half-close semantics.
 
 ---
@@ -96,11 +96,11 @@ curl http://receiver.example.com:26426/v1/chat/completions \
 
 **TLS boundaries (honest):**
 
-- **Carrier TLS (`--tls`, moesh_relay.py:134-148)**: encrypts the agent→bridge carrier hop only and is terminated at the bridge. `create_ssl_context` is called only by the outbound dial paths (`fetch_status`, `connect_tunnel`, `main`).
-- **Bridge listener TLS (`--tls-cert/--tls-key`, moesh-bridge.py:1997-2019)**: direct TLS termination on the **tunnel listener** only. The public relay ports (26420-26430, moesh-bridge.py:2028-2082) get no `ssl_context` — they are plaintext.
+- **Carrier TLS (`--tls`, moesh_relay.py:162-176)**: encrypts the agent→bridge carrier hop only and is terminated at the bridge. `create_ssl_context` is called only by the outbound dial paths (`fetch_status`, `_dial_relay_upgrade`, `connect_tunnel`, `main`).
+- **Bridge listener TLS (`--tls-cert/--tls-key`, moesh-bridge.py:2030-2062)**: direct TLS termination on the **tunnel listener** only. The public relay ports (26420-26430, moesh-bridge.py:2072-2140) get no `ssl_context` — they are plaintext.
 - **Backend TLS**: terminates behind the relay on the agent host (e.g. vLLM behind a local TLS-terminating front). This tree does not vendor vLLM's own TLS flags, so do not invent a `vLLM --ssl` flag; use any TLS-terminating front. Note that `moesh-relay` dials its `--target` as plain TCP, so backend TLS does not ride the relay pipe itself.
 
-Because the relay port is plaintext, `curl https://receiver.example.com:26426/...` is **unsupported as written**. For true client↔backend TLS end-to-end, terminate TLS at a front in front of the relay port (e.g. nginx TLS on :443 → plaintext to :26426) and/or have the backend speak TLS; the bridge is blind and never terminates TLS for the relayed stream (moesh-bridge.py:31-32).
+Because the relay port is plaintext, `curl https://receiver.example.com:26426/...` is **unsupported as written**. For true client↔backend TLS end-to-end, terminate TLS at a front in front of the relay port (e.g. nginx TLS on :443 → plaintext to :26426) and/or have the backend speak TLS; the bridge is blind and never terminates TLS for the relayed stream (moesh-bridge.py:32-35).
 
 ### Example: Exposing llama.cpp / Ollama with SHA-256 Pinning
 
